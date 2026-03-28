@@ -1,0 +1,17 @@
+[Unit]
+Description=ESP32 Assistant Brains (Audio & Rotary)
+After=network.target
+
+[Service]
+# Use the Python from our virtual environment
+ExecStart={{APP_PATH}}/venv/bin/python -u {{APP_PATH}}/assistant_brains.py
+WorkingDirectory={{APP_PATH}}
+# Load environment variables (API Keys, etc.) from .env
+EnvironmentFile=-{{APP_PATH}}/.env
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+User=pi
+
+[Install]
+WantedBy=multi-user.target

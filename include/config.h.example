@@ -1,0 +1,36 @@
+/**
+ * @file config.h
+ * @brief User configuration for the ADS-B radar display.
+ * Copy this file to config.h and edit before flashing.
+ */
+#pragma once
+
+// ── WiFi ─────────────────────────────────────────────────────────────────────
+#define WIFI_SSID      "YOUR_SSID"
+#define WIFI_PASSWORD  "YOUR_PASSWORD"
+
+// ── ADS-B Receiver ───────────────────────────────────────────────────────────
+// PiAware / dump1090-fa JSON endpoint (accessible from your local network)
+#define ADSB_HOST      "192.168.1.XX"  // IP of your Raspberry Pi
+#define ADSB_PORT      80
+#define ADSB_PATH      "/skyaware/data/aircraft.json"
+
+// Your location — this becomes the centre of the radar.
+#define HOME_LAT       0.0f
+#define HOME_LON       0.0f
+
+// ── Display Defaults ──────────────────────────────────────────────────────────
+#define DEFAULT_RANGE_NM  15     ///< Starting range in nautical miles
+#define MIN_RANGE_NM       5     ///< Minimum zoom-in range
+#define MAX_RANGE_NM     250     ///< Maximum zoom-out range
+
+// ── Data Refresh ──────────────────────────────────────────────────────────────
+#define FETCH_INTERVAL_MS  3000  ///< How often to poll the aircraft JSON (ms)
+
+// ── Sweep Animation ──────────────────────────────────────────────────────────
+#define SWEEP_INTERVAL_MS  20    ///< Smoothness (ms between steps, lower is smoother)
+#define SWEEP_STEP_DEG    1.0f   ///< Speed (degrees per step)
+
+// ── Aircraft Expiry ───────────────────────────────────────────────────────────
+// Aircraft not seen for this long are removed from the display
+#define AIRCRAFT_MAX_AGE_S  60

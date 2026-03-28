@@ -1,0 +1,857 @@
+/**
+ * @file main.cpp
+ * @brief ADS-B Radar Display — Waveshare ESP32-S3-Knob-Touch-LCD-1.8
+ *
+ * Key design choices
+ * ──────────────────
+ * • HTTP fetch runs on Core 0 (FreeRTOS task) — the sweep animation on Core 1
+ *   never blocks, so the arm moves smoothly even during network calls.
+ * • A mutex protects the shared aircraft array.
+ * • PPI-style painting: blips appear only when the sweep arm crosses their
+ *   bearing; on the next pass the arm erases and repaints with fresh data.
+ * • Labels are erased by redrawing the exact text in black, not a dumb
+ *   fillRect, so nearby labels are not clobbered.
+ *
+ * Controls:
+ *   Encoder CW/CCW  — zoom in / zoom out
+ *   Touch blip      — show aircraft detail
+ *   Touch elsewhere — dismiss detail
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <esp_heap_caps.h>
+#define private public
+#define protected public
+#include <Arduino_GFX_Library.h>
+#undef private
+#undef protected
+#include <math.h>
+
+#include "pins.h"
+#include "config.h"
+#include "waveshare_init.h"
+#include "Settings.h"
+#include "Provisioning.h"
+#include "ClockView.h"
+#include "AssistantView.h"
+#include <time.h>
+#include <ArduinoOTA.h>
+
+
+#include <lvgl.h>
+
+static ProjectSettings settings;
+
+enum AppState { APP_RADAR, APP_ASSISTANT, APP_CLOCK };
+static AppState current_app = APP_RADAR;
+static Arduino_Canvas *assistant_canvas = nullptr;
+
+
+
+
+// ─── Colours (RGB565: RRRRR GGGGGG BBBBB) ────────────────────────────────────
+static const uint16_t C_BG       = 0x0000;  // black
+static const uint16_t C_RING     = 0x0120;  // dark green ring
+static const uint16_t C_GRID     = 0x00A0;  // dim green crosshair
+static const uint16_t C_SWEEP    = 0x07E0;  // bright green sweep arm
+static const uint16_t C_BLIP     = 0x07E0;  // blip colour
+static const uint16_t C_DIM_BLIP = 0x02E0;  // dimmed blip (dark green)
+static const uint16_t C_SEL      = 0xFFFF;  // selected aircraft (white)
+static const uint16_t C_LBL      = 0x03E0;  // callsign label
+static const uint16_t C_BOX_BG   = 0x0020;  // detail box background
+static const uint16_t C_BOX_BORD = 0x03E0;  // detail box border
+
+// ─── Display & Expanders ─────────────────────────────────────────────────────
+
+#include "TCA9554PWR.h"
+#include "Touch_GT911.h"
+
+TCA9554PWR io_expander(TCA9554_ADDR);
+Arduino_RGB_Display *gfx = nullptr; // Initialized in setup via create_waveshare_28C_rgb_panel()
+
+#define SCREEN_WIDTH  480
+#define SCREEN_HEIGHT 480
+#define CX            240
+#define CY            240
+#define SCREEN_RADIUS 230
+
+static const float DEG2RAD    = M_PI / 180.0f;
+static const float NM_PER_DEG = 60.0f;
+
+void full_redraw(); 
+int  find_nearest(int x, int y);
+void draw_blip_shape(int x, int y, int head, uint16_t color);
+void draw_detail_box();
+void erase_detail_box();
+
+static bool detail_visible = false;
+static bool detail_clobbered = false;
+static float range_nm      = DEFAULT_RANGE_NM;
+static int   selected_idx  = -1;
+
+// ─── Touch ───────────────────────────────────────────────────────────────────
+
+Touch_GT911 touch;
+
+void touch_init() {
+    // Touch reset is handled inside create_waveshare_28C_rgb_panel() via TCA9554
+    pinMode(TOUCH_INT, INPUT); // GT911 Interrupt pin
+    if (touch.begin()) {
+        Serial.println("GT911 Touch initialized successfully.");
+    }
+}
+
+static int  touch_x = -1, touch_y = -1;
+
+// We will track the last touch state to handle tap vs swipe/zoom
+static bool last_was_touching = false;
+static bool touch_active = false;
+static uint32_t last_touch_time = 0;
+static int touch_start_x = -1, touch_start_y = -1;
+
+bool read_touch() {
+    if (touch.read()) {
+        // We actually got a status update from the hardware!
+        if (touch.points > 0) {
+            touch_x = touch.touches[0].x;
+            touch_y = touch.touches[0].y;
+            touch_active = true;
+        } else {
+            touch_active = false;
+        }
+    }
+    // If touch.read() returned false, there was no hardware update; 
+    // keep the old touch_active/last_was_touching state.
+    return touch_active;
+}
+
+
+// ─── Aircraft (shared between Core 0 fetch and Core 1 render) ────────────────
+
+#define MAX_AIRCRAFT 64
+
+struct Aircraft {
+    // Data from ADS-B
+    char    hex[8], callsign[10];
+    float   lat, lon;
+    int     altitude, speed, heading;
+    bool    has_pos;
+    uint32_t seen_ms;
+    bool    position_updated; // true if updated since last sweep
+    bool    is_dimmed;        // true if currently in dimmed state
+    // Derived
+    float   bearing;      // 0=N clockwise
+    // Paint state (Core 1 only)
+    int     paint_x, paint_y, paint_hdg;
+    char    paint_cs[10];
+    bool    paint_valid;
+};
+
+static Aircraft aircraft[MAX_AIRCRAFT];
+static int      aircraft_count = 0;
+
+// Mutex protecting aircraft[] and aircraft_count
+static SemaphoreHandle_t ac_mutex;
+
+// ─── Gesture Detection ───────────────────────────────────────────────────────
+#define GESTURE_THRESHOLD 50
+
+
+static bool lvgl_active = false; // True only when LVGL clock screen is the active view
+
+void process_swipe(int x1, int y1, int x2, int y2) {
+    int dx = x2 - x1;
+    int dy = y2 - y1;
+
+    if (abs(dx) < 30 && abs(dy) < 30) {
+        // Gesture too small, treat as a TAP
+        int hit = find_nearest(x2, y2);
+        if (hit >= 0) {
+            selected_idx = hit;
+            xSemaphoreTake(ac_mutex, portMAX_DELAY);
+            Aircraft &ac = aircraft[hit];
+            if (ac.paint_valid)
+                draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, C_SEL);
+            xSemaphoreGive(ac_mutex);
+            draw_detail_box();
+        } else if (detail_visible) {
+            selected_idx = -1;
+            erase_detail_box();
+        }
+        return;
+    }
+
+    // Vertical Swipes (Zoom)
+    if (abs(dy) > abs(dx)) {
+        if (dy < -GESTURE_THRESHOLD) {
+            // Swipe UP -> Zoom IN
+            range_nm = max((float)MIN_RANGE_NM, range_nm / 1.3f);
+            Serial.println("Gesture: SWIPE UP (Zoom IN)");
+            full_redraw();
+        } else if (dy > GESTURE_THRESHOLD) {
+            // Swipe DOWN -> Zoom OUT
+            range_nm = min((float)MAX_RANGE_NM, range_nm * 1.3f);
+            Serial.println("Gesture: SWIPE DOWN (Zoom OUT)");
+            full_redraw();
+        }
+    } 
+    // Horizontal Swipes (App Navigation Placeholder)
+    else {
+        if (dx < -GESTURE_THRESHOLD) {
+            Serial.println("Gesture: SWIPE LEFT (Radar -> Assistant -> Clock)");
+            if (current_app == APP_RADAR) {
+                current_app = APP_ASSISTANT;
+                AssistantView::show();
+                full_redraw();
+            } else if (current_app == APP_ASSISTANT) {
+                current_app = APP_CLOCK;
+                lvgl_active = true;  // Enable LVGL flush before showing clock screen
+                ClockView::show();
+            }
+        } else if (dx > GESTURE_THRESHOLD) {
+            Serial.println("Gesture: SWIPE RIGHT (Clock -> Assistant -> Radar)");
+            if (current_app == APP_CLOCK) {
+                lvgl_active = false;  // Stop LVGL from flushing over radar
+                current_app = APP_ASSISTANT;
+                AssistantView::show();
+                // Load a blank black screen so LVGL has something safe to reference
+                lv_obj_t *blank = lv_obj_create(NULL);
+                lv_obj_set_style_bg_color(blank, lv_color_black(), 0);
+                lv_scr_load(blank);
+                full_redraw();
+            } else if (current_app == APP_ASSISTANT) {
+                current_app = APP_RADAR;
+                full_redraw();
+            }
+        }
+
+
+
+    }
+}
+
+
+float bearing_to(float lat, float lon) {
+    float dlat = lat - settings.home_lat;
+    float dlon = (lon - settings.home_lon) * cosf(settings.home_lat * DEG2RAD);
+    float b = atan2f(dlon, dlat) * (180.0f / M_PI);
+    return b < 0 ? b + 360.0f : b;
+}
+
+bool latlon_to_screen(float lat, float lon, int *sx, int *sy) {
+    float dlat = lat - settings.home_lat;
+    float dlon = (lon - settings.home_lon) * cosf(settings.home_lat * DEG2RAD);
+    float dist = sqrtf(dlat*dlat + dlon*dlon) * NM_PER_DEG;
+    if (dist > range_nm) return false;
+    float scale = (float)SCREEN_RADIUS / range_nm;
+    *sx = (int)(CX + dlon * NM_PER_DEG * scale);
+    *sy = (int)(CY - dlat * NM_PER_DEG * scale);
+    return true;
+}
+
+// ─── Core 0 Fetch Task ───────────────────────────────────────────────────────
+
+// ─── LVGL Integration ────────────────────────────────────────────────────────
+static const uint32_t screenWidth  = SCREEN_WIDTH;
+static const uint32_t screenHeight = SCREEN_HEIGHT;
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t *disp_draw_buf;
+static lv_disp_drv_t disp_drv;
+
+
+
+// ─── LVGL VSnyc Synchronization ────────────────────────────────────────────────
+// To prevent tearing, we align the LVGL buffer flush with the ESP32 LCD driver's
+// VSYNC signal. This callback gives a semaphore exactly when the screen finishes
+// drawing a frame, so our flush memcpy happens safely in the blanking period.
+// ─────────────────────────────────────────────────────────────────────────────
+SemaphoreHandle_t vsync_sem = NULL;
+
+IRAM_ATTR bool example_lvgl_on_vsync_callback(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *event_data, void *user_data)
+{
+    BaseType_t high_task_awoken = pdFALSE;
+    if (vsync_sem) {
+        xSemaphoreGiveFromISR(vsync_sem, &high_task_awoken);
+    }
+    return high_task_awoken == pdTRUE;
+}
+
+void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
+    if (lvgl_active) {
+        uint32_t w = (area->x2 - area->x1 + 1);
+        uint32_t h = (area->y2 - area->y1 + 1);
+        
+        // Wait for VSYNC signal before drawing to prevent "cut" tearing lines on the screen
+        if (vsync_sem) {
+            xSemaphoreTake(vsync_sem, portMAX_DELAY);
+        }
+        
+        // Copy LVGL's PSRAM buffer to the Arduino_GFX PSRAM buffer exactly after VSYNC
+        gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
+    }
+    lv_disp_flush_ready(disp_drv);
+}
+
+void my_touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
+    if (touch_x != -1 && touch_y != -1 && touch_active) {
+        data->state = LV_INDEV_STATE_PR;
+        data->point.x = touch_x;
+        data->point.y = touch_y;
+    } else {
+        data->state = LV_INDEV_STATE_REL;
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+static volatile bool fetch_requested = false;
+static volatile bool fetch_busy      = false;
+
+void fetch_task(void *pv) {
+    for (;;) {
+        if (fetch_requested && !fetch_busy) {
+            fetch_busy      = true;
+            fetch_requested = false;
+
+            if (WiFi.status() == WL_CONNECTED) {
+                HTTPClient http;
+                String url = String("http://") + ADSB_HOST + ":" + ADSB_PORT + ADSB_PATH;
+                http.begin(url);
+                http.setTimeout(2500);
+                int code = http.GET();
+                if (code == 200) {
+                    // Parse into a local temporary buffer
+                    JsonDocument doc;
+                    deserializeJson(doc, *http.getStreamPtr());
+                    http.end();
+
+                    // Update aircraft list in-place
+                    xSemaphoreTake(ac_mutex, portMAX_DELAY);
+                    for (JsonObject ac_obj : doc["aircraft"].as<JsonArray>()) {
+                        const char *hex = ac_obj["hex"] | "";
+                        if (!hex[0]) continue;
+
+                        // Find existing or empty slot
+                        int idx = -1;
+                        for (int i = 0; i < aircraft_count; i++) {
+                            if (strcmp(aircraft[i].hex, hex) == 0) { idx = i; break; }
+                        }
+                        if (idx == -1 && aircraft_count < MAX_AIRCRAFT) {
+                            idx = aircraft_count++;
+                            memset(&aircraft[idx], 0, sizeof(Aircraft));
+                            strlcpy(aircraft[idx].hex, hex, sizeof(aircraft[idx].hex));
+                        }
+
+                        if (idx != -1) {
+                            Aircraft &a = aircraft[idx];
+                            const char *fl = ac_obj["flight"];
+                            if (fl) strlcpy(a.callsign, fl, sizeof(a.callsign));
+                            else if (!a.callsign[0]) strlcpy(a.callsign, a.hex, sizeof(a.callsign));
+                            for (int i=strlen(a.callsign)-1;i>=0&&a.callsign[i]==' ';i--) a.callsign[i]='\0';
+                            
+                            a.has_pos  = ac_obj["lat"].is<float>() && ac_obj["lon"].is<float>();
+                            if (a.has_pos) {
+                                a.lat      = ac_obj["lat"];
+                                a.lon      = ac_obj["lon"];
+                                a.bearing  = bearing_to(a.lat, a.lon);
+                                // Mark fresh only if updated in last 5 seconds
+                                if ((float)(ac_obj["seen_pos"] | 0.0f) < 5.0f) {
+                                    a.position_updated = true;
+                                }
+                            }
+                            a.altitude = ac_obj["alt_baro"] | a.altitude;
+                            a.speed    = ac_obj["gs"].is<float>() ? (int)ac_obj["gs"].as<float>() : a.speed;
+                            a.heading  = ac_obj["track"].is<float>() ? (int)ac_obj["track"].as<float>() : a.heading;
+                            a.seen_ms  = millis();
+                        }
+                    }
+                    xSemaphoreGive(ac_mutex);
+                } else {
+                    http.end();
+                }
+            }
+            fetch_busy = false;
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+// ─── Rendering (Core 1) ───────────────────────────────────────────────────────
+
+static float sweep_angle = 0.0f;
+static float prev_sweep  = -1.0f;
+
+void draw_blip_shape(int cx, int cy, int hdg, uint16_t col) {
+    float a = hdg * DEG2RAD, sz = 6;
+    int x0=cx+(int)(sinf(a)*sz),            y0=cy-(int)(cosf(a)*sz);
+    int x1=cx+(int)(sinf(a+2.4f)*sz*.7f),   y1=cy-(int)(cosf(a+2.4f)*sz*.7f);
+    int x2=cx+(int)(sinf(a-2.4f)*sz*.7f),   y2=cy-(int)(cosf(a-2.4f)*sz*.7f);
+    gfx->drawTriangle(x0,y0,x1,y1,x2,y2,col);
+}
+
+void restore_rings_and_cross() {
+    for (int r = 1; r <= 3; r++)
+        gfx->drawCircle(CX, CY, SCREEN_RADIUS*r/3, C_RING);
+    gfx->drawFastHLine(CX-SCREEN_RADIUS, CY, SCREEN_RADIUS*2, C_GRID);
+    gfx->drawFastVLine(CX, CY-SCREEN_RADIUS, SCREEN_RADIUS*2, C_GRID);
+    gfx->fillCircle(CX, CY, 3, C_BLIP);
+    // Restore range labels at 12-o'clock on each ring
+    gfx->setTextColor(C_LBL, C_BG);
+    gfx->setTextSize(1);
+    char buf[8];
+    for (int r = 1; r <= 3; r++) {
+        sprintf(buf, "%.0f", range_nm*r/3.0f);
+        int16_t x, y; uint16_t w, h;
+        gfx->getTextBounds(buf, 0, 0, &x, &y, &w, &h);
+        gfx->setCursor(CX - w/2, CY - SCREEN_RADIUS*r/3 + 1);
+        gfx->print(buf);
+    }
+}
+
+void draw_static_bg() {
+    gfx->fillScreen(C_BG);
+    restore_rings_and_cross();
+}
+
+/** True if segment (x1,y1)→(x2,y2) passes within `thresh` pixels of point (px,py) */
+static bool line_near(int x1, int y1, int x2, int y2, int px, int py, float thresh) {
+    float dx = x2-x1, dy = y2-y1;
+    float len2 = dx*dx + dy*dy;
+    if (len2 < 1.0f) return false;
+    // Project point onto segment, clamp to [0,1]
+    float t = ((px-x1)*dx + (py-y1)*dy) / len2;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    float cx = x1 + t*dx - px;
+    float cy = y1 + t*dy - py;
+    return (cx*cx + cy*cy) < thresh*thresh;
+}
+
+void erase_sweep(float a_deg) {
+    float a  = a_deg * DEG2RAD;
+    int   ex = CX + (int)(sinf(a) * SCREEN_RADIUS);
+    int   ey = CY - (int)(cosf(a) * SCREEN_RADIUS);
+    gfx->drawLine(CX, CY, ex, ey, C_BG);
+    restore_rings_and_cross();
+
+    // Restore any painted blips the sweep line crossed through
+    xSemaphoreTake(ac_mutex, portMAX_DELAY);
+    for (int i = 0; i < aircraft_count; i++) {
+        Aircraft &ac = aircraft[i];
+        if (!ac.paint_valid) continue;
+
+        // Check triangle centre and several points along the callsign label
+        int  lx = ac.paint_x, ly = ac.paint_y;
+        int  label_len = strlen(ac.paint_cs);
+        bool hit = line_near(CX, CY, ex, ey, lx, ly, 10.0f);   // blip triangle
+        for (int c = 0; c <= label_len && !hit; c++) {           // scan label chars
+            hit = line_near(CX, CY, ex, ey, lx+8+c*6, ly, 7.0f);
+        }
+        if (!hit) continue;
+
+        // Redraw this blip
+        bool sel = (i == selected_idx);
+        draw_blip_shape(lx, ly, ac.paint_hdg, sel ? C_SEL : (ac.is_dimmed ? C_DIM_BLIP : C_BLIP));
+        gfx->setTextColor(sel ? C_SEL : C_LBL, C_BG);
+        gfx->setTextSize(1);
+        gfx->setCursor(lx+8, ly-4);
+        gfx->print(ac.paint_cs);
+    }
+    xSemaphoreGive(ac_mutex);
+
+    // If detail box is visible, check if the sweep line clobbers it
+    if (detail_visible) {
+        // Box is at (160, 40) size (160, 68)
+        // Check if (CX, CY) -> (ex, ey) passes near box
+        // For simplicity, check 4 corners and center
+        if (line_near(CX, CY, ex, ey, 160, 40, 10.0f) || 
+            line_near(CX, CY, ex, ey, 320, 40, 10.0f) ||
+            line_near(CX, CY, ex, ey, 160, 108, 10.0f) ||
+            line_near(CX, CY, ex, ey, 320, 108, 10.0f) ||
+            line_near(CX, CY, ex, ey, 240, 74, 10.0f)) {
+            detail_clobbered = true;
+        }
+    }
+}
+
+void draw_sweep(float a_deg) {
+    float a = a_deg * DEG2RAD;
+    gfx->drawLine(CX, CY, CX+(int)(sinf(a)*SCREEN_RADIUS), CY-(int)(cosf(a)*SCREEN_RADIUS), C_SWEEP);
+}
+
+
+/** Erase a blip — fillRect over icon area (robust regardless of heading), then exact text overdraw */
+void erase_blip(int x, int y, int hdg, const char *cs) {
+    // Wipe a box big enough to cover the triangle in any orientation
+    gfx->fillRect(x-9, y-9, 18, 18, C_BG);
+    // Erase label by overdrawing exact text in black
+    gfx->setTextColor(C_BG, C_BG);
+    gfx->setTextSize(1);
+    gfx->setCursor(x+8, y-4);
+    gfx->print(cs);
+    restore_rings_and_cross();
+}
+
+/** Paint a blip and record paint state */
+void paint_blip(Aircraft &ac, int sx, int sy, uint16_t color) {
+    bool sel = (&ac - aircraft) == selected_idx;
+    draw_blip_shape(sx, sy, ac.heading, sel ? C_SEL : color);
+    gfx->setTextColor(sel ? C_SEL : C_LBL, C_BG);
+    gfx->setTextSize(1);
+    gfx->setCursor(sx+8, sy-4);
+    gfx->print(ac.callsign);
+    ac.paint_x   = sx;
+    ac.paint_y   = sy;
+    ac.paint_hdg = ac.heading;
+    strlcpy(ac.paint_cs, ac.callsign, sizeof(ac.paint_cs));
+    ac.paint_valid = true;
+}
+
+/**
+ * For each aircraft whose bearing is crossed by the sweep arm advancing
+ * from prev_angle to new_angle: erase old painted position, repaint new.
+ */
+void sweep_paint_aircraft(float prev_angle, float new_angle) {
+    xSemaphoreTake(ac_mutex, portMAX_DELAY);
+
+    for (int i = 0; i < aircraft_count; i++) {
+        Aircraft &ac = aircraft[i];
+        if (!ac.has_pos || ac.bearing < 0) continue;
+        
+        // Hard expiry for very old data
+        if (millis() - ac.seen_ms > (uint32_t)(AIRCRAFT_MAX_AGE_S * 1000)) {
+            if (ac.paint_valid) {
+                erase_blip(ac.paint_x, ac.paint_y, ac.heading, ac.paint_cs);
+                ac.paint_valid = false;
+            }
+            continue;
+        }
+
+        bool crossed = (prev_angle <= new_angle)
+            ? (ac.bearing >= prev_angle && ac.bearing < new_angle)
+            : (ac.bearing >= prev_angle || ac.bearing < new_angle);
+        if (!crossed) continue;
+
+        // Erase old painted position (if any)
+        if (ac.paint_valid)
+            erase_blip(ac.paint_x, ac.paint_y, ac.heading, ac.paint_cs);
+
+        // Aging logic
+        if (ac.position_updated) {
+            // Fresh data! Paint normally.
+            int sx, sy;
+            if (latlon_to_screen(ac.lat, ac.lon, &sx, &sy)) {
+                paint_blip(ac, sx, sy, C_BLIP);
+                ac.is_dimmed = false;
+            } else {
+                ac.paint_valid = false;
+            }
+            ac.position_updated = false;
+        } else {
+            // No update since last sweep
+            if (ac.is_dimmed) {
+                // Was already dimmed, now remove
+                ac.paint_valid = false;
+            } else {
+                // Dim it
+                int sx, sy;
+                if (latlon_to_screen(ac.lat, ac.lon, &sx, &sy)) {
+                    paint_blip(ac, sx, sy, C_DIM_BLIP);
+                    ac.is_dimmed = true;
+                } else {
+                    ac.paint_valid = false;
+                }
+            }
+        }
+    }
+
+    xSemaphoreGive(ac_mutex);
+}
+
+void draw_detail_box() {
+    xSemaphoreTake(ac_mutex, portMAX_DELAY);
+    if (selected_idx < 0 || selected_idx >= aircraft_count) {
+        xSemaphoreGive(ac_mutex); return;
+    }
+    Aircraft ac = aircraft[selected_idx];  // local copy
+    xSemaphoreGive(ac_mutex);
+
+    int bx = 160, by = 40, bw = 160, bh = 68;
+    gfx->fillRect(bx, by, bw, bh, C_BOX_BG);
+    gfx->drawRect(bx, by, bw, bh, C_BOX_BORD);
+    gfx->setTextColor(C_LBL, C_BOX_BG);
+    gfx->setTextSize(1);
+    gfx->setCursor(bx+6, by+8); gfx->print(ac.callsign[0] ? ac.callsign : ac.hex);
+    gfx->setCursor(bx+6, by+22); gfx->printf("Alt: %d ft", ac.altitude);
+    gfx->setCursor(bx+6, by+36); gfx->printf("Spd: %d kts", ac.speed);
+    gfx->setCursor(bx+6, by+50); gfx->printf("Hdg: %d deg", ac.heading);
+    detail_visible = true;
+    detail_clobbered = false;
+}
+
+void erase_detail_box() {
+    gfx->fillRect(160, 40, 160, 68, C_BG);
+    restore_rings_and_cross();
+    detail_visible = false;
+    detail_clobbered = false;
+}
+
+void draw_range_label() {
+    gfx->fillRect(CX-40, SCREEN_HEIGHT-18, 80, 14, C_BG);
+    gfx->setTextColor(C_LBL, C_BG);
+    gfx->setTextSize(1);
+    gfx->setCursor(CX-30, SCREEN_HEIGHT-14);
+    gfx->printf("%.0f nm", range_nm);
+}
+
+int find_nearest(int tx, int ty) {
+    int best = -1; float best_d = 18.0f;
+    xSemaphoreTake(ac_mutex, portMAX_DELAY);
+    for (int i = 0; i < aircraft_count; i++) {
+        if (!aircraft[i].paint_valid) continue;
+        float d = sqrtf((float)((tx-aircraft[i].paint_x)*(tx-aircraft[i].paint_x)+
+                                (ty-aircraft[i].paint_y)*(ty-aircraft[i].paint_y)));
+        if (d < best_d) { best_d=d; best=i; }
+    }
+    xSemaphoreGive(ac_mutex);
+    return best;
+}
+
+void full_redraw() {
+    // Invalidate all paint state so aircraft repaint on next sweep pass
+    xSemaphoreTake(ac_mutex, portMAX_DELAY);
+    for (int i = 0; i < aircraft_count; i++) aircraft[i].paint_valid = false;
+    xSemaphoreGive(ac_mutex);
+    draw_static_bg();
+    draw_sweep(sweep_angle);
+    draw_range_label();
+    if (detail_visible) draw_detail_box();
+    prev_sweep = sweep_angle;
+}
+
+// ─── Arduino entry points ─────────────────────────────────────────────────────
+
+void setup() {
+    Serial.begin(115200);
+    Serial0.begin(115200); // Hardware UART0 (usually on header pins 43/44)
+    // Encoder removed.
+    
+    // PWM Backlight on native GPIO 6
+    // The demo uses 20kHz, 10-bit resolution. 100% duty = 1024
+    ledcAttach(LCD_BL, 20000, 10);
+    ledcWrite(LCD_BL, 1023); // Max brightness (100%)
+
+    vsync_sem = xSemaphoreCreateBinary();
+
+    gfx = create_waveshare_28C_rgb_panel();
+    gfx->begin();
+
+    // ─── VSYNC Callback Registration Hack ───
+    // Arduino_GFX abstracts the ESP32-S3 RGB LCD driver, keeping `_panel_handle`
+    // inaccessible. We redefine private to public in the header to access the handle
+    // and manually register the VSYNC interrupt that LVGL depends on.
+    esp_lcd_rgb_panel_event_callbacks_t cbs = {
+        .on_vsync = example_lvgl_on_vsync_callback,
+    };
+    esp_lcd_rgb_panel_register_event_callbacks(gfx->_rgbpanel->_panel_handle, &cbs, NULL);
+
+    touch_init();
+
+    // Splash screen while WiFi connects
+    gfx->fillScreen(C_BG);
+    gfx->setTextColor(C_SWEEP, C_BG);
+    gfx->setTextSize(2);
+    gfx->setCursor(45, 155); gfx->print("ADS-B Radar");
+    gfx->setTextSize(1);
+    
+    // Handshake: Check for touch to force provisioning mode
+    gfx->setTextColor(0x0350, C_BG); // Dim green
+    gfx->setCursor(60, 200); gfx->print("TOUCH TO SETUP...");
+    
+    unsigned long start_wait = millis();
+    bool force_ap = false;
+    while (millis() - start_wait < 2500) {
+        if (read_touch()) {
+            force_ap = true;
+            break;
+        }
+        delay(20);
+    }
+
+    // Load Settings
+    bool has_settings = SettingsManager::load(settings);
+    
+    if (!has_settings || force_ap) {
+        gfx->fillRect(0, 180, 480, 60, C_BG);
+        gfx->setCursor(60, 180); 
+        gfx->print(force_ap ? "FORCING SETUP..." : "NO CONFIG! AP MODE...");
+        ProvisioningManager::startPortal(settings);
+    }
+    
+    range_nm = settings.range_nm; // Initialize range from settings
+
+    gfx->setCursor(60, 180); gfx->print("Connecting WiFi...");
+    Serial.printf("Connecting to %s...\n", settings.wifi_ssid);
+
+    WiFi.begin(settings.wifi_ssid, settings.wifi_password);
+    
+    unsigned long start_wifi = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start_wifi < 10000) {
+        delay(500);
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        gfx->fillRect(60, 180, 400, 20, C_BG);
+        gfx->setCursor(60, 180); gfx->print("WiFi failed! AP Mode...");
+        ProvisioningManager::startPortal(settings);
+    }
+
+    Serial.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
+    ArduinoOTA.setHostname("esp32-radar");
+    ArduinoOTA.begin();
+
+    // Initialize NTP
+    Serial.printf("Syncing NTP (GMT Offset: %.1f)...\n", settings.gmt_offset);
+    configTime(settings.gmt_offset * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+    ac_mutex = xSemaphoreCreateMutex();
+
+    // Fetch task on Core 0 — main loop (sweep/render) runs on Core 1
+    xTaskCreatePinnedToCore(fetch_task, "fetch", 8192, nullptr, 1, nullptr, 0);
+
+    // Initial data fetch (blocking, before render starts)
+    fetch_requested = true;
+    while (fetch_busy || fetch_requested) delay(50);
+
+    full_redraw();
+
+    full_redraw();
+
+    // Prepare assistant canvas
+    assistant_canvas = new Arduino_Canvas(SCREEN_WIDTH, SCREEN_HEIGHT, gfx, 0, 0, 0);
+    if (!assistant_canvas->begin(GFX_SKIP_OUTPUT_BEGIN)) {
+        Serial.println("Warning: Assistant canvas failed to initialize");
+        delete assistant_canvas;
+        assistant_canvas = nullptr;
+    }
+    AssistantView::set_canvas(assistant_canvas);
+    AssistantView::init();
+
+    // Initialize LVGL
+
+
+
+    lv_init();
+    
+    // Allocate two full-screen buffers in PSRAM for double buffering. 
+    // This allows LVGL to draw into one buffer entirely while the LCD 
+    // peripheral is safely streaming from the other, thus avoiding tearing.
+    size_t buf_size = SCREEN_WIDTH * SCREEN_HEIGHT;
+    lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(buf_size * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(buf_size * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    
+    if (!buf1 || !buf2) {
+        Serial.println("LVGL double buffer PSRAM allocation failed! Falling back to SRAM single buffer...");
+        // Fallback to smaller single buffer in SRAM if PSRAM fails
+        buf_size = SCREEN_WIDTH * 40;
+        buf1 = (lv_color_t *)malloc(buf_size * sizeof(lv_color_t));
+        buf2 = NULL;
+    }
+    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, buf_size);
+
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = SCREEN_WIDTH;
+    disp_drv.ver_res = SCREEN_HEIGHT;
+    disp_drv.flush_cb = my_disp_flush;
+    disp_drv.draw_buf = &draw_buf;
+    disp_drv.full_refresh = 1;      // Fix tearing issue with ESP32 DMA
+    disp_drv.antialiasing = 1;      // Smooth out the second hand
+    lv_disp_drv_register(&disp_drv);
+
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = my_touchpad_read;
+    lv_indev_drv_register(&indev_drv);
+
+    ClockView::init();
+}
+
+void loop() {
+    unsigned long now = millis();
+
+    // Touch processing
+    touch_active = read_touch();
+    bool is_new_tap = touch_active && !last_was_touching;
+    if (is_new_tap) {
+        touch_start_x = touch_x;
+        touch_start_y = touch_y;
+        last_touch_time = now;
+    }
+
+    // On touch release, process the gesture
+    if (!touch_active && last_was_touching) {
+        process_swipe(touch_start_x, touch_start_y, touch_x, touch_y);
+    }
+    
+    last_was_touching = touch_active;
+
+    if (current_app == APP_RADAR) {
+        // Don't run lv_timer_handler in radar mode -- it would flush LVGL's white screen over us
+        
+        // Sweep — smooth single-arm rotation
+        static unsigned long last_sweep_ms = 0;
+        if (now - last_sweep_ms >= SWEEP_INTERVAL_MS) {
+            float new_angle = fmodf(sweep_angle + SWEEP_STEP_DEG, 360.0f);
+            if (prev_sweep >= 0) erase_sweep(prev_sweep);
+            sweep_paint_aircraft(sweep_angle, new_angle);
+            draw_sweep(new_angle);
+            if (detail_visible && detail_clobbered) draw_detail_box();
+            prev_sweep  = sweep_angle;
+            sweep_angle = new_angle;
+            last_sweep_ms = now;
+        }
+
+        // Trigger background fetch every FETCH_INTERVAL_MS
+        static unsigned long last_fetch_ms = 0;
+        if (now - last_fetch_ms >= FETCH_INTERVAL_MS && !fetch_busy) {
+            fetch_requested = true;
+            last_fetch_ms = now;
+        }
+    } else if (current_app == APP_ASSISTANT) {
+        AssistantView::update();
+    } else if (current_app == APP_CLOCK) {
+        ClockView::update_time(); 
+        lv_timer_handler();
+    }
+
+    // ─── UART Remote Control (Pi Brains) ───
+    Stream* inputs[] = {&Serial, &Serial0};
+    for (Stream* s : inputs) {
+        while (s->available()) {
+            String rx = s->readStringUntil('\n');
+            rx.trim();
+            if (rx.length() == 0) continue;
+
+            if (rx == "Z+") {
+                range_nm = max((float)MIN_RANGE_NM, range_nm / 1.15f);
+                Serial.printf("Remote Zoom IN: %.1f nm\n", range_nm);
+                full_redraw();
+            } else if (rx == "Z-") {
+                range_nm = min((float)MAX_RANGE_NM, range_nm * 1.15f);
+                Serial.printf("Remote Zoom OUT: %.1f nm\n", range_nm);
+                full_redraw();
+            } else if (rx.startsWith("A")) {
+                int intensity = rx.substring(1).toInt();
+                AssistantView::set_audio_intensity(intensity);
+            }
+        }
+    }
+    
+    ArduinoOTA.handle();
+
+    delay(5);
+}
