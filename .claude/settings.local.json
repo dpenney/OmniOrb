@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ssh pi@octopi.local \"cd ~/assistant && ./venv/bin/python find_mic.py\")",
+      "Bash(ssh:*)",
+      "Bash(scp:*)"
+    ]
+  }
+}

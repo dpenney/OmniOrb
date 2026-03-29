@@ -12,10 +12,22 @@ PIN_ROTARY_DT  = 22
 PIN_ROTARY_SW  = None # Not currently used
 PIN_SFT_GND    = 27   # Software Ground for Encoder
 
+# I2S Audio Pins (Standard Raspberry Pi I2S)
+# These are handled by the system driver, but defined here for hardware reference.
+PIN_I2S_BCLK  = 18
+PIN_I2S_LRCK  = 19
+PIN_I2S_DIN   = 20    # Microphone Data 
+PIN_I2S_DOUT  = 21    # Speaker Data
+
+# UART Pins (Standard Raspberry Pi UART)
+# Used for serial communication with the ESP32
+PIN_UART_TX   = 14
+PIN_UART_RX   = 15
+
 # Audio Configuration
-AUDIO_DEVICE_INDEX = 1
-AUDIO_CHANNELS     = 2
-AUDIO_RATE         = 48000
+AUDIO_DEVICE_INDEX = 0
+AUDIO_CHANNELS     = 2        # Original working stereo setting
+AUDIO_RATE         = 48000    # Original working rate
 AUDIO_CHUNK        = 1024
 
 # Logging

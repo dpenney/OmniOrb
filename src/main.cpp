@@ -847,6 +847,38 @@ void loop() {
             } else if (rx.startsWith("A")) {
                 int intensity = rx.substring(1).toInt();
                 AssistantView::set_audio_intensity(intensity);
+            } else if (rx.startsWith("S")) {
+                // Parse combined spectrum and intensity: S20,45,0,3...|A100
+                int pipe_idx = rx.indexOf('|');
+                String s_data;
+                String a_data = "";
+                if (pipe_idx != -1) {
+                    s_data = rx.substring(1, pipe_idx);
+                    a_data = rx.substring(pipe_idx + 1);
+                } else {
+                    s_data = rx.substring(1);
+                }
+
+                // Parse Spectrum Bins
+                int bins[16];
+                int bin_idx = 0;
+                int start_idx = 0;
+                while (bin_idx < 16 && start_idx < s_data.length()) {
+                    int next_comma = s_data.indexOf(',', start_idx);
+                    if (next_comma == -1) {
+                        bins[bin_idx++] = s_data.substring(start_idx).toInt();
+                        break;
+                    }
+                    bins[bin_idx++] = s_data.substring(start_idx, next_comma).toInt();
+                    start_idx = next_comma + 1;
+                }
+                AssistantView::set_spectrum(bins, bin_idx);
+
+                // Parse Intensity if present
+                if (a_data.startsWith("A")) {
+                    int intensity = a_data.substring(1).toInt();
+                    AssistantView::set_audio_intensity(intensity);
+                }
             }
         }
     }

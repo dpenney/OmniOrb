@@ -44,15 +44,17 @@ else
 fi
 
 # 3. Create Virtual Environment
-if [ ! -f "venv/bin/pip" ]; then
-    echo -e "🐍 Creating virtual environment (venv)..."
+# We ensure system-site-packages is enabled so we can use system numpy/pyaudio
+VENV_CFG="venv/pyvenv.cfg"
+if [ ! -f "venv/bin/pip" ] || [ ! -f "$VENV_CFG" ] || ! grep -q "include-system-site-packages = true" "$VENV_CFG"; then
+    echo -e "🐍 Creating/Updating virtual environment (venv)..."
     if [ -d "venv" ]; then
-        echo -e "${YELLOW}🧹 Removing old/broken venv...${NC}"
+        echo -e "${YELLOW}🧹 Removing old/incompatible venv...${NC}"
         rm -rf venv 
     fi
     python3 -m venv --system-site-packages venv
 else
-    echo -e "${GREEN}✅ Venv already exists and is healthy.${NC}"
+    echo -e "${GREEN}✅ Venv already exists and is correctly configured.${NC}"
 fi
 
 # 4. Install Python Ingredients

@@ -11,6 +11,10 @@ public:
     static void hide();
     static void set_canvas(Arduino_Canvas *canvas);
     static void set_audio_intensity(int intensity);
+    static void set_spectrum(const int* bins, int count);
+
+private:
+    static int freq_bins[16];
 };
 
 #endif

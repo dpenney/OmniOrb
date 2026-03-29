@@ -79,9 +79,9 @@ def audio_processor():
         return
 
     CHUNK = config.AUDIO_CHUNK
-    FORMAT = pyaudio.paInt16
+    FORMAT = pyaudio.paInt32  # I2S MEMS mics require 32-bit format
     CHANNELS = config.AUDIO_CHANNELS
-    RATE = config.AUDIO_RATE 
+    RATE = config.AUDIO_RATE
     DEVICE_INDEX = config.AUDIO_DEVICE_INDEX 
 
     p = pyaudio.PyAudio()
@@ -93,46 +93,88 @@ def audio_processor():
                         input=True,
                         input_device_index=DEVICE_INDEX,
                         frames_per_buffer=CHUNK)
-        logger.info("Audio stream opened for I2S microphone")
+        logger.info("Audio stream opened for I2S microphone (16-bit)")
     except Exception as e:
         logger.error(f"Failed to open audio stream: {e}")
         return
 
     last_send_time = 0
-    last_log_time = 0
+    last_log_time = time.time()
     while True:
         try:
             data = stream.read(CHUNK, exception_on_overflow=False)
-            audio_data = np.frombuffer(data, dtype=np.int16)
+            # Diagnostic: Calculate RMS for both stereo slots to find where the mic is!
+            raw_samples = np.frombuffer(data, dtype=np.int32)  # Match 32-bit format
+            ch_left  = raw_samples[0::2]
+            ch_right = raw_samples[1::2]
             
-            # Simple RMS-based intensity
-            # Use float32 to avoid overflow when squaring int16
-            rms = np.sqrt(np.mean(audio_data.astype(np.float32)**2))
+            # Normalize 32-bit samples to float64 ±1.0 range
+            norm_samples = ch_left.astype(np.float64) / 2147483648.0
+
+            # Simple RMS-based intensity (scaled 0-100)
+            rms_left  = np.sqrt(np.mean(norm_samples**2)) * 100.0
             
-            # Diagnostic log every 10 seconds to reduce chattiness
+            # Auto-gain moving average (EMA)
+            avg_rms = assistant_state.get("avg_rms", 1.0)
+            avg_rms = (avg_rms * 0.95) + (rms_left * 0.05)
+            assistant_state["avg_rms"] = max(0.1, avg_rms) # Prevent div by 0
+
+            # Diagnostic log every 10 seconds 
             now = time.time()
             if now - last_log_time > 10.0:
-                logger.info(f"Microphone RMS: {rms:.2f}")
+                logger.info(f"Microphone RMS: {rms_left:.4f} (Avg: {avg_rms:.4f})")
                 last_log_time = now
 
-            # Floor subtraction and 8x boost for high reactivity
-            # Silence is ~4.0 based on logs.
-            adj_rms = max(0, rms - 4.0)
-            intensity = int(min(100, adj_rms * 8.0)) 
+            # Floor subtraction (user calibrated to 0.03)
+            adj_rms = max(0.0, rms_left - 0.03)
             
+            # ─── Auto-Gain Control (AGC) for Central Orb ───
+            if adj_rms > 0.02:
+                # Faster Attack: 10% new data per frame (~1 second adapt)
+                avg_rms = (avg_rms * 0.90) + (adj_rms * 0.10)
+            else:
+                # Fast Decay: Drop `avg_rms` down to 0.10 during silence 
+                # This allows the multiplier to relax up to 400x for the next quiet sound
+                avg_rms = (avg_rms * 0.95) + (0.10 * 0.05)
+                
+            assistant_state["avg_rms"] = max(0.1, avg_rms)
+            
+            dynamic_multiplier = 80.0 / assistant_state["avg_rms"]
+            dynamic_multiplier = max(2.0, min(2000.0, dynamic_multiplier))
+            
+            intensity = int(min(100, adj_rms * dynamic_multiplier)) 
             assistant_state["audio_intensity"] = intensity
             
+            # ─── FFT Spectrum Analysis ───
+            fft_data = np.abs(np.fft.rfft(norm_samples)) 
+            
+            # Bucket into 16 bins for the ESP32
+            num_bins = 16
+            chunk_size = len(fft_data) // num_bins
+            bins = []
+            
+            # Calculate a dynamic gain factor based on moving average volume
+            # Amplifies quiet sounds, dampens very loud sounds
+            gain = 1.0 / assistant_state["avg_rms"]
+            gain = max(0.5, min(10.0, gain)) # Clamp the gain multiplier
+            
+            for i in range(num_bins):
+                start = i * chunk_size
+                end = (i + 1) * chunk_size
+                mag = np.mean(fft_data[start:end])
+                
+                # Apply Dynamic Gain, log scale, and cap at 100
+                scaled_mag = int(min(100, np.log1p(mag * 200.0 * gain) * 15.0))
+                bins.append(scaled_mag)
+
+            
+            bin_string = ",".join(map(str, bins))
+
             # Broadcast to ESP32 to prevent buffer bloat
             now = time.time()
             if now - last_send_time > (1.0 / config.AUDIO_UPDATE_HZ):
-                # Delta threshold: only send if intensity changed significantly
-                last_sent = assistant_state.get("last_intensity_sent", 0)
-                diff = abs(intensity - last_sent)
-                
-                # Send if significant change OR if we need to return to 0
-                if diff >= 3 or (intensity == 0 and last_sent > 0):
-                    send_uart_command(f"A{intensity}")
-                    assistant_state["last_intensity_sent"] = intensity
+                # Always send spectrum and intensity combined if the app is active
+                send_uart_command(f"S{bin_string}|A{intensity}")
                 
                 last_send_time = now
                 
