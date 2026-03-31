@@ -25,13 +25,13 @@ PIN_UART_TX   = 14
 PIN_UART_RX   = 15
 
 # Audio Configuration
-AUDIO_DEVICE_INDEX = 0
+AUDIO_DEVICE_INDEX = 1
 AUDIO_CHANNELS     = 2        # Original working stereo setting
 AUDIO_RATE         = 48000    # Original working rate
 AUDIO_CHUNK        = 1024
 
 # Logging
-LOG_FILE = "/home/pi/assistant/assistant.log"
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assistant.log")
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 

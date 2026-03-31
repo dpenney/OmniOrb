@@ -2,7 +2,7 @@
 set -e
 
 # Target Raspberry Pi address
-PI_HOST="octopi.local"
+PI_HOST="omnihub.local"
 PI_USER="pi"
 PI_DIR="/home/pi/assistant"
 

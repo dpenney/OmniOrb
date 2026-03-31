@@ -19,14 +19,14 @@ echo -e "${BLUE}------------------------------------------${NC}"
 
 # 1. User Validation
 if [ "$EUID" -eq 0 ]; then
-    echo -e "${RED}❌ Error: Please DO NOT run this script with 'sudo'. Run it as the 'pi' user.${NC}"
+    echo -e "${RED}❌ Error: Please DO NOT run this script with 'sudo'. Run it as a normal user.${NC}"
     echo "The script will use 'sudo' internally when it needs to."
     exit 1
 fi
 
 # 2. Install System Dependencies
 echo -e "📦 Checking system dependencies..."
-DEPENDENCIES="python3-venv python3-pip portaudio19-dev python3-pyaudio python3-numpy rsync"
+DEPENDENCIES="python3-venv python3-pip portaudio19-dev python3-pyaudio python3-numpy rsync device-tree-compiler"
 MISSING_DEPS=""
 
 for dep in $DEPENDENCIES; do

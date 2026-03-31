@@ -25,7 +25,7 @@ app = Flask(__name__)
 assistant_state = {
     "zoom": 15,
     "last_event": None,
-    "mic_active": False,
+    "mic_active": True,  # Default to TRUE so it works even if sync fails
     "audio_intensity": 0
 }
 
@@ -44,7 +44,8 @@ logger = logging.getLogger(__name__)
 # Try common Pi serial ports
 serial_ports = config.SERIAL_PORTS
 ser = None
-ser_lock = threading.Lock()
+ser_lock = threading.Lock()   # protects writes only
+ser_read_lock = threading.Lock()  # protects reads only (TX and RX are independent)
 
 for port in serial_ports:
     try:
@@ -60,16 +61,39 @@ if not ser:
 
 def serial_reader():
     """Background thread to read and log incoming serial data from ESP32"""
+    global assistant_state
     while True:
         try:
-            with ser_lock:
-                if ser and ser.is_open:
-                    if ser.in_waiting > 0:
+            if ser and ser.is_open:
+                # Read ALL available lines in a burst to prevent buffer lag
+                # Uses ser_read_lock (separate from write lock — TX/RX are independent)
+                while ser.in_waiting > 0:
+                    with ser_read_lock:
                         line = ser.readline().decode('utf-8', errors='ignore').strip()
-                        if line:
+
+                    if not line:
+                        break
+
+                    # Mode Synchronization
+                    if "APP:" in line:
+                        # Extract everything after "APP:" robustly
+                        app_mode = line.split("APP:", 1)[1].split()[0]
+                        if app_mode == "ASSISTANT":
+                            assistant_state["mic_active"] = True
+                            logger.info("Assistant mode confirmed: Processing audio")
+                        else:
+                            assistant_state["mic_active"] = False
+                            logger.info(f"App mode switched to {app_mode}: Pausing audio")
+                    else:
+                        # Log anything else from the ESP32 if it's not a common debug line
+                        if not any(x in line for x in ["Gesture", "Touch", "Remote"]):
                             logger.info(f"[ESP32] {line}")
+                        else:
+                            logger.debug(f"[ESP32 Debug] {line}")
         except Exception as e:
             logger.error(f"Serial read error: {e}")
+            time.sleep(1) # Wait on error
+            
         time.sleep(config.SERIAL_READER_SLEEP)
 
 def audio_processor():
@@ -102,6 +126,11 @@ def audio_processor():
     last_log_time = time.time()
     while True:
         try:
+            # Only process audio if the Assistant screen is active on the ESP32
+            if not assistant_state.get("mic_active", False):
+                time.sleep(0.1)
+                continue
+
             data = stream.read(CHUNK, exception_on_overflow=False)
             # Diagnostic: Calculate RMS for both stereo slots to find where the mic is!
             raw_samples = np.frombuffer(data, dtype=np.int32)  # Match 32-bit format
@@ -122,7 +151,7 @@ def audio_processor():
             # Diagnostic log every 10 seconds 
             now = time.time()
             if now - last_log_time > 10.0:
-                logger.info(f"Microphone RMS: {rms_left:.4f} (Avg: {avg_rms:.4f})")
+                logger.debug(f"Microphone RMS: {rms_left:.4f} (Avg: {avg_rms:.4f})")
                 last_log_time = now
 
             # Floor subtraction (user calibrated to 0.03)
@@ -248,10 +277,14 @@ def mic_stop():
     return jsonify({"status": "mic_idle"})
 
 if __name__ == "__main__":
-    # Start Serial Reader thread
+    # Start Serial Reader thread before sending SYNC? so the response isn't missed
     reader_thread = threading.Thread(target=serial_reader, daemon=True)
     reader_thread.start()
     logger.info("Serial reader thread started")
+
+    # Request current app mode from ESP32 in case it's already running
+    time.sleep(0.5)
+    send_uart_command("SYNC?")
 
     # Start Audio Processor thread
     audio_thread = threading.Thread(target=audio_processor, daemon=True)
