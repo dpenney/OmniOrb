@@ -35,6 +35,11 @@ LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assistant.l
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 
+# Wake Word
+# Set to an absolute path for a custom .onnx model, or a built-in like "hey_jarvis_v0.1"
+WAKEWORD_MODEL = "hey_jarvis_v0.1"
+WAKEWORD_THRESHOLD = 0.5
+
 # UI Update Frequency
 AUDIO_UPDATE_HZ = 10 
 SERIAL_READER_SLEEP = 0.1

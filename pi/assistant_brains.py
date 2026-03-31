@@ -19,6 +19,13 @@ try:
 except ImportError:
     pyaudio = None
 
+try:
+    import openwakeword
+    from openwakeword.model import Model
+    OWW_AVAILABLE = True
+except ImportError:
+    OWW_AVAILABLE = False
+
 app = Flask(__name__)
 
 # State
@@ -135,13 +142,40 @@ def audio_processor():
                         input=True,
                         input_device_index=DEVICE_INDEX,
                         frames_per_buffer=CHUNK)
-        logger.info("Audio stream opened for I2S microphone (16-bit)")
+        logger.info("Audio stream opened for I2S microphone (32-bit)")
     except Exception as e:
         logger.error(f"Failed to open audio stream: {e}")
         return
 
+    # Load OpenWakeWord Model
+    oww_model = None
+    if OWW_AVAILABLE and hasattr(config, "WAKEWORD_MODEL"):
+        try:
+            model_target = config.WAKEWORD_MODEL
+            wakeword_models = []
+            
+            # Resolve exact path for pre-trained defaults
+            if not model_target.endswith(".onnx"):
+                paths = openwakeword.get_pretrained_model_paths()
+                for p in paths:
+                    if model_target in p:
+                        wakeword_models.append(p)
+                        break
+            else:
+                wakeword_models = [model_target]
+
+            if not wakeword_models:
+                logger.error(f"Could not find OpenWakeWord model matching: {model_target}")
+            else:
+                oww_model = Model(wakeword_model_paths=wakeword_models)
+                logger.info(f"OpenWakeWord Model '{wakeword_models[0]}' loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to load OpenWakeWord: {e}")
+
     last_send_time = 0
+    oww_buffer = np.array([], dtype=np.int16)
     last_log_time = time.time()
+    last_wakeword_time = 0
     while True:
         try:
             # Only process audio if the Assistant screen is active on the ESP32
@@ -159,6 +193,39 @@ def audio_processor():
             
             # Normalize 32-bit samples to float64 ±1.0 range
             norm_samples = ch_left.astype(np.float64) / 2147483648.0
+
+            # ─── Wake Word Detection ───
+            if oww_model and (time.time() - last_wakeword_time > 3.0):
+                # Downsample 48kHz -> 16kHz for openwakeword (select every 3rd sample)
+                # Convert 32-bit int to 16-bit int (bit shift preserves sign)
+                ch_left_16k = ch_left[::3]
+                oww_audio = np.right_shift(ch_left_16k, 16).astype(np.int16)
+                
+                oww_buffer = np.concatenate((oww_buffer, oww_audio))
+                if len(oww_buffer) >= 1280:
+                    prediction = oww_model.predict(oww_buffer[:1280])
+                    oww_buffer = oww_buffer[1280:]
+                    
+                    for mdl, score in prediction.items():
+                        if score >= getattr(config, "WAKEWORD_THRESHOLD", 0.5):
+                            logger.info(f"🌟 WAKE WORD DETECTED: {mdl} (Score: {score:.3f}) 🌟")
+                            send_uart_command(f"WAKE|{mdl}")
+                            last_wakeword_time = time.time()
+                            
+                            # Hard Nuke: Re-instantiate the openwakeword model to permanently kill ghost echoes
+                            oww_model = Model(wakeword_model_paths=wakeword_models)
+                            # Clear our residual audio chunks
+                            oww_buffer = np.array([], dtype=np.int16)
+                            
+                            # Force-drain any remaining queued audio hardware buffer to kill echoes
+                            try:
+                                avail = stream.get_read_available()
+                                if avail > 0:
+                                    stream.read(avail, exception_on_overflow=False)
+                            except Exception:
+                                pass
+                                
+                            break
 
             # Simple RMS-based intensity (scaled 0-100)
             rms_left  = np.sqrt(np.mean(norm_samples**2)) * 100.0
