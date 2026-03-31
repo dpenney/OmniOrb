@@ -3,7 +3,10 @@
     "allow": [
       "Bash(ssh pi@octopi.local \"cd ~/assistant && ./venv/bin/python find_mic.py\")",
       "Bash(ssh:*)",
-      "Bash(scp:*)"
+      "Bash(scp:*)",
+      "Bash(pio run:*)",
+      "Bash(bash pi/deploy.sh)",
+      "Bash(git add:*)"
     ]
   }
 }

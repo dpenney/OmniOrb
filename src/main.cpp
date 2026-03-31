@@ -19,6 +19,7 @@
  */
 
 #include <Arduino.h>
+#include <atomic>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -159,6 +160,13 @@ static SemaphoreHandle_t ac_mutex;
 
 // ─── Gesture Detection ───────────────────────────────────────────────────────
 #define GESTURE_THRESHOLD 50
+#define TAP_THRESHOLD     50   ///< Max dx+dy to treat as a tap (matches GESTURE_THRESHOLD)
+
+// ─── Detail Box Layout ────────────────────────────────────────────────────────
+#define DETAIL_BX  160
+#define DETAIL_BY   40
+#define DETAIL_BW  160
+#define DETAIL_BH   68
 
 
 static bool lvgl_active = false; // True only when LVGL clock screen is the active view
@@ -170,15 +178,15 @@ void notify_pi_app_mode(AppState mode) {
     else if (mode == APP_RADAR) modeStr = "RADAR";
     
     String msg = "APP:" + modeStr;
-    Serial0.println(msg);  // Hardware UART0 (Expansion Header Pins 43/44)
-    Serial.println(msg);   // USB-CDC
+    Serial0.println(msg);                          // Hardware UART0 → Pi
+    Serial.printf("[UART→Pi] %s\n", msg.c_str());  // USB monitor visibility
 }
 
 void process_swipe(int x1, int y1, int x2, int y2) {
     int dx = x2 - x1;
     int dy = y2 - y1;
 
-    if (abs(dx) < 30 && abs(dy) < 30) {
+    if (abs(dx) < TAP_THRESHOLD && abs(dy) < TAP_THRESHOLD) {
         // Gesture too small, treat as a TAP
         int hit = find_nearest(x2, y2);
         if (hit >= 0) {
@@ -322,8 +330,8 @@ void my_touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-static volatile bool fetch_requested = false;
-static volatile bool fetch_busy      = false;
+static std::atomic<bool> fetch_requested{false};
+static std::atomic<bool> fetch_busy{false};
 
 void fetch_task(void *pv) {
     for (;;) {
@@ -482,11 +490,11 @@ void erase_sweep(float a_deg) {
         // Box is at (160, 40) size (160, 68)
         // Check if (CX, CY) -> (ex, ey) passes near box
         // For simplicity, check 4 corners and center
-        if (line_near(CX, CY, ex, ey, 160, 40, 10.0f) || 
-            line_near(CX, CY, ex, ey, 320, 40, 10.0f) ||
-            line_near(CX, CY, ex, ey, 160, 108, 10.0f) ||
-            line_near(CX, CY, ex, ey, 320, 108, 10.0f) ||
-            line_near(CX, CY, ex, ey, 240, 74, 10.0f)) {
+        if (line_near(CX, CY, ex, ey, DETAIL_BX,            DETAIL_BY,            10.0f) ||
+            line_near(CX, CY, ex, ey, DETAIL_BX+DETAIL_BW,  DETAIL_BY,            10.0f) ||
+            line_near(CX, CY, ex, ey, DETAIL_BX,            DETAIL_BY+DETAIL_BH,  10.0f) ||
+            line_near(CX, CY, ex, ey, DETAIL_BX+DETAIL_BW,  DETAIL_BY+DETAIL_BH,  10.0f) ||
+            line_near(CX, CY, ex, ey, DETAIL_BX+DETAIL_BW/2, DETAIL_BY+DETAIL_BH/2, 10.0f)) {
             detail_clobbered = true;
         }
     }
@@ -594,21 +602,20 @@ void draw_detail_box() {
     Aircraft ac = aircraft[selected_idx];  // local copy
     xSemaphoreGive(ac_mutex);
 
-    int bx = 160, by = 40, bw = 160, bh = 68;
-    gfx->fillRect(bx, by, bw, bh, C_BOX_BG);
-    gfx->drawRect(bx, by, bw, bh, C_BOX_BORD);
+    gfx->fillRect(DETAIL_BX, DETAIL_BY, DETAIL_BW, DETAIL_BH, C_BOX_BG);
+    gfx->drawRect(DETAIL_BX, DETAIL_BY, DETAIL_BW, DETAIL_BH, C_BOX_BORD);
     gfx->setTextColor(C_LBL, C_BOX_BG);
     gfx->setTextSize(1);
-    gfx->setCursor(bx+6, by+8); gfx->print(ac.callsign[0] ? ac.callsign : ac.hex);
-    gfx->setCursor(bx+6, by+22); gfx->printf("Alt: %d ft", ac.altitude);
-    gfx->setCursor(bx+6, by+36); gfx->printf("Spd: %d kts", ac.speed);
-    gfx->setCursor(bx+6, by+50); gfx->printf("Hdg: %d deg", ac.heading);
+    gfx->setCursor(DETAIL_BX+6, DETAIL_BY+8);  gfx->print(ac.callsign[0] ? ac.callsign : ac.hex);
+    gfx->setCursor(DETAIL_BX+6, DETAIL_BY+22); gfx->printf("Alt: %d ft", ac.altitude);
+    gfx->setCursor(DETAIL_BX+6, DETAIL_BY+36); gfx->printf("Spd: %d kts", ac.speed);
+    gfx->setCursor(DETAIL_BX+6, DETAIL_BY+50); gfx->printf("Hdg: %d deg", ac.heading);
     detail_visible = true;
     detail_clobbered = false;
 }
 
 void erase_detail_box() {
-    gfx->fillRect(160, 40, 160, 68, C_BG);
+    gfx->fillRect(DETAIL_BX, DETAIL_BY, DETAIL_BW, DETAIL_BH, C_BG);
     restore_rings_and_cross();
     detail_visible = false;
     detail_clobbered = false;
@@ -743,8 +750,6 @@ void setup() {
 
     full_redraw();
 
-    full_redraw();
-
     // Prepare assistant canvas
     assistant_canvas = new Arduino_Canvas(SCREEN_WIDTH, SCREEN_HEIGHT, gfx, 0, 0, 0);
     if (!assistant_canvas->begin(GFX_SKIP_OUTPUT_BEGIN)) {
@@ -794,8 +799,6 @@ void setup() {
 
     ClockView::init();
 
-    // ─── UART0 Setup (Pi Header) ───
-    Serial0.begin(115200); 
     notify_pi_app_mode(current_app);
 }
 

@@ -12,6 +12,9 @@ static const int CX = 240;
 static const int CY = 240;
 static const int SCREEN_RADIUS = 230;
 
+static const float AUDIO_DECAY       = 0.85f;  ///< Per-frame decay for smoothed audio scale
+static const float SPECTRUM_DECAY    = 0.88f;  ///< Per-frame decay for each spectrum bin
+
 static Arduino_Canvas *canvas = nullptr;
 static unsigned long start_ms = 0;
 static int cur_audio_intensity = 0;
@@ -61,7 +64,7 @@ void AssistantView::update() {
     if (target_audio > audio_scale) {
         audio_scale = target_audio; // Sharp rise
     } else {
-        audio_scale *= 0.85f; // Gradual decay
+        audio_scale *= AUDIO_DECAY;
     }
 
     // 1. Draw Breathing Iris (Central Orb)
@@ -120,7 +123,7 @@ void AssistantView::update() {
         // Smoothing for each bin
         float target = freq_bins[i] / 100.0f;
         if (target > visual_bins[i]) visual_bins[i] = target;
-        else visual_bins[i] *= 0.88f; // Smooth decay
+        else visual_bins[i] *= SPECTRUM_DECAY;
 
         float mag = visual_bins[i] * max_len;
         

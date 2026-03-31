@@ -28,6 +28,7 @@ assistant_state = {
     "mic_active": True,  # Default to TRUE so it works even if sync fails
     "audio_intensity": 0
 }
+state_lock = threading.Lock()  # protects assistant_state shared across threads
 
 # Logging Configuration
 logging.basicConfig(
@@ -76,20 +77,16 @@ def serial_reader():
 
                     # Mode Synchronization
                     if "APP:" in line:
-                        # Extract everything after "APP:" robustly
                         app_mode = line.split("APP:", 1)[1].split()[0]
-                        if app_mode == "ASSISTANT":
-                            assistant_state["mic_active"] = True
-                            logger.info("Assistant mode confirmed: Processing audio")
-                        else:
-                            assistant_state["mic_active"] = False
-                            logger.info(f"App mode switched to {app_mode}: Pausing audio")
+                        with state_lock:
+                            if app_mode == "ASSISTANT":
+                                assistant_state["mic_active"] = True
+                            else:
+                                assistant_state["mic_active"] = False
+                        logger.info(f"[ESP32→Pi] Received: '{line}' → mic_active={app_mode == 'ASSISTANT'}")
                     else:
-                        # Log anything else from the ESP32 if it's not a common debug line
-                        if not any(x in line for x in ["Gesture", "Touch", "Remote"]):
-                            logger.info(f"[ESP32] {line}")
-                        else:
-                            logger.debug(f"[ESP32 Debug] {line}")
+                        # Unexpected line on Serial0 — should only carry APP: messages
+                        logger.debug(f"[ESP32 unexpected] {line}")
         except Exception as e:
             logger.error(f"Serial read error: {e}")
             time.sleep(1) # Wait on error
@@ -127,7 +124,9 @@ def audio_processor():
     while True:
         try:
             # Only process audio if the Assistant screen is active on the ESP32
-            if not assistant_state.get("mic_active", False):
+            with state_lock:
+                mic_active = assistant_state.get("mic_active", False)
+            if not mic_active:
                 time.sleep(0.1)
                 continue
 
@@ -171,8 +170,9 @@ def audio_processor():
             dynamic_multiplier = 80.0 / assistant_state["avg_rms"]
             dynamic_multiplier = max(2.0, min(2000.0, dynamic_multiplier))
             
-            intensity = int(min(100, adj_rms * dynamic_multiplier)) 
-            assistant_state["audio_intensity"] = intensity
+            intensity = int(min(100, adj_rms * dynamic_multiplier))
+            with state_lock:
+                assistant_state["audio_intensity"] = intensity
             
             # ─── FFT Spectrum Analysis ───
             fft_data = np.abs(np.fft.rfft(norm_samples)) 
@@ -209,20 +209,15 @@ def audio_processor():
                 
         except Exception as e:
             logger.error(f"Audio processing error: {e}")
-            # Try to recover stream if it's a known error
             time.sleep(0.5)
-
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
 
 def send_uart_command(cmd):
     try:
         with ser_lock:
             if ser and ser.is_open:
                 ser.write(f"{cmd}\n".encode())
-                # Only log non-audio commands (like Zoom) to reduce chattiness
-                if not cmd.startswith("A"):
+                # Only log non-audio/spectrum commands to reduce chattiness
+                if not cmd.startswith("S") and not cmd.startswith("A"):
                     logger.info(f"Sent UART Command: {cmd}")
     except Exception as e:
         logger.error(f"Error sending UART command: {e}")
