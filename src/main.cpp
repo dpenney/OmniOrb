@@ -163,6 +163,17 @@ static SemaphoreHandle_t ac_mutex;
 
 static bool lvgl_active = false; // True only when LVGL clock screen is the active view
 
+void notify_pi_app_mode(AppState mode) {
+    String modeStr = "OTHER";
+    if (mode == APP_ASSISTANT) modeStr = "ASSISTANT";
+    else if (mode == APP_CLOCK) modeStr = "CLOCK";
+    else if (mode == APP_RADAR) modeStr = "RADAR";
+    
+    String msg = "APP:" + modeStr;
+    Serial0.println(msg);  // Hardware UART0 (Expansion Header Pins 43/44)
+    Serial.println(msg);   // USB-CDC
+}
+
 void process_swipe(int x1, int y1, int x2, int y2) {
     int dx = x2 - x1;
     int dy = y2 - y1;
@@ -206,9 +217,11 @@ void process_swipe(int x1, int y1, int x2, int y2) {
             if (current_app == APP_RADAR) {
                 current_app = APP_ASSISTANT;
                 AssistantView::show();
+                notify_pi_app_mode(current_app);
                 full_redraw();
             } else if (current_app == APP_ASSISTANT) {
                 current_app = APP_CLOCK;
+                notify_pi_app_mode(current_app);
                 lvgl_active = true;  // Enable LVGL flush before showing clock screen
                 ClockView::show();
             }
@@ -218,6 +231,7 @@ void process_swipe(int x1, int y1, int x2, int y2) {
                 lvgl_active = false;  // Stop LVGL from flushing over radar
                 current_app = APP_ASSISTANT;
                 AssistantView::show();
+                notify_pi_app_mode(current_app);
                 // Load a blank black screen so LVGL has something safe to reference
                 lv_obj_t *blank = lv_obj_create(NULL);
                 lv_obj_set_style_bg_color(blank, lv_color_black(), 0);
@@ -225,6 +239,7 @@ void process_swipe(int x1, int y1, int x2, int y2) {
                 full_redraw();
             } else if (current_app == APP_ASSISTANT) {
                 current_app = APP_RADAR;
+                notify_pi_app_mode(current_app);
                 full_redraw();
             }
         }
@@ -778,6 +793,10 @@ void setup() {
     lv_indev_drv_register(&indev_drv);
 
     ClockView::init();
+
+    // ─── UART0 Setup (Pi Header) ───
+    Serial0.begin(115200); 
+    notify_pi_app_mode(current_app);
 }
 
 void loop() {
@@ -836,7 +855,9 @@ void loop() {
             rx.trim();
             if (rx.length() == 0) continue;
 
-            if (rx == "Z+") {
+            if (rx == "SYNC?") {
+                notify_pi_app_mode(current_app);
+            } else if (rx == "Z+") {
                 range_nm = max((float)MIN_RANGE_NM, range_nm / 1.15f);
                 Serial.printf("Remote Zoom IN: %.1f nm\n", range_nm);
                 full_redraw();

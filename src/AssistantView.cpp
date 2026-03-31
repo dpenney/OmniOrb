@@ -2,11 +2,11 @@
 #include <math.h>
 
 // ─── Constants ─────────────────────────────────────────────────────────────
-static const uint16_t C_BG        = 0x0000;
-static const uint16_t C_HAL_RED      = 0xF800; // #FF8800
-static const uint16_t C_HAL_ORANGE   = 0xB800; // #CC4444
-static const uint16_t C_HAL_DARK_RED = 0x8000;
-static const uint16_t C_HAL_GLOW     = 0x4000;
+static const uint16_t C_BG        = 0x2A26; // Dark Green/Shadow
+static const uint16_t C_ACCENT    = 0xE651; // Brass Gold
+static const uint16_t C_HIGHLIGHT = 0x97F2; // Mint Green
+static const uint16_t C_SECONDARY = 0x5AC9; // Secondary Neutral
+static const uint16_t C_GLOW      = 0x5AC9; // Using Secondary for Glow
 
 static const int CX = 240;
 static const int CY = 240;
@@ -70,14 +70,14 @@ void AssistantView::update() {
     int iris_r = 60 + (int)(breath * 25); // Increased from 20
     
     // Multi-layered glow
-    canvas->fillCircle(CX, CY, iris_r + 15 + (int)(audio_scale * 30), C_HAL_GLOW);
-    canvas->fillCircle(CX, CY, iris_r, C_HAL_DARK_RED);
-    canvas->fillCircle(CX, CY, iris_r - 10, C_HAL_RED);
+    canvas->fillCircle(CX, CY, iris_r + 15 + (int)(audio_scale * 30), C_GLOW);
+    canvas->fillCircle(CX, CY, iris_r, C_SECONDARY);
+    canvas->fillCircle(CX, CY, iris_r - 10, C_ACCENT);
 
     canvas->fillCircle(CX, CY, iris_r - 30, C_BG); // Core
     
     // Core detail (pupil)
-    canvas->fillCircle(CX, CY, 15 + (int)(breath * 10) + (int)(audio_scale * 40), C_HAL_ORANGE);
+    canvas->fillCircle(CX, CY, 15 + (int)(breath * 10) + (int)(audio_scale * 40), C_HIGHLIGHT);
 
 
     // // 2. Rotating Data Rings
@@ -91,10 +91,10 @@ void AssistantView::update() {
     //     float rad = (a + rot1 * 57.29f) * (M_PI / 180.0f);
     //     int sx = CX + (int)(cosf(rad) * r1);
     //     int sy = CY + (int)(sinf(rad) * r1);
-    //     canvas->drawPixel(sx, sy, C_HAL_RED);
+    //     canvas->drawPixel(sx, sy, C_ACCENT);
 
     // }
-    // canvas->drawCircle(CX, CY, r1, C_HAL_DARK_RED);
+    // canvas->drawCircle(CX, CY, r1, C_SECONDARY);
 
 
     // // Ring 2: Outer Hex-like markers
@@ -105,10 +105,10 @@ void AssistantView::update() {
     //     int y0 = CY + (int)(sinf(rad) * (r2 - 10));
     //     int x1 = CX + (int)(cosf(rad) * (r2 + 10));
     //     int y1 = CY + (int)(sinf(rad) * (r2 + 10));
-    //     canvas->drawLine(x0, y0, x1, y1, C_HAL_RED);
+    //     canvas->drawLine(x0, y0, x1, y1, C_ACCENT);
 
     // }
-    // canvas->drawCircle(CX, CY, r2, C_HAL_DARK_RED);
+    // canvas->drawCircle(CX, CY, r2, C_SECONDARY);
 
 
     // 3. Spectrum Analyzer Outer Ring (Growing Inwards)
@@ -138,11 +138,11 @@ void AssistantView::update() {
                 int x1 = CX + (int)(cosf(rad) * (start_r - mag));
                 int y1 = CY + (int)(sinf(rad) * (start_r - mag));
 
-                // If it's near the edge of the bar, draw it dark red for a 3D/glow effect
+                // If it's near the edge of the bar, draw it 3D/glow effect
                 if (abs(offset_deg) > (bar_width_deg/2.0f - 1.0f)) {
-                    canvas->drawLine(x0, y0, x1, y1, C_HAL_DARK_RED);
+                    canvas->drawLine(x0, y0, x1, y1, C_SECONDARY);
                 } else {
-                    canvas->drawLine(x0, y0, x1, y1, C_HAL_RED);
+                    canvas->drawLine(x0, y0, x1, y1, C_ACCENT);
                 }
             }
         }
@@ -155,7 +155,7 @@ void AssistantView::update() {
     //     // Find x-width at this y
     //     int dy = abs(scan_y - CY);
     //     int dx = (int)sqrtf(SCREEN_RADIUS * SCREEN_RADIUS - dy * dy);
-    //     canvas->drawFastHLine(CX - dx, scan_y, dx * 2, C_HAL_GLOW);
+    //     canvas->drawFastHLine(CX - dx, scan_y, dx * 2, C_GLOW);
 
     // }
 
@@ -165,7 +165,7 @@ void AssistantView::update() {
     //     int bx = CX + (int)(cosf(bt * 0.7f) * 200);
     //     int by = CY + (int)(sinf(bt * 1.1f) * 200);
     //     if ((bx-CX)*(bx-CX) + (by-CY)*(by-CY) < SCREEN_RADIUS*SCREEN_RADIUS) {
-    //         canvas->drawPixel(bx, by, C_HAL_RED);
+    //         canvas->drawPixel(bx, by, C_ACCENT);
 
     //     }
     // }
