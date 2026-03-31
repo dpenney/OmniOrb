@@ -60,6 +60,26 @@ for port in serial_ports:
 if not ser:
     logger.error("No valid serial port found!")
 
+def reconnect_serial():
+    """Close and reopen the serial port. Call after any I/O error."""
+    global ser
+    with ser_lock:
+        try:
+            if ser:
+                ser.close()
+        except Exception:
+            pass
+        for port in serial_ports:
+            try:
+                if os.path.exists(port):
+                    ser = serial.Serial(port, config.SERIAL_BAUD, timeout=1, write_timeout=1)
+                    logger.info(f"Serial reconnected on {port}")
+                    return
+            except Exception as e:
+                logger.error(f"Reconnect failed on {port}: {e}")
+        ser = None
+        logger.error("Serial reconnect failed — no valid port found")
+
 def serial_reader():
     """Background thread to read and log incoming serial data from ESP32"""
     global assistant_state
@@ -89,7 +109,8 @@ def serial_reader():
                         logger.debug(f"[ESP32 unexpected] {line}")
         except Exception as e:
             logger.error(f"Serial read error: {e}")
-            time.sleep(1) # Wait on error
+            reconnect_serial()
+            time.sleep(1)
             
         time.sleep(config.SERIAL_READER_SLEEP)
 
@@ -174,26 +195,36 @@ def audio_processor():
             with state_lock:
                 assistant_state["audio_intensity"] = intensity
             
-            # ─── FFT Spectrum Analysis ───
+            # ─── FFT Spectrum Analysis (Speech Optimized) ───
             fft_data = np.abs(np.fft.rfft(norm_samples)) 
-            
-            # Bucket into 16 bins for the ESP32
             num_bins = 16
-            chunk_size = len(fft_data) // num_bins
+            
+            # Use logarithmic spacing between 80 Hz and 12000 Hz for 16 bins
+            # Widened slightly (80-12k) to feel less "narrow"
+            freq_bounds = np.geomspace(80, 12000, num_bins + 1)
+            # Convert frequencies to FFT indices: index = freq * (chunk / rate)
+            idx_bounds = (freq_bounds * CHUNK / RATE).astype(int)
+            idx_bounds = np.clip(idx_bounds, 0, len(fft_data) - 1)
+            
             bins = []
-            
-            # Calculate a dynamic gain factor based on moving average volume
-            # Amplifies quiet sounds, dampens very loud sounds
+            # Calculate a dynamic gain factor
             gain = 1.0 / assistant_state["avg_rms"]
-            gain = max(0.5, min(10.0, gain)) # Clamp the gain multiplier
+            gain = max(0.5, min(8.0, gain)) # Slightly lower max gain
             
+            # Visual equalization factor (1.0 to 2.0 across the 16 bins)
+            weights = np.linspace(1.0, 2.0, num_bins)
+
             for i in range(num_bins):
-                start = i * chunk_size
-                end = (i + 1) * chunk_size
-                mag = np.mean(fft_data[start:end])
+                start, end = idx_bounds[i], idx_bounds[i+1]
+                if start == end: end = start + 1
                 
-                # Apply Dynamic Gain, log scale, and cap at 100
-                scaled_mag = int(min(100, np.log1p(mag * 200.0 * gain) * 15.0))
+                # Take the average magnitude in this frequency band
+                # Subtracting a small noise floor (0.001) to stop bouncing in silence
+                mag = max(0.0, np.mean(fft_data[start:end]) - 0.001)
+                
+                # Apply Dynamic Gain, log scale, and frequency weighting
+                # Reduced multiplier from 250 -> 180 and scale from 18 -> 17 for better stability
+                scaled_mag = int(min(100, np.log1p(mag * 180.0 * gain * weights[i]) * 17.0))
                 bins.append(scaled_mag)
 
             
@@ -221,6 +252,7 @@ def send_uart_command(cmd):
                     logger.info(f"Sent UART Command: {cmd}")
     except Exception as e:
         logger.error(f"Error sending UART command: {e}")
+        reconnect_serial()
 
 def on_encoder_event(event, direction, value):
     global assistant_state
