@@ -14,8 +14,9 @@ pi/venv/
 pi/__pycache__/
 pi/*.pyc
 pi/.env
-pi/*.tar.gz
 pi/assistant.log
+pi/adsb_proxy_pi.py
+pi/flights.json
 
 # Other
 tmp/

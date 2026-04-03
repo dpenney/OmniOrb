@@ -341,7 +341,9 @@ void fetch_task(void *pv) {
 
             if (WiFi.status() == WL_CONNECTED) {
                 HTTPClient http;
-                String url = String("http://") + ADSB_HOST + ":" + ADSB_PORT + ADSB_PATH;
+                String url = String("http://") + ADSB_HOST + ":" + ADSB_PORT + ADSB_PATH + 
+                             "?lat=" + String(settings.home_lat, 4) + 
+                             "&lon=" + String(settings.home_lon, 4);
                 http.begin(url);
                 http.setTimeout(2500);
                 int code = http.GET();
@@ -749,6 +751,7 @@ void setup() {
     while (fetch_busy || fetch_requested) delay(50);
 
     full_redraw();
+    notify_pi_app_mode(current_app);  // Tell Pi the initial screen on boot
 
     // Prepare assistant canvas
     assistant_canvas = new Arduino_Canvas(SCREEN_WIDTH, SCREEN_HEIGHT, gfx, 0, 0, 0);

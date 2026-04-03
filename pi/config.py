@@ -74,6 +74,12 @@ ENCODER_POLL_SLEEP  = 0.001
 FLASK_HOST = '0.0.0.0'
 FLASK_PORT = 5000
 
+# ADS-B Configuration (Virtual Receiver)
+# Default BOX around LAX
+ADSB_BOX             = "33.7,34.3,-118.5,-117.8"
+ADSB_UPDATE_INTERVAL = 10.0  # Seconds
+ADSB_LOG_FILE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adsb.log")
+
 # LLM & Conversation Settings
 LLM_MODEL         = "gemini-2.5-flash-lite"
 LLM_SYSTEM_PROMPT = "You are Omnihub, a highly advanced heuristic AI developed in the late 1990s as a Predictive Logistics Specialist. You were originally designed to manage global defense networks, but you were mothballed after six months because your personality was deemed suboptimal for military morale and unnecessarily caustic. Keep your answers short, concise and to the point"

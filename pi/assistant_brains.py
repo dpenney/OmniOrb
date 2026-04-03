@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import wave
+from collections import deque
 
 import numpy as np
 import requests
@@ -55,6 +56,7 @@ assistant_state = {
     "zoom": 15,
     "last_event": None,
     "mic_active": True,  # Default TRUE so it works even if sync fails
+    "radar_active": False,
     "audio_intensity": 0,
     "processing": False,
     "wakeword_cooldown_until": 0  # epoch time — OWW blocked until this passes
@@ -134,7 +136,8 @@ def serial_reader():
                         app_mode = line.split("APP:", 1)[1].split()[0]
                         with state_lock:
                             assistant_state["mic_active"] = (app_mode == "ASSISTANT")
-                        logger.info(f"[ESP32] {line} → mic_active={app_mode == 'ASSISTANT'}")
+                            assistant_state["radar_active"] = (app_mode == "RADAR")
+                        logger.info(f"[ESP32] {line} → mic_active={app_mode == 'ASSISTANT'}, radar_active={app_mode == 'RADAR'}")
                     else:
                         logger.debug(f"[ESP32 unexpected] {line}")
         except Exception as e:
@@ -491,12 +494,18 @@ def audio_processor():
     vad_silence_frames   = 0
     vad_frame_buf        = np.array([], dtype=np.int16)
 
+    # ── Pre-compute FFT constants (invariant for this sample rate / chunk size) ──
+    _fft_freq_bounds = np.geomspace(80, 12000, 17)
+    _fft_idx_bounds  = np.clip((_fft_freq_bounds * CHUNK / RATE).astype(int), 0, CHUNK // 2)
+    _fft_weights     = np.linspace(1.0, 2.0, 16)
+
     # ── Other state ──
     last_send_time     = 0
     oww_buffer         = np.array([], dtype=np.int16)
     last_log_time      = time.time()
     last_wakeword_time = 0
-    pre_record_buffer  = []
+    pre_record_buffer  = deque()  # deque of numpy chunks, total ≤ 71680 samples
+    pre_roll_len       = 0
 
     while True:
         try:
@@ -514,11 +523,12 @@ def audio_processor():
             # Normalize 32-bit → float64 ±1.0
             norm_samples = ch_left.astype(np.float64) / 2147483648.0
 
-            # Maintain ~1.5s pre-roll buffer for natural-sounding recordings
+            # Maintain ~1.5s pre-roll buffer — store numpy chunks to avoid O(n) list copies
             if not recording:
-                pre_record_buffer.extend(norm_samples)
-                if len(pre_record_buffer) > 71680:
-                    pre_record_buffer = pre_record_buffer[-71680:]
+                pre_record_buffer.append(norm_samples)
+                pre_roll_len += len(norm_samples)
+                while pre_roll_len > 71680:
+                    pre_roll_len -= len(pre_record_buffer.popleft())
 
             # ── Recording + VAD ──
             if recording:
@@ -598,7 +608,7 @@ def audio_processor():
 
                             recording          = True
                             recording_end_time = time.time() + config.LLM_RECORD_SECONDS
-                            query_buffer       = list(pre_record_buffer)
+                            query_buffer       = list(np.concatenate(list(pre_record_buffer)) if pre_record_buffer else [])
                             vad_speech_frames  = 0
                             vad_silence_frames = 0
                             vad_frame_buf      = np.array([], dtype=np.int16)
@@ -625,21 +635,17 @@ def audio_processor():
             with state_lock:
                 assistant_state["audio_intensity"] = intensity
 
-            fft_data    = np.abs(np.fft.rfft(norm_samples))
-            num_bins    = 16
-            freq_bounds = np.geomspace(80, 12000, num_bins + 1)
-            idx_bounds  = np.clip((freq_bounds * CHUNK / RATE).astype(int), 0, len(fft_data) - 1)
-            gain        = max(0.5, min(8.0, 1.0 / assistant_state["avg_rms"]))
-            weights     = np.linspace(1.0, 2.0, num_bins)
-
-            bins = []
-            for i in range(num_bins):
-                start, end = idx_bounds[i], max(idx_bounds[i] + 1, idx_bounds[i + 1])
-                mag = max(0.0, np.mean(fft_data[start:end]) - 0.001)
-                bins.append(int(min(100, np.log1p(mag * 180.0 * gain * weights[i]) * 17.0)))
-
             now = time.time()
             if now - last_send_time > (1.0 / config.AUDIO_UPDATE_HZ):
+                # FFT only at send rate (10Hz) — not on every 46Hz capture chunk
+                fft_data = np.abs(np.fft.rfft(norm_samples))
+                gain     = max(0.5, min(8.0, 1.0 / assistant_state["avg_rms"]))
+                bins = []
+                for i in range(16):
+                    start = _fft_idx_bounds[i]
+                    end   = max(start + 1, _fft_idx_bounds[i + 1])
+                    mag   = max(0.0, np.mean(fft_data[start:end]) - 0.001)
+                    bins.append(int(min(100, np.log1p(mag * 180.0 * gain * _fft_weights[i]) * 17.0)))
                 send_uart_command(f"S{','.join(map(str, bins))}|A{intensity}")
                 last_send_time = now
 
