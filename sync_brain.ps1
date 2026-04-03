@@ -13,6 +13,11 @@ if (Test-Path ./pi/adsb_proxy_pi.py) {
     scp ./pi/adsb_proxy_pi.py "${User}@${HostIp}:~/assistant/"
     Write-Host "ADS-B sidecar synced." -ForegroundColor Cyan
 }
+if (Test-Path ./pi/install_adsb_sidecar.sh) {
+    scp ./pi/install_adsb_sidecar.sh "${User}@${HostIp}:~/assistant/"
+    ssh -o StrictHostKeyChecking=no "${User}@${HostIp}" "chmod +x ~/assistant/install_adsb_sidecar.sh; bash ~/assistant/install_adsb_sidecar.sh"
+    Write-Host "ADS-B sidecar installed and started." -ForegroundColor Green
+}
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Failed to copy files." -ForegroundColor Red

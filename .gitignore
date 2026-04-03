@@ -16,6 +16,7 @@ pi/*.pyc
 pi/.env
 pi/assistant.log
 pi/adsb_proxy_pi.py
+pi/install_adsb_sidecar.sh
 pi/flights.json
 
 # Other
