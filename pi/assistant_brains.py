@@ -709,6 +709,20 @@ def mic_stop():
     assistant_state["mic_active"] = False
     return jsonify({"status": "mic_idle"})
 
+@app.route('/radar/start')
+def radar_start():
+    with state_lock:
+        assistant_state["radar_active"] = True
+    logger.info("radar_active set True via HTTP")
+    return jsonify({"status": "radar_active"})
+
+@app.route('/radar/stop')
+def radar_stop():
+    with state_lock:
+        assistant_state["radar_active"] = False
+    logger.info("radar_active set False via HTTP")
+    return jsonify({"status": "radar_idle"})
+
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
