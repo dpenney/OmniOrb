@@ -21,6 +21,11 @@ static int cur_audio_intensity = 0;
 static float audio_scale = 0.0f; // Smoothed visual scale
 int AssistantView::freq_bins[16] = {0};
 static float visual_bins[16] = {0.0f}; // Smoothed visual values
+static AssistantView::AssistantState current_state = AssistantView::STATE_IDLE;
+
+void AssistantView::set_state(AssistantState state) {
+    current_state = state;
+}
 
 void AssistantView::set_canvas(Arduino_Canvas *c) {
     canvas = c;
@@ -73,14 +78,30 @@ void AssistantView::update() {
     int iris_r = 60 + (int)(breath * 25); // Increased from 20
     
     // Multi-layered glow
-    canvas->fillCircle(CX, CY, iris_r + 15 + (int)(audio_scale * 30), C_GLOW);
+    uint16_t eff_glow = C_GLOW;
+    uint16_t eff_accent = C_ACCENT;
+    uint16_t eff_high = C_HIGHLIGHT;
+    
+    if (current_state == AssistantView::STATE_LISTENING) {
+        eff_glow = 0xF800; // Red
+        eff_accent = 0xFC00; // Orange
+        eff_high = 0xFFFF; // White
+    } else if (current_state == AssistantView::STATE_THINKING) {
+        eff_glow = 0x001F; // Blue
+        eff_accent = 0x07FF; // Cyan
+    } else if (current_state == AssistantView::STATE_SPEAKING) {
+        eff_glow = 0xF81F; // Magenta
+        eff_accent = 0x780F; // Purple
+    }
+
+    canvas->fillCircle(CX, CY, iris_r + 15 + (int)(audio_scale * 30), eff_glow);
     canvas->fillCircle(CX, CY, iris_r, C_SECONDARY);
-    canvas->fillCircle(CX, CY, iris_r - 10, C_ACCENT);
+    canvas->fillCircle(CX, CY, iris_r - 10, eff_accent);
 
     canvas->fillCircle(CX, CY, iris_r - 30, C_BG); // Core
     
     // Core detail (pupil)
-    canvas->fillCircle(CX, CY, 15 + (int)(breath * 10) + (int)(audio_scale * 40), C_HIGHLIGHT);
+    canvas->fillCircle(CX, CY, 15 + (int)(breath * 10) + (int)(audio_scale * 40), eff_high);
 
 
     // // 2. Rotating Data Rings
@@ -145,7 +166,7 @@ void AssistantView::update() {
                 if (abs(offset_deg) > (bar_width_deg/2.0f - 1.0f)) {
                     canvas->drawLine(x0, y0, x1, y1, C_SECONDARY);
                 } else {
-                    canvas->drawLine(x0, y0, x1, y1, C_ACCENT);
+                    canvas->drawLine(x0, y0, x1, y1, eff_accent);
                 }
             }
         }

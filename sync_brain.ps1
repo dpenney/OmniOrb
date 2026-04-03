@@ -4,8 +4,10 @@ param(
     [string]$Dest = "~/assistant/assistant_brains.py"
 )
 
-Write-Host "🚀 Syncing assistant_brains.py to $User@$HostIp..." -ForegroundColor Cyan
-scp ./pi/assistant_brains.py ${User}@${HostIp}:$Dest
+Write-Host "🚀 Syncing brain files to $User@$HostIp..." -ForegroundColor Cyan
+scp ./pi/assistant_brains.py ${User}@${HostIp}:~/assistant/
+scp ./pi/config.py ${User}@${HostIp}:~/assistant/
+scp ./pi/HeyRobot.onnx ${User}@${HostIp}:~/assistant/
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "❌ Failed to copy the file. Ensure you are running this from the esp32_round root directory" -ForegroundColor Red

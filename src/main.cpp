@@ -821,6 +821,15 @@ void loop() {
     
     last_was_touching = touch_active;
 
+    // ─── Serial0 Heartbeat (troubleshooting only) ─────────────────────────────
+    static unsigned long last_hb_ms = 0;
+    if (now - last_hb_ms >= 5000) {
+        Serial0.println("HB:OK");
+        Serial.println("[UART→Pi] HB:OK");
+        last_hb_ms = now;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     if (current_app == APP_RADAR) {
         // Don't run lv_timer_handler in radar mode -- it would flush LVGL's white screen over us
         
@@ -868,6 +877,14 @@ void loop() {
                 range_nm = min((float)MAX_RANGE_NM, range_nm * 1.15f);
                 Serial.printf("Remote Zoom OUT: %.1f nm\n", range_nm);
                 full_redraw();
+            } else if (rx.startsWith("WAKE|")) {
+                AssistantView::set_state(AssistantView::STATE_LISTENING);
+            } else if (rx.startsWith("APP:")) {
+                String cmd = rx.substring(4);
+                cmd.trim();
+                if (cmd == "THINKING") AssistantView::set_state(AssistantView::STATE_THINKING);
+                else if (cmd == "SPEAKING") AssistantView::set_state(AssistantView::STATE_SPEAKING);
+                else if (cmd == "ASSISTANT") AssistantView::set_state(AssistantView::STATE_IDLE);
             } else if (rx.startsWith("A")) {
                 int intensity = rx.substring(1).toInt();
                 AssistantView::set_audio_intensity(intensity);
