@@ -29,3 +29,6 @@ ssh-copy-id*
 demo_c*/
 *.log
 *.txt
+*.tar.gz
+.claude/settings.local.json
+pi/device_settings.json

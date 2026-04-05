@@ -51,12 +51,49 @@ except ImportError:
 
 app = Flask(__name__)
 
+# ─── Device Settings (location + timezone, pushed by ESP32 on boot) ───────────
+_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_settings.json")
+_device_settings = {
+    "lat": config.HOME_LAT,
+    "lon": config.HOME_LON,
+    "tz":  config.HOME_TZ,
+}
+_device_settings_lock = threading.Lock()
+
+def _load_device_settings():
+    """Load persisted location/tz from device_settings.json if it exists."""
+    global _device_settings
+    try:
+        if os.path.exists(_SETTINGS_FILE):
+            import json as _json
+            with open(_SETTINGS_FILE) as f:
+                stored = _json.load(f)
+            with _device_settings_lock:
+                _device_settings.update(stored)
+            logger.info(f"Loaded device settings: {_device_settings}")
+    except Exception as e:
+        logger.warning(f"Could not load device_settings.json: {e}")
+
+def _save_device_settings(lat, lon, tz):
+    """Persist location/tz to disk and update in-memory state."""
+    global _device_settings
+    import json as _json
+    data = {"lat": lat, "lon": lon, "tz": tz}
+    with _device_settings_lock:
+        _device_settings.update(data)
+    try:
+        with open(_SETTINGS_FILE, "w") as f:
+            _json.dump(data, f)
+        logger.info(f"Device settings saved: {data}")
+    except Exception as e:
+        logger.error(f"Could not save device_settings.json: {e}")
+
 # State
 assistant_state = {
     "zoom": 15,
     "last_event": None,
-    "mic_active": True,  # Default TRUE so it works even if sync fails
-    "radar_active": False,
+    "mic_active": True,   # Default TRUE so it works even if sync fails
+    "radar_active": True, # Default TRUE so it works even if sync fails
     "audio_intensity": 0,
     "processing": False,
     "wakeword_cooldown_until": 0  # epoch time — OWW blocked until this passes
@@ -132,14 +169,30 @@ def serial_reader():
                         line = ser.readline().decode('utf-8', errors='ignore').strip()
                     if not line:
                         break
-                    if "APP:" in line:
+                    if line.startswith("GEO:"):
+                        # Format: GEO:lat,lon,tz  (tz is an IANA string, may contain /)
+                        parts = line[4:].split(",", 2)
+                        if len(parts) == 3:
+                            try:
+                                lat, lon, tz = float(parts[0]), float(parts[1]), parts[2].strip()
+                                _save_device_settings(lat, lon, tz)
+                                # Bust weather cache so next query uses new location
+                                with _weather_cache_lock:
+                                    _weather_cache["fetched_at"] = 0
+                            except ValueError:
+                                logger.warning(f"Bad GEO message: {line}")
+                    elif line.startswith("TIMER:DONE:"):
+                        label = line[len("TIMER:DONE:"):]
+                        logger.info(f"[ESP32] Timer done: '{label}'")
+                        threading.Thread(target=_handle_timer_done, args=(label,), daemon=True).start()
+                    elif "APP:" in line:
                         app_mode = line.split("APP:", 1)[1].split()[0]
                         with state_lock:
                             assistant_state["mic_active"] = (app_mode == "ASSISTANT")
                             assistant_state["radar_active"] = (app_mode == "RADAR")
                         logger.info(f"[ESP32] {line} → mic_active={app_mode == 'ASSISTANT'}, radar_active={app_mode == 'RADAR'}")
                     else:
-                        logger.debug(f"[ESP32 unexpected] {line}")
+                        logger.info(f"[ESP32] {line}")
         except Exception as e:
             logger.error(f"Serial read error: {e}")
             reconnect_serial()
@@ -228,6 +281,125 @@ def _get_piper():
     threading.Thread(target=_warmup_piper, daemon=True).start()
     return p
 
+# ─── Weather + Context ────────────────────────────────────────────────────────
+
+_WMO_CODES = {
+    0:"Clear sky", 1:"Mainly clear", 2:"Partly cloudy", 3:"Overcast",
+    45:"Fog", 48:"Icy fog", 51:"Light drizzle", 53:"Drizzle", 55:"Heavy drizzle",
+    61:"Light rain", 63:"Rain", 65:"Heavy rain", 71:"Light snow", 73:"Snow",
+    75:"Heavy snow", 80:"Rain showers", 81:"Rain showers", 82:"Heavy showers",
+    95:"Thunderstorm", 96:"Thunderstorm with hail", 99:"Thunderstorm with hail",
+}
+
+_weather_cache      = {"summary": None, "fetched_at": 0}
+_weather_cache_lock = threading.Lock()
+
+def get_weather():
+    """Return a concise weather string. Cached for 10 minutes."""
+    with _weather_cache_lock:
+        if _weather_cache["summary"] and time.time() - _weather_cache["fetched_at"] < 600:
+            return _weather_cache["summary"]
+    with _device_settings_lock:
+        lat = _device_settings["lat"]
+        lon = _device_settings["lon"]
+        tz  = _device_settings["tz"]
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude":          lat,
+            "longitude":         lon,
+            "current":           "temperature_2m,apparent_temperature,precipitation,"
+                                 "weather_code,wind_speed_10m,relative_humidity_2m",
+            "daily":             "temperature_2m_max,temperature_2m_min,precipitation_sum,weather_code",
+            "temperature_unit":  "fahrenheit",
+            "wind_speed_unit":   "mph",
+            "precipitation_unit":"inch",
+            "timezone":          tz,
+            "forecast_days":     3,
+        }, timeout=5)
+        r.raise_for_status()
+        d   = r.json()
+        cur = d["current"]
+        dy  = d["daily"]
+
+        def wmo(c): return _WMO_CODES.get(int(c), f"weather code {c}")
+
+        lines = [
+            f"Current weather: {wmo(cur['weather_code'])}, "
+            f"{cur['temperature_2m']:.0f}°F (feels {cur['apparent_temperature']:.0f}°F), "
+            f"humidity {cur['relative_humidity_2m']}%, wind {cur['wind_speed_10m']:.0f} mph."
+        ]
+        for i in range(len(dy["time"])):
+            rain = f", {dy['precipitation_sum'][i]:.2f}in rain" if dy["precipitation_sum"][i] > 0 else ""
+            lines.append(
+                f"{dy['time'][i]}: {wmo(dy['weather_code'][i])}, "
+                f"high {dy['temperature_2m_max'][i]:.0f}°F / low {dy['temperature_2m_min'][i]:.0f}°F{rain}."
+            )
+        summary = " ".join(lines)
+        with _weather_cache_lock:
+            _weather_cache["summary"]    = summary
+            _weather_cache["fetched_at"] = time.time()
+        logger.info("Weather updated.")
+        return summary
+    except Exception as e:
+        logger.warning(f"Weather fetch failed: {e}")
+        return "Weather data unavailable."
+
+def get_context():
+    """One-liner injected into every LLM prompt: date/time + weather."""
+    from datetime import datetime
+    now = datetime.now()
+    return (
+        f"Today is {now.strftime('%A, %B %d %Y')}. "
+        f"The time is {now.strftime('%I:%M %p')}. "
+        + get_weather()
+    )
+
+# ─── Timer Management ─────────────────────────────────────────────────────────
+
+_TIMER_TAG = re.compile(r'\[TIMER:(\d+)(?::([^\]]*))?\]')
+
+_active_timers      = {}
+_active_timers_lock = threading.Lock()
+
+def speak_text(text):
+    """Speak arbitrary text through the Piper/aplay pipeline."""
+    try:
+        piper = _get_piper()
+        piper.stdin.write(text.encode() + b'\n')
+        piper.stdin.close()
+        _tts_active.set()
+        try:
+            while True:
+                chunk = piper.stdout.read(4096)
+                if not chunk:
+                    break
+                with _audio_lock:
+                    _aplay_stdin.write(chunk)
+                    _aplay_stdin.flush()
+        finally:
+            _tts_active.clear()
+    except Exception as e:
+        logger.error(f"speak_text error: {e}")
+
+def _handle_timer_done(label):
+    """Called when ESP32 sends TIMER:DONE — announce completion."""
+    with _active_timers_lock:
+        _active_timers.pop(label, None)
+    logger.info(f"Timer fired (ESP32): '{label}'")
+    send_uart_command("APP: SPEAKING")
+    clean = re.sub(r'\s*timer\s*$', '', label, flags=re.IGNORECASE).strip()
+    speak_text(f"{clean} timer is done." if clean else "Timer complete.")
+    send_uart_command("APP: ASSISTANT")
+
+def set_timer(seconds, label=""):
+    """Tell the ESP32 to run the countdown — it sends TIMER:DONE when finished."""
+    key = label or f"{seconds}s"
+    safe_label = label.replace(":", " ")  # colons are the delimiter
+    with _active_timers_lock:
+        _active_timers[key] = {"expires_at": time.time() + seconds, "label": label}
+    send_uart_command(f"TIMER:START:{seconds}:{safe_label}")
+    logger.info(f"Timer set: '{key}' for {seconds}s → ESP32")
+
 # ─── LLM + TTS Pipeline ───────────────────────────────────────────────────────
 
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
@@ -258,14 +430,29 @@ def _iter_sentences(stream):
     elif full_parts:
         yield '', True, ''.join(full_parts)
 
+_TIMER_TOOL = types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name="set_timer",
+        description="Set a countdown timer that alerts the user when complete.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "seconds": types.Schema(type="INTEGER", description="Duration in seconds"),
+                "label":   types.Schema(type="STRING",  description="Short name, e.g. 'pasta'"),
+            },
+            required=["seconds", "label"],
+        )
+    )
+]) if LLM_AVAILABLE else None
+
+
 def process_llm(audio_array):
     """
-    Full optimized pipeline:
-      1. Normalize + encode audio in-memory (no temp file)
-      2. Send inline audio to Gemini (no file-upload round-trip)
-      3. Stream response → buffer to sentence boundaries
-      4. Feed sentences to warm Piper subprocess
-      5. Forward Piper raw PCM → aplay stdin (audio starts before LLM finishes)
+    LLM pipeline with Gemini function calling for timers:
+      1. Normalize + encode audio
+      2. Non-streaming call with set_timer tool defined
+      3. If tool called: execute, follow-up call for spoken confirmation
+      4. Feed response text to Piper → aplay
     """
     if not LLM_AVAILABLE:
         logger.error("LLM libraries not installed!")
@@ -279,9 +466,6 @@ def process_llm(audio_array):
     piper_proc = None
 
     try:
-        # Gate: discard silent recordings before touching the LLM.
-        # Uses peak amplitude (not RMS) so the silent pre-roll buffer doesn't dilute
-        # the check — one moment of speech will always produce a clear peak.
         peak_amplitude = float(np.max(np.abs(audio_array)))
         if peak_amplitude < config.LLM_MIN_PEAK:
             logger.info(f"Recording discarded — silence (peak={peak_amplitude:.5f} < {config.LLM_MIN_PEAK})")
@@ -295,7 +479,7 @@ def process_llm(audio_array):
         if peak > 0.001:
             audio_array = (audio_array / peak) * 0.95
 
-        # Encode to 16-bit PCM WAV in memory — no disk I/O, no temp file
+        # Encode to 16-bit PCM WAV in memory
         audio_int16 = (audio_array * 32767).astype(np.int16)
         wav_buf = io.BytesIO()
         with wave.open(wav_buf, 'wb') as wf:
@@ -305,22 +489,63 @@ def process_llm(audio_array):
             wf.writeframes(audio_int16.tobytes())
         wav_bytes = wav_buf.getvalue()
 
-        # Stream from Gemini — inline audio skips the file-upload round-trip
-        response_stream = client.models.generate_content_stream(
-            model=config.LLM_MODEL,
-            contents=[
-                types.Part.from_bytes(data=wav_bytes, mime_type='audio/wav'),
-                "Listen to the audio and fulfill the spoken request. "
-                "Ignore background noises and clicks. "
-                + config.LLM_SYSTEM_PROMPT
-            ]
+        context  = get_context()
+        user_msg = (
+            "Listen to the audio and answer the spoken question or fulfill the spoken request. "
+            "Ignore background noises and clicks. "
+            "You can answer any question directly using your knowledge and the context below. "
+            "Only call set_timer if the user explicitly asks to set or start a timer. "
+            f"Context: {context}"
+        )
+        audio_part = types.Part.from_bytes(data=wav_bytes, mime_type='audio/wav')
+        gen_cfg    = types.GenerateContentConfig(
+            system_instruction=config.LLM_SYSTEM_PROMPT,
+            tools=[_TIMER_TOOL],
         )
 
-        # Grab the pre-warmed Piper (model already loaded → no startup delay)
+        # ── First call: detect function use ──────────────────────────────────
+        response = client.models.generate_content(
+            model=config.LLM_MODEL,
+            contents=[audio_part, user_msg],
+            config=gen_cfg,
+        )
+
+        pending_timers = []
+        text_parts     = []
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, 'function_call') and part.function_call:
+                fc = part.function_call
+                if fc.name == "set_timer":
+                    pending_timers.append((int(fc.args["seconds"]), str(fc.args.get("label", ""))))
+            if getattr(part, 'text', None):
+                text_parts.append(part.text)
+
+        # ── If timer requested: follow-up call for spoken confirmation ────────
+        # set_timer() is called after TTS finishes so the ring starts post-confirmation
+        if pending_timers:
+            fn_responses = [
+                types.Part.from_function_response(
+                    name="set_timer",
+                    response={"status": "started"}
+                )
+                for _ in pending_timers
+            ]
+            follow = client.models.generate_content(
+                model=config.LLM_MODEL,
+                contents=[
+                    audio_part, user_msg,
+                    response.candidates[0].content,
+                    types.Content(role="user", parts=fn_responses),
+                ],
+                config=types.GenerateContentConfig(system_instruction=config.LLM_SYSTEM_PROMPT),
+            )
+            text_parts = [p.text for p in follow.candidates[0].content.parts if getattr(p, 'text', None)]
+
+        full_text = ' '.join(text_parts).strip()
+
+        # ── Pipe text → Piper → aplay ─────────────────────────────────────────
         piper_proc = _get_piper()
 
-        # Forward thread: piper stdout → persistent aplay stdin
-        # Pauses the silence feeder while TTS audio is writing so they don't interleave.
         def _forward_audio():
             first = True
             try:
@@ -329,7 +554,7 @@ def process_llm(audio_array):
                     if not chunk:
                         break
                     if first:
-                        _tts_active.set()   # Pause silence feeder
+                        _tts_active.set()
                         send_uart_command("APP: SPEAKING")
                         first = False
                     with _audio_lock:
@@ -338,33 +563,23 @@ def process_llm(audio_array):
             except Exception:
                 pass
             finally:
-                _tts_active.clear()  # Resume silence feeder
+                _tts_active.clear()
 
         forward_thread = threading.Thread(target=_forward_audio, daemon=True)
         forward_thread.start()
 
-        # Stream LLM → sentence buffer → Piper stdin
-        full_text = ""
-        for sentence, is_last, accumulated in _iter_sentences(response_stream):
-            if sentence:
-                logger.debug(f"TTS: {sentence!r}")
-                piper_proc.stdin.write(sentence.encode() + b'\n')
-                piper_proc.stdin.flush()
-            if is_last:
-                full_text = accumulated
-
-        # Signal Piper that input is done → it flushes remaining audio and exits
+        if full_text:
+            logger.info(f"LLM answer: {full_text}")
+            send_uart_command(f"TXT|{full_text.replace(chr(10), ' ')}")
+            piper_proc.stdin.write(full_text.encode() + b'\n')
         piper_proc.stdin.close()
 
-        # Send transcription to display (non-blocking — happens while audio plays)
-        if full_text:
-            display_text = full_text.strip().replace('\n', ' ')
-            logger.info(f"LLM answer: {display_text}")
-            send_uart_command(f"TXT|{display_text}")
-
-        # Wait for all audio to be written to the persistent aplay buffer
         forward_thread.join()
         logger.info("Playback finished.")
+
+        # Start timers after confirmation has been spoken
+        for secs, label in pending_timers:
+            set_timer(secs, label)
 
     except Exception as e:
         logger.error(f"LLM pipeline error: {e}")
@@ -497,7 +712,10 @@ def audio_processor():
     # ── Pre-compute FFT constants (invariant for this sample rate / chunk size) ──
     _fft_freq_bounds = np.geomspace(80, 12000, 17)
     _fft_idx_bounds  = np.clip((_fft_freq_bounds * CHUNK / RATE).astype(int), 0, CHUNK // 2)
-    _fft_weights     = np.linspace(1.0, 2.0, 16)
+    _fft_weights     = np.ones(16)
+    # Per-bin noise floor calibrated from measured silence (silence p95 * 1.3)
+    _fft_floor       = np.array([0.673, 0.3535, 0.2799, 0.1647, 0.1024, 0.059, 0.0352, 0.0254,
+                                  0.0179, 0.0129, 0.0094, 0.0072, 0.0055, 0.0043, 0.0035, 0.0028])
 
     # ── Other state ──
     last_send_time     = 0
@@ -511,17 +729,14 @@ def audio_processor():
         try:
             with state_lock:
                 mic_active = assistant_state.get("mic_active", False)
-            if not mic_active:
-                time.sleep(0.1)
-                continue
 
             data = stream.read(CHUNK, exception_on_overflow=False)
             raw_samples = np.frombuffer(data, dtype=np.int32)
-            ch_left  = raw_samples[0::2]   # INMP441 on left channel
-            ch_right = raw_samples[1::2]   # noqa: F841
+            ch_left  = raw_samples[0::2]   # noqa: F841
+            ch_right = raw_samples[1::2]   # INMP441 on right channel (L/R=3.3V)
 
             # Normalize 32-bit → float64 ±1.0
-            norm_samples = ch_left.astype(np.float64) / 2147483648.0
+            norm_samples = ch_right.astype(np.float64) / 2147483648.0
 
             # Maintain ~1.5s pre-roll buffer — store numpy chunks to avoid O(n) list copies
             if not recording:
@@ -536,7 +751,7 @@ def audio_processor():
 
                 if vad:
                     # Accumulate downsampled int16 for VAD (48k→16k, 32bit→16bit)
-                    chunk_16k = np.right_shift(ch_left[::3], 16).astype(np.int16)
+                    chunk_16k = np.right_shift(ch_right[::3], 16).astype(np.int16)
                     vad_frame_buf = np.concatenate([vad_frame_buf, chunk_16k])
 
                     while len(vad_frame_buf) >= VAD_FRAME_SAMPLES:
@@ -592,8 +807,8 @@ def audio_processor():
                     continue
 
                 # Downsample 48kHz → 16kHz, 32-bit → 16-bit for OWW
-                ch_left_16k = ch_left[::3]
-                oww_audio   = np.right_shift(ch_left_16k, 16).astype(np.int16)
+                ch_right_16k = ch_right[::3]
+                oww_audio    = np.right_shift(ch_right_16k, 16).astype(np.int16)
                 oww_buffer  = np.concatenate((oww_buffer, oww_audio))
 
                 if len(oww_buffer) >= 1280:
@@ -622,7 +837,7 @@ def audio_processor():
             rms_left = np.sqrt(np.mean(norm_samples ** 2)) * 100.0
 
             avg_rms = assistant_state.get("avg_rms", 1.0)
-            adj_rms = max(0.0, rms_left - 0.03)
+            adj_rms = max(0.0, rms_left - 2.5)
 
             if adj_rms > 0.02:
                 avg_rms = (avg_rms * 0.90) + (adj_rms * 0.10)
@@ -636,7 +851,7 @@ def audio_processor():
                 assistant_state["audio_intensity"] = intensity
 
             now = time.time()
-            if now - last_send_time > (1.0 / config.AUDIO_UPDATE_HZ):
+            if mic_active and now - last_send_time > (1.0 / config.AUDIO_UPDATE_HZ):
                 # FFT only at send rate (10Hz) — not on every 46Hz capture chunk
                 fft_data = np.abs(np.fft.rfft(norm_samples))
                 gain     = max(0.5, min(8.0, 1.0 / assistant_state["avg_rms"]))
@@ -644,7 +859,7 @@ def audio_processor():
                 for i in range(16):
                     start = _fft_idx_bounds[i]
                     end   = max(start + 1, _fft_idx_bounds[i + 1])
-                    mag   = max(0.0, np.mean(fft_data[start:end]) - 0.001)
+                    mag   = max(0.0, np.mean(fft_data[start:end]) - _fft_floor[i])
                     bins.append(int(min(100, np.log1p(mag * 180.0 * gain * _fft_weights[i]) * 17.0)))
                 send_uart_command(f"S{','.join(map(str, bins))}|A{intensity}")
                 last_send_time = now
@@ -726,6 +941,23 @@ def radar_stop():
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    _load_device_settings()
+
+    # Launch the ADS-B proxy as a subprocess — restarts automatically if it crashes
+    _proxy_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adsb_proxy_pi.py")
+    _proxy_python  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv/bin/python")
+    def _watch_proxy():
+        while True:
+            try:
+                logger.info("Starting adsb_proxy_pi.py")
+                proc = subprocess.Popen([_proxy_python, _proxy_script])
+                proc.wait()
+                logger.warning(f"adsb_proxy_pi.py exited (code {proc.returncode}), restarting in 5s")
+            except Exception as e:
+                logger.error(f"adsb_proxy watcher error: {e}")
+            time.sleep(5)
+    threading.Thread(target=_watch_proxy, daemon=True).start()
+
     reader_thread = threading.Thread(target=serial_reader, daemon=True)
     reader_thread.start()
     logger.info("Serial reader thread started")

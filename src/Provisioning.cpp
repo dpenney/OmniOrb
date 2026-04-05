@@ -23,17 +23,33 @@ h2 { letter-spacing: 2px; }
 p { font-size: 14px; color: #0350; }
 </style>
 <script>
+var TZ_MAP = {
+  "America/New_York":    -5, "America/Chicago":     -6,
+  "America/Denver":      -7, "America/Los_Angeles": -8,
+  "America/Anchorage":   -9, "Pacific/Honolulu":   -10,
+  "America/Sao_Paulo":   -3, "America/Argentina/Buenos_Aires": -3,
+  "Europe/London":        0, "Europe/Paris":         1,
+  "Europe/Berlin":        1, "Europe/Helsinki":      2,
+  "Europe/Athens":        2, "Europe/Moscow":        3,
+  "Asia/Dubai":           4, "Asia/Kolkata":       5.5,
+  "Asia/Bangkok":         7, "Asia/Shanghai":        8,
+  "Asia/Singapore":       8, "Asia/Tokyo":           9,
+  "Australia/Perth":      8, "Australia/Sydney":    10,
+  "Pacific/Auckland":    12
+};
 function setLocation(sel) {
     var val = sel.value;
-    if (val == "manual") {
-        document.getElementById('lat').value = "";
-        document.getElementById('lon').value = "";
-        document.getElementById('gmt').value = "0";
-    } else {
-        var parts = val.split(",");
-        document.getElementById('lat').value = parts[0];
-        document.getElementById('lon').value = parts[1];
-        document.getElementById('gmt').value = parts[2];
+    if (val == "manual") return;
+    var parts = val.split(",");
+    document.getElementById('lat').value = parts[0];
+    document.getElementById('lon').value = parts[1];
+    document.getElementById('gmt').value = parts[2];
+    if (parts[3]) document.getElementById('tz').value = parts[3];
+}
+function setTZ(sel) {
+    var tz = sel.value;
+    if (TZ_MAP.hasOwnProperty(tz)) {
+        document.getElementById('gmt').value = TZ_MAP[tz];
     }
 }
 </script>
@@ -46,15 +62,47 @@ function setLocation(sel) {
 <input type="password" name="pass" placeholder="WIFI PASSWORD">
 <label style="display:block; text-align:left; font-size:12px; margin-top:10px;">HOME POSITION:</label>
 <select onchange="setLocation(this)">
-    <option value="33.771524,-92.858774,-6" selected>Barksdale AFB, LA</option>
-    <option value="51.681442,-1.802442,0">RAF Fairford</option>
-    <option value="37.849993,-122.115747,-7">Bruno's Lair</option>
-    <option value="manual">-- MANUAL ENTRY --</option>
+    <option value="manual" selected>-- SELECT PRESET --</option>
+    <option value="33.771524,-92.858774,-6,America/Chicago">Barksdale AFB, LA</option>
+    <option value="51.681442,-1.802442,0,Europe/London">RAF Fairford</option>
+    <option value="37.849993,-122.115747,-7,America/Los_Angeles">Bruno's Lair</option>
 </select>
-<input type="text" name="lat" id="lat" placeholder="HOME LATITUDE" value="33.771524" required>
-<input type="text" name="lon" id="lon" placeholder="HOME LONGITUDE" value="-92.858774" required>
-<input type="text" name="gmt" id="gmt" placeholder="GMT OFFSET (e.g. -7)" value="-6" required>
-<p style="color: #666; font-size: 12px;">(Use Google Maps or LatLong.net for manual coords)</p>
+<input type="text" name="lat" id="lat" placeholder="HOME LATITUDE" required>
+<input type="text" name="lon" id="lon" placeholder="HOME LONGITUDE" required>
+<label style="display:block; text-align:left; font-size:12px; margin-top:10px;">TIMEZONE:</label>
+<select name="tz" id="tz" onchange="setTZ(this)">
+    <optgroup label="Americas">
+    <option value="America/New_York">Eastern (UTC-5)</option>
+    <option value="America/Chicago">Central (UTC-6)</option>
+    <option value="America/Denver">Mountain (UTC-7)</option>
+    <option value="America/Los_Angeles" selected>Pacific (UTC-8)</option>
+    <option value="America/Anchorage">Alaska (UTC-9)</option>
+    <option value="Pacific/Honolulu">Hawaii (UTC-10)</option>
+    <option value="America/Sao_Paulo">Sao Paulo (UTC-3)</option>
+    <option value="America/Argentina/Buenos_Aires">Buenos Aires (UTC-3)</option>
+    </optgroup>
+    <optgroup label="Europe">
+    <option value="Europe/London">London (UTC+0)</option>
+    <option value="Europe/Paris">Paris/Madrid (UTC+1)</option>
+    <option value="Europe/Berlin">Berlin/Rome (UTC+1)</option>
+    <option value="Europe/Helsinki">Helsinki (UTC+2)</option>
+    <option value="Europe/Athens">Athens (UTC+2)</option>
+    <option value="Europe/Moscow">Moscow (UTC+3)</option>
+    </optgroup>
+    <optgroup label="Asia/Pacific">
+    <option value="Asia/Dubai">Dubai (UTC+4)</option>
+    <option value="Asia/Kolkata">India (UTC+5:30)</option>
+    <option value="Asia/Bangkok">Bangkok (UTC+7)</option>
+    <option value="Asia/Shanghai">China (UTC+8)</option>
+    <option value="Asia/Singapore">Singapore (UTC+8)</option>
+    <option value="Asia/Tokyo">Tokyo (UTC+9)</option>
+    <option value="Australia/Perth">Perth (UTC+8)</option>
+    <option value="Australia/Sydney">Sydney (UTC+10)</option>
+    <option value="Pacific/Auckland">Auckland (UTC+12)</option>
+    </optgroup>
+</select>
+<input type="text" name="gmt" id="gmt" placeholder="GMT OFFSET (e.g. -7)" value="-8" required>
+<p style="color: #666; font-size: 12px;">(Coords: use Google Maps. GMT offset auto-fills from timezone.)</p>
 <button type="submit">COMMIT SETTINGS</button>
 </form></div></body></html>
 )rawliteral";
@@ -70,6 +118,7 @@ void handleSave() {
         currentSettings->home_lat = server.arg("lat").toFloat();
         currentSettings->home_lon = server.arg("lon").toFloat();
         currentSettings->gmt_offset = server.arg("gmt").toFloat();
+        strlcpy(currentSettings->timezone, server.arg("tz").c_str(), sizeof(currentSettings->timezone));
         
         SettingsManager::save(*currentSettings);
         

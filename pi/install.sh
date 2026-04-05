@@ -67,7 +67,35 @@ else
     exit 1
 fi
 
-# 5. Configuration Setup
+# 5. Piper TTS Binary
+PIPER_VERSION="1.2.0"
+PIPER_ARCH="aarch64"
+PIPER_TARBALL="piper_linux_${PIPER_ARCH}.tar.gz"
+PIPER_URL="https://github.com/rhasspy/piper/releases/download/${PIPER_VERSION}/${PIPER_TARBALL}"
+
+if [ ! -f "venv/bin/piper" ]; then
+    echo -e "🔊 Downloading Piper TTS binary..."
+    curl -L "$PIPER_URL" -o /tmp/piper.tar.gz
+    tar -xzf /tmp/piper.tar.gz -C /tmp/
+    cp /tmp/piper/piper venv/bin/piper
+    chmod +x venv/bin/piper
+    cp /tmp/piper/*.so* venv/bin/ 2>/dev/null || true
+    rm -rf /tmp/piper /tmp/piper.tar.gz
+    echo -e "${GREEN}✅ Piper installed.${NC}"
+else
+    echo -e "${GREEN}✅ Piper already installed.${NC}"
+fi
+
+# Voice model directory
+mkdir -p voices
+if [ ! -f "voices/alan.onnx" ]; then
+    echo -e "${YELLOW}⚠️  voices/alan.onnx not found.${NC}"
+    echo -e "   Place the alan voice model files at:"
+    echo -e "   ${BLUE}$SCRIPT_DIR/voices/alan.onnx${NC}"
+    echo -e "   ${BLUE}$SCRIPT_DIR/voices/alan.onnx.json${NC}"
+fi
+
+# 6. Configuration Setup
 if [ ! -f ".env" ]; then
     if [ -f ".env.example" ]; then
         echo -e "📝 Creating .env from template..."
@@ -80,14 +108,41 @@ else
     echo -e "${GREEN}✅ .env file exists.${NC}"
 fi
 
-# 6. Systemd Service Integration
+# 7. Boot Configuration (/boot/firmware/config.txt)
+echo -e "🔧 Checking /boot/firmware/config.txt..."
+BOOT_CONFIG="/boot/firmware/config.txt"
+BOOT_CHANGED=0
+
+append_if_missing() {
+    local line="$1"
+    if ! grep -qF "$line" "$BOOT_CONFIG" 2>/dev/null; then
+        echo "$line" | sudo tee -a "$BOOT_CONFIG" > /dev/null
+        echo -e "${YELLOW}  Added: $line${NC}"
+        BOOT_CHANGED=1
+    fi
+}
+
+append_if_missing "dtoverlay=googlevoicehat-soundcard"
+append_if_missing "enable_uart=1"
+append_if_missing "dtoverlay=disable-bt"
+append_if_missing "gpio=13=op,dl"
+
+if [ "$BOOT_CHANGED" -eq 1 ]; then
+    echo -e "${YELLOW}⚠️  /boot/firmware/config.txt was updated — a reboot is required!${NC}"
+else
+    echo -e "${GREEN}✅ Boot config already correct.${NC}"
+fi
+
+# 8. Systemd Service Integration
 echo -e "⚙️  Installing systemd service..."
 
 # Create a temporary service file with correct paths
 SERVICE_FILE="assistant.service"
 if [ -f "$SERVICE_FILE" ]; then
     TEMP_SERVICE="/tmp/assistant.service"
-    sed "s|{{APP_PATH}}|$SCRIPT_DIR|g" "$SERVICE_FILE" > "$TEMP_SERVICE"
+    sed -e "s|{{APP_PATH}}|$SCRIPT_DIR|g" \
+        -e "s|{{SERVICE_USER}}|$USER|g" \
+        "$SERVICE_FILE" > "$TEMP_SERVICE"
     sudo cp "$TEMP_SERVICE" /etc/systemd/system/assistant.service
     rm "$TEMP_SERVICE"
     
@@ -105,4 +160,9 @@ echo -e "${BLUE}------------------------------------------${NC}"
 echo -e "Monitor logs: ${BLUE}tail -f $SCRIPT_DIR/assistant.log${NC}"
 echo -e "Edit config:  ${BLUE}nano $SCRIPT_DIR/config.py${NC}"
 echo -e "Edit secrets: ${BLUE}nano $SCRIPT_DIR/.env${NC}"
+echo -e "${BLUE}------------------------------------------${NC}"
+echo -e "${YELLOW}⚠️  If this is a new device, verify audio device indices:${NC}"
+echo -e "   ${BLUE}aplay -l${NC}  (output devices)"
+echo -e "   ${BLUE}python3 $SCRIPT_DIR/find_mic.py${NC}  (input device index)"
+echo -e "   Update AUDIO_DEVICE_INDEX and APLAY_DEVICE in config.py if needed."
 echo -e "${BLUE}------------------------------------------${NC}"

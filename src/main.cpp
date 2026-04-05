@@ -171,6 +171,14 @@ static SemaphoreHandle_t ac_mutex;
 
 static bool lvgl_active = false; // True only when LVGL clock screen is the active view
 
+void notify_pi_settings() {
+    // Send location + timezone so Pi can use them for weather, ADS-B bounding box, etc.
+    String msg = String("GEO:") + String(settings.home_lat, 6) + "," +
+                 String(settings.home_lon, 6) + "," + String(settings.timezone);
+    Serial0.println(msg);
+    Serial.printf("[UART→Pi] %s\n", msg.c_str());
+}
+
 void notify_pi_app_mode(AppState mode) {
     String modeStr = "OTHER";
     if (mode == APP_ASSISTANT) modeStr = "ASSISTANT";
@@ -644,12 +652,55 @@ int find_nearest(int tx, int ty) {
     return best;
 }
 
+// Draw timer ring on the radar/gfx canvas — safe at r=231-240 since sweep only reaches r=230
+static void draw_radar_timer_ring() {
+    const float STEP = 0.008f;
+    const float FULL = 2.0f * M_PI;
+    const float start_rad = -M_PI / 2.0f;
+
+    if (!AssistantView::is_timer_active()) {
+        // Erase any leftover ring
+        for (float a = start_rad; a <= start_rad + FULL; a += STEP) {
+            float cs = cosf(a), sn = sinf(a);
+            for (int tt = 0; tt < 10; tt++)
+                gfx->drawPixel(CX + (int)((240 - tt) * cs), CY + (int)((240 - tt) * sn), C_BG);
+        }
+        return;
+    }
+
+    float pct      = AssistantView::get_timer_vis_pct();
+    float span_rad = (pct / 100.0f) * FULL;
+    float end_rad  = start_rad + span_rad;
+
+    // Green → yellow → red colour
+    uint16_t col;
+    int ipct = (int)pct;
+    if (ipct >= 50) {
+        float t  = (ipct - 50) / 50.0f;
+        uint8_t r = (uint8_t)(31 * (1.0f - t));
+        col = (r << 11) | (63 << 5);
+    } else {
+        float t  = ipct / 50.0f;
+        uint8_t g = (uint8_t)(63 * t);
+        col = (31 << 11) | (g << 5);
+    }
+
+    // Draw full ring: coloured arc then background for the remainder
+    for (float a = start_rad; a <= start_rad + FULL; a += STEP) {
+        uint16_t px_col = (a <= end_rad) ? col : C_BG;
+        float cs = cosf(a), sn = sinf(a);
+        for (int tt = 0; tt < 10; tt++)
+            gfx->drawPixel(CX + (int)((240 - tt) * cs), CY + (int)((240 - tt) * sn), px_col);
+    }
+}
+
 void full_redraw() {
     // Invalidate all paint state so aircraft repaint on next sweep pass
     xSemaphoreTake(ac_mutex, portMAX_DELAY);
     for (int i = 0; i < aircraft_count; i++) aircraft[i].paint_valid = false;
     xSemaphoreGive(ac_mutex);
     draw_static_bg();
+    draw_radar_timer_ring();   // drawn after bg, outside sweep radius — will persist
     draw_sweep(sweep_angle);
     draw_range_label();
     if (detail_visible) draw_detail_box();
@@ -751,6 +802,7 @@ void setup() {
     while (fetch_busy || fetch_requested) delay(50);
 
     full_redraw();
+    notify_pi_settings();             // Tell Pi location + timezone on every boot
     notify_pi_app_mode(current_app);  // Tell Pi the initial screen on boot
 
     // Prepare assistant canvas
@@ -833,9 +885,22 @@ void loop() {
     }
     // ─────────────────────────────────────────────────────────────────────────
 
+    // ── Timer tick — runs on every screen ──────────────────────────────────────
+    AssistantView::tick_timer();
+
+    // ── Timer done — notify Pi regardless of active screen ─────────────────────
+    if (AssistantView::is_timer_done()) {
+        String msg = "TIMER:DONE:" + AssistantView::timer_label();
+        Serial0.println(msg);
+        Serial.println(msg);
+        AssistantView::clear_timer();
+        if (current_app == APP_CLOCK) ClockView::set_timer_pct(-1);
+        if (current_app == APP_RADAR) full_redraw();  // redraw to erase ring
+    }
+
     if (current_app == APP_RADAR) {
         // Don't run lv_timer_handler in radar mode -- it would flush LVGL's white screen over us
-        
+
         // Sweep — smooth single-arm rotation
         static unsigned long last_sweep_ms = 0;
         if (now - last_sweep_ms >= SWEEP_INTERVAL_MS) {
@@ -843,6 +908,7 @@ void loop() {
             if (prev_sweep >= 0) erase_sweep(prev_sweep);
             sweep_paint_aircraft(sweep_angle, new_angle);
             draw_sweep(new_angle);
+            draw_radar_timer_ring();  // redraws ring if active (persists outside sweep radius)
             if (detail_visible && detail_clobbered) draw_detail_box();
             prev_sweep  = sweep_angle;
             sweep_angle = new_angle;
@@ -858,7 +924,15 @@ void loop() {
     } else if (current_app == APP_ASSISTANT) {
         AssistantView::update();
     } else if (current_app == APP_CLOCK) {
-        ClockView::update_time(); 
+        // Update timer arc at ~10 Hz — fast enough to look smooth, won't flood LVGL
+        static unsigned long last_timer_arc_ms = 0;
+        if (now - last_timer_arc_ms >= 100) {
+            if (AssistantView::is_timer_active()) {
+                ClockView::set_timer_pct((int)AssistantView::get_timer_vis_pct());
+            }
+            last_timer_arc_ms = now;
+        }
+        ClockView::update_time();
         lv_timer_handler();
     }
 
@@ -871,6 +945,7 @@ void loop() {
             if (rx.length() == 0) continue;
 
             if (rx == "SYNC?") {
+                notify_pi_settings();
                 notify_pi_app_mode(current_app);
             } else if (rx == "Z+") {
                 range_nm = max((float)MIN_RANGE_NM, range_nm / 1.15f);
@@ -880,7 +955,36 @@ void loop() {
                 range_nm = min((float)MAX_RANGE_NM, range_nm * 1.15f);
                 Serial.printf("Remote Zoom OUT: %.1f nm\n", range_nm);
                 full_redraw();
+            } else if (rx.startsWith("TIMER:START:")) {
+                // Format: TIMER:START:<seconds>:<label>
+                String rest = rx.substring(12);
+                int colon = rest.indexOf(':');
+                uint32_t secs;
+                String lbl;
+                if (colon != -1) {
+                    secs = (uint32_t)rest.substring(0, colon).toInt();
+                    lbl  = rest.substring(colon + 1);
+                } else {
+                    secs = (uint32_t)rest.toInt();
+                    lbl  = "";
+                }
+                AssistantView::start_timer(secs, lbl);
+            } else if (rx == "TIMER:CANCEL") {
+                AssistantView::clear_timer();
             } else if (rx.startsWith("WAKE|")) {
+                // Switch to assistant view from any screen
+                if (current_app != APP_ASSISTANT) {
+                    if (current_app == APP_CLOCK) {
+                        lvgl_active = false;
+                        lv_obj_t *blank = lv_obj_create(NULL);
+                        lv_obj_set_style_bg_color(blank, lv_color_black(), 0);
+                        lv_scr_load(blank);
+                    }
+                    current_app = APP_ASSISTANT;
+                    AssistantView::show();
+                    notify_pi_app_mode(current_app);
+                    full_redraw();
+                }
                 AssistantView::set_state(AssistantView::STATE_LISTENING);
             } else if (rx.startsWith("APP:")) {
                 String cmd = rx.substring(4);

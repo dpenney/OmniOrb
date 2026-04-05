@@ -23,6 +23,14 @@ int AssistantView::freq_bins[16] = {0};
 static float visual_bins[16] = {0.0f}; // Smoothed visual values
 static AssistantView::AssistantState current_state = AssistantView::STATE_IDLE;
 
+// ─── Timer state ────────────────────────────────────────────────────────────
+static bool     timer_active   = false;
+static uint32_t timer_start_ms = 0;
+static uint32_t timer_dur_ms   = 0;
+static String   timer_lbl      = "";
+static bool     timer_done_flag = false;  // true for one update() frame after expiry
+static float    timer_pct_vis  = 100.0f;  // smoothed visual percent
+
 void AssistantView::set_state(AssistantState state) {
     current_state = state;
 }
@@ -46,6 +54,64 @@ void AssistantView::set_audio_intensity(int intensity) {
     // Debug: print if significant
     if (intensity > 10) {
         // Serial.printf("Got Intensity: %d\n", intensity);
+    }
+}
+
+void AssistantView::start_timer(uint32_t seconds, const String& label) {
+    timer_start_ms  = millis();
+    timer_dur_ms    = seconds * 1000UL;
+    timer_lbl       = label;
+    timer_active    = true;
+    timer_done_flag = false;
+    timer_pct_vis   = 100.0f;
+    // draw_pct (static in update()) will snap on first draw — acceptable
+}
+
+void AssistantView::clear_timer() {
+    timer_active    = false;
+    timer_done_flag = false;
+    timer_pct_vis   = -1.0f;
+}
+
+void AssistantView::tick_timer() {
+    if (!timer_active) return;
+    unsigned long elapsed = millis() - timer_start_ms;
+    if (elapsed < timer_dur_ms) {
+        timer_pct_vis = 100.0f * (1.0f - (float)elapsed / (float)timer_dur_ms);
+    } else {
+        timer_pct_vis = 0.0f;
+        if (!timer_done_flag) {
+            timer_done_flag = true;   // fire once; main.cpp will call clear_timer()
+        }
+    }
+}
+
+bool AssistantView::is_timer_done() {
+    return timer_done_flag;
+}
+
+bool AssistantView::is_timer_active() {
+    return timer_active;
+}
+
+float AssistantView::get_timer_vis_pct() {
+    return timer_pct_vis;
+}
+
+const String& AssistantView::timer_label() {
+    return timer_lbl;
+}
+
+// Blend green→yellow→red based on percent remaining (100=green, 0=red)
+static uint16_t timer_ring_color(int pct) {
+    if (pct >= 50) {
+        float t = (pct - 50) / 50.0f;          // 0=yellow, 1=green
+        uint8_t r = (uint8_t)(31 * (1.0f - t));
+        return (r << 11) | (63 << 5);          // varying R, full G, no B
+    } else {
+        float t = pct / 50.0f;                  // 0=red, 1=yellow
+        uint8_t g = (uint8_t)(63 * t);
+        return (31 << 11) | (g << 5);          // full R, varying G, no B
     }
 }
 
@@ -193,6 +259,25 @@ void AssistantView::update() {
 
     //     }
     // }
+
+    // 4. Timer ring — lerp toward true value for smooth assistant-view animation
+    static float draw_pct = 100.0f;
+    if (timer_active && timer_pct_vis >= 0.0f) {
+        draw_pct += (timer_pct_vis - draw_pct) * 0.12f;  // smooth at ~20fps draw rate
+        float span_deg  = (draw_pct / 100.0f) * 360.0f;
+        float start_rad = -M_PI / 2.0f;
+        float end_rad   = start_rad + span_deg * (M_PI / 180.0f);
+        uint16_t col    = timer_ring_color((int)draw_pct);
+        int ring_r      = 240;
+        int thickness   = 10;
+        for (float a = start_rad; a <= end_rad; a += 0.008f) {
+            float cs = cosf(a), sn = sinf(a);
+            for (int tt = 0; tt < thickness; tt++) {
+                canvas->drawPixel(CX + (int)((ring_r - tt) * cs),
+                                  CY + (int)((ring_r - tt) * sn), col);
+            }
+        }
+    }
 
     canvas->flush();
 }

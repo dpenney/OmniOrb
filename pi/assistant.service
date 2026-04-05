@@ -14,8 +14,8 @@ EnvironmentFile=-{{APP_PATH}}/.env
 StandardOutput=inherit
 StandardError=inherit
 Restart=always
-User=pi
-Group=pi
+User={{SERVICE_USER}}
+Group={{SERVICE_USER}}
 
 [Install]
 WantedBy=multi-user.target

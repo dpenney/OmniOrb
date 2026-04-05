@@ -11,6 +11,7 @@ struct ProjectSettings {
     float home_lon;
     float range_nm;
     float gmt_offset;
+    char timezone[64];
 
     ProjectSettings();
 };

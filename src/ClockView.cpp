@@ -16,6 +16,7 @@ static lv_obj_t *meter = nullptr;
 static lv_meter_indicator_t *indic_sec_needle;
 static lv_obj_t *date_label;
 static lv_obj_t *num_labels[12];
+static int _timer_ring_pct = -1;  // -1 = hidden, 0-100 = draw arc
 
 // Global time snapshot to ensure all hands and drawing chunks are perfectly synced
 static struct timeval global_frame_tv;
@@ -468,6 +469,25 @@ static void meter_draw_event_cb(lv_event_t * e) {
         hub_dsc.bg_color = lv_color_black();
         lv_area_t inner_hub = {240-4, 240-4, 240+4, 240+4};
         lv_draw_rect(draw_ctx, &hub_dsc, &inner_hub);
+
+        // ── Timer ring — outer edge of display ──────────────────────────────
+        if (_timer_ring_pct >= 0) {
+            lv_color_t ring_col;
+            if      (_timer_ring_pct >= 50) ring_col = lv_palette_main(LV_PALETTE_GREEN);
+            else if (_timer_ring_pct >= 20) ring_col = lv_palette_main(LV_PALETTE_YELLOW);
+            else                            ring_col = lv_palette_main(LV_PALETTE_RED);
+
+            lv_draw_arc_dsc_t arc_dsc;
+            lv_draw_arc_dsc_init(&arc_dsc);
+            arc_dsc.color = ring_col;
+            arc_dsc.width = 10;
+            arc_dsc.opa   = LV_OPA_COVER;
+
+            // LVGL arc angles: 0=right(3 o'clock), clockwise.
+            // 270 = 12 o'clock. Span = pct/100 * 360.
+            uint16_t end_angle = (uint16_t)(270 + (_timer_ring_pct * 360 / 100)) % 360;
+            lv_draw_arc(draw_ctx, &arc_dsc, &center, 233, 270, end_angle);
+        }
     }
 }
 
@@ -525,6 +545,7 @@ void ClockView::init() {
     // are on top of all labels. Background opa set to 0 and transparent.
     lv_obj_set_style_bg_opa(meter, LV_OPA_TRANSP, 0);
     lv_obj_move_foreground(meter);
+    // Timer ring is drawn inside meter_draw_event_cb — no extra widget needed.
 }
 
 // Helper to invalidate ONLY the area where a hand is (old or new position)
@@ -555,6 +576,12 @@ void ClockView::show() {
 }
 
 void ClockView::hide() {}
+
+void ClockView::set_timer_pct(int pct) {
+    if (pct == _timer_ring_pct) return;   // skip if unchanged
+    _timer_ring_pct = pct;
+    if (meter) lv_obj_invalidate(meter);  // ask LVGL to redraw the meter area
+}
 
 void ClockView::update_time() {
     if (!clock_screen) return;

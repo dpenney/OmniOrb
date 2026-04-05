@@ -1,6 +1,8 @@
 import os
 import json
 
+_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Serial Configuration
 SERIAL_PORTS = ['/dev/serial0', '/dev/ttyS0', '/dev/ttyAMA0']
 SERIAL_BAUD = 115200
@@ -37,9 +39,9 @@ AUDIO_CHUNK        = 1024
 APLAY_DEVICE = "plughw:CARD=sndrpigooglevoi,DEV=0"
 
 # TTS (Piper)
-PIPER_BINARY      = "/home/pi/assistant/venv/bin/piper"
-PIPER_MODEL       = "/home/pi/assistant/voices/alan.onnx"
-PIPER_SAMPLE_RATE = 22050   # Hz — must match voice model (alan = 22050)
+PIPER_BINARY      = os.path.join(_DIR, "venv/bin/piper")
+PIPER_MODEL       = os.path.join(_DIR, "voices/danny.onnx")
+PIPER_SAMPLE_RATE = 16000   # Hz — must match voice model (danny = 16000)
 
 # Logging
 LOG_FILE         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assistant.log")
@@ -48,7 +50,7 @@ LOG_BACKUP_COUNT = 3
 
 # Wake Word
 # Set to an absolute path for a custom .onnx model, or a built-in like "hey_jarvis_v0.1"
-WAKEWORD_MODEL     = "/home/pi/assistant/HeyRobot.onnx"
+WAKEWORD_MODEL     = os.path.join(_DIR, "HeyRobot.onnx")
 WAKEWORD_THRESHOLD = 0.88
 
 # VAD (Voice Activity Detection) — webrtcvad, 30ms frames at 16kHz
@@ -74,9 +76,15 @@ ENCODER_POLL_SLEEP  = 0.001
 FLASK_HOST = '0.0.0.0'
 FLASK_PORT = 5000
 
+# Home Location — fallback defaults used until ESP32 sends GEO: over UART.
+# Set via the provisioning portal on first boot; persisted to device_settings.json.
+HOME_LAT  = 40.7128   # New York City (example — overridden by provisioning)
+HOME_LON  = -74.0060
+HOME_TZ   = "America/New_York"
+
 # ADS-B Configuration (Virtual Receiver)
-# Default BOX around LAX
-ADSB_BOX             = "33.7,34.3,-118.5,-117.8"
+# Default BOX around New York City (matches HOME_LAT/HOME_LON in config.h)
+ADSB_BOX             = "40.3,41.1,-74.4,-73.6"
 ADSB_UPDATE_INTERVAL = 10.0  # Seconds
 ADSB_LOG_FILE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adsb.log")
 
