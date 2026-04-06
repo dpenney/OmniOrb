@@ -10,6 +10,7 @@ ProjectSettings::ProjectSettings() {
     range_nm = DEFAULT_RANGE_NM;
     gmt_offset = DEFAULT_GMT_OFFSET;
     strlcpy(timezone, DEFAULT_TIMEZONE, sizeof(timezone));
+    volume = 75;
 }
 
 void SettingsManager::reset(ProjectSettings &s) {
@@ -46,6 +47,7 @@ bool SettingsManager::load(ProjectSettings &s) {
     s.range_nm = doc["range_nm"] | 15.0f;
     s.gmt_offset = doc["gmt_offset"] | 0.0f;
     strlcpy(s.timezone, doc["timezone"] | DEFAULT_TIMEZONE, sizeof(s.timezone));
+    s.volume = doc["volume"] | 75;
 
     // Migration: if GMT offset is 0 but we're in the Pacific US, it was never set.
     // Auto-correct to the compiled default and re-save so the fix persists.
@@ -72,6 +74,7 @@ bool SettingsManager::save(const ProjectSettings &s) {
     doc["range_nm"] = s.range_nm;
     doc["gmt_offset"] = s.gmt_offset;
     doc["timezone"] = s.timezone;
+    doc["volume"]   = s.volume;
 
     serializeJson(doc, f);
     f.close();

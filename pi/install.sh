@@ -26,7 +26,7 @@ fi
 
 # 2. Install System Dependencies
 echo -e "📦 Checking system dependencies..."
-DEPENDENCIES="python3-venv python3-pip python3-dev portaudio19-dev python3-pyaudio python3-numpy rsync device-tree-compiler mpg123"
+DEPENDENCIES="python3-venv python3-pip python3-dev portaudio19-dev python3-pyaudio python3-numpy rsync device-tree-compiler mpg123 libspeexdsp-dev"
 MISSING_DEPS=""
 
 for dep in $DEPENDENCIES; do

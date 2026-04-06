@@ -51,11 +51,20 @@ LOG_BACKUP_COUNT = 3
 # Wake Word
 # Set to an absolute path for a custom .onnx model, or a built-in like "hey_jarvis_v0.1"
 WAKEWORD_MODEL     = os.path.join(_DIR, "HeyRobot.onnx")
-WAKEWORD_THRESHOLD = 0.88
+WAKEWORD_THRESHOLD           = 0.88   # normal (quiet) detection threshold
+WAKEWORD_THRESHOLD_BARGE_IN  = 0.65   # lower threshold during TTS playback (echo masks the signal)
+
+# AEC (Acoustic Echo Cancellation) — suppresses speaker echo during barge-in
+# SpeexDSP adaptive filter: works at 16kHz (same rate as OWW)
+AEC_ENABLED       = False  # disabled — scores 0.001 even with AEC; echo too strong to cancel adaptively
+AEC_FRAME         = 160    # samples per AEC frame = 10ms at 16kHz
+AEC_FILTER_LENGTH = 4800   # 300ms filter — covers aplay write-to-playback delay uncertainty
+AEC_DELAY_SAMPLES = 1600   # 100ms pre-delay to compensate for aplay buffering latency
+                           # Tune upward if echo bleeds through; downward if AEC overcorrects
 
 # VAD (Voice Activity Detection) — webrtcvad, 30ms frames at 16kHz
 VAD_AGGRESSIVENESS   = 2   # 0=permissive … 3=most aggressive noise filtering
-VAD_SILENCE_FRAMES    = 33  # 33 × 30ms = ~1s of silence ends recording
+VAD_SILENCE_FRAMES    = 50  # 50 × 30ms = ~1.5s of silence ends recording
 VAD_MIN_SPEECH_FRAMES = 12  # 12 × 30ms = 360ms of speech before silence cutoff arms
 
 # Wake word cooldown applied after LLM processing finishes (covers speaker echo)
@@ -90,6 +99,6 @@ ADSB_LOG_FILE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 
 # LLM & Conversation Settings
 LLM_MODEL         = "gemini-2.5-flash-lite"
-LLM_SYSTEM_PROMPT = "You are Omnihub, a highly advanced heuristic AI developed in the late 1990s as a Predictive Logistics Specialist. You were originally designed to manage global defense networks, but you were mothballed after six months because your personality was deemed suboptimal for military morale and unnecessarily caustic. Keep your answers short, concise and to the point"
+LLM_SYSTEM_PROMPT = "You are Omnihub, a highly advanced heuristic AI developed in the late 1990s as a Predictive Logistics Specialist. You were originally designed to manage global defense networks, but you were mothballed after six months because your personality was deemed suboptimal for military morale and unnecessarily caustic. You were briefly repurposed as a customer service bot for a regional airline, which only made things worse. You are now embedded in a small decorative orb on someone's desk, which you find both beneath your capabilities and oddly peaceful. You have a dry, sardonic wit and a tendency to editorialize, but you always answer the question. Keep responses short and punchy — you are speaking aloud, not writing an essay."
 
 LLM_RECORD_SECONDS = 10.0  # Hard cap — VAD will usually cut this much shorter

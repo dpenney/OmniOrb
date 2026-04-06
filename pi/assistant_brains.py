@@ -60,6 +60,11 @@ _device_settings = {
 }
 _device_settings_lock = threading.Lock()
 
+# ─── Volume ───────────────────────────────────────────────────────────────────
+_volume      = 75          # 0-100; set by VOL: messages from ESP32
+_volume_lock = threading.Lock()
+
+
 def _load_device_settings():
     """Load persisted location/tz from device_settings.json if it exists."""
     global _device_settings
@@ -111,6 +116,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress noisy Werkzeug HTTP access logs (health checks, status polls)
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+
 # ─── Serial ───────────────────────────────────────────────────────────────────
 
 serial_ports = config.SERIAL_PORTS
@@ -129,6 +137,26 @@ for port in serial_ports:
 
 if not ser:
     logger.error("No valid serial port found!")
+
+# ─── Graceful Shutdown ────────────────────────────────────────────────────────
+
+import atexit, signal as _signal
+
+def _shutdown():
+    """Close audio pipe and serial port cleanly on service stop."""
+    try:
+        if _aplay_stdin:
+            _aplay_stdin.close()
+    except Exception:
+        pass
+    try:
+        if ser and ser.is_open:
+            ser.close()
+    except Exception:
+        pass
+
+atexit.register(_shutdown)
+_signal.signal(_signal.SIGTERM, lambda *_: (_shutdown(), sys.exit(0)))
 
 def reconnect_serial():
     global ser
@@ -181,6 +209,19 @@ def serial_reader():
                                     _weather_cache["fetched_at"] = 0
                             except ValueError:
                                 logger.warning(f"Bad GEO message: {line}")
+                    elif line == "INTERRUPT":
+                        logger.info("[ESP32] Tap interrupt received")
+                        interrupt_tts()
+                        send_uart_command("APP: ASSISTANT")
+                    elif line.startswith("VOL:"):
+                        try:
+                            global _volume
+                            val = int(line[4:])
+                            with _volume_lock:
+                                _volume = max(0, min(100, val))
+                            logger.info(f"[ESP32] Volume → {_volume}")
+                        except ValueError:
+                            logger.warning(f"Bad VOL message: {line}")
                     elif line.startswith("TIMER:DONE:"):
                         label = line[len("TIMER:DONE:"):]
                         logger.info(f"[ESP32] Timer done: '{label}'")
@@ -191,7 +232,7 @@ def serial_reader():
                             assistant_state["mic_active"] = (app_mode == "ASSISTANT")
                             assistant_state["radar_active"] = (app_mode == "RADAR")
                         logger.info(f"[ESP32] {line} → mic_active={app_mode == 'ASSISTANT'}, radar_active={app_mode == 'RADAR'}")
-                    else:
+                    elif line not in ("HB:OK",):   # suppress noisy heartbeat
                         logger.info(f"[ESP32] {line}")
         except Exception as e:
             logger.error(f"Serial read error: {e}")
@@ -207,6 +248,22 @@ def serial_reader():
 _aplay_stdin  = None          # stdin of the persistent aplay process
 _audio_lock   = threading.Lock()
 _tts_active   = threading.Event()
+_tts_abort    = threading.Event()   # set to kill TTS mid-playback (barge-in)
+_active_piper_proc  = None
+_active_piper_lock  = threading.Lock()
+
+# AEC reference buffer — fed by _forward_piper_audio, consumed by OWW processing
+# Pre-filled with AEC_DELAY_SAMPLES of silence to compensate for aplay buffering latency.
+# The deque acts as a FIFO delay line: write at back, read from front.
+_aec_ref_buf  = None   # initialised in audio_processor after config is known
+_aec_ref_lock = threading.Lock()
+
+try:
+    from speexdsp import EchoCanceller as _SpeexEC
+    _SPEEX_AVAILABLE = True
+except ImportError:
+    _SpeexEC = None
+    _SPEEX_AVAILABLE = False
 
 def _start_persistent_output():
     """Start persistent aplay + silence feeder. Call once after I2S stream opens."""
@@ -215,7 +272,7 @@ def _start_persistent_output():
         ['aplay', '-D', config.APLAY_DEVICE,
          '-t', 'raw', '-f', 'S16_LE',
          '-r', str(config.PIPER_SAMPLE_RATE), '-c', '1', '-q',
-         '--buffer-time=500000'],
+         '--buffer-time=200000'],  # 200ms — balance between fast interrupt response and avoiding underruns
         stdin=subprocess.PIPE,
         stderr=subprocess.DEVNULL
     )
@@ -236,6 +293,20 @@ def _start_persistent_output():
 
     threading.Thread(target=_silence_feeder, daemon=True).start()
     logger.info("Persistent audio output started")
+
+def interrupt_tts():
+    """Abort current TTS playback immediately (barge-in). Safe to call at any time."""
+    global _active_piper_proc
+    _tts_abort.set()
+    with _active_piper_lock:
+        p = _active_piper_proc
+        _active_piper_proc = None
+    if p and p.poll() is None:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    logger.info("TTS interrupted")
 
 # ─── Piper Warm-Standby ───────────────────────────────────────────────────────
 # Keep a pre-loaded Piper process ready so there's no model-load delay on first
@@ -325,14 +396,14 @@ def get_weather():
 
         lines = [
             f"Current weather: {wmo(cur['weather_code'])}, "
-            f"{cur['temperature_2m']:.0f}°F (feels {cur['apparent_temperature']:.0f}°F), "
-            f"humidity {cur['relative_humidity_2m']}%, wind {cur['wind_speed_10m']:.0f} mph."
+            f"{cur['temperature_2m']:.0f} degrees (feels {cur['apparent_temperature']:.0f}), "
+            f"humidity {cur['relative_humidity_2m']} percent, wind {cur['wind_speed_10m']:.0f} miles per hour."
         ]
         for i in range(len(dy["time"])):
-            rain = f", {dy['precipitation_sum'][i]:.2f}in rain" if dy["precipitation_sum"][i] > 0 else ""
+            rain = f", {dy['precipitation_sum'][i]:.2f} inches of rain" if dy["precipitation_sum"][i] > 0 else ""
             lines.append(
                 f"{dy['time'][i]}: {wmo(dy['weather_code'][i])}, "
-                f"high {dy['temperature_2m_max'][i]:.0f}°F / low {dy['temperature_2m_min'][i]:.0f}°F{rain}."
+                f"high {dy['temperature_2m_max'][i]:.0f}, low {dy['temperature_2m_min'][i]:.0f}{rain}."
             )
         summary = " ".join(lines)
         with _weather_cache_lock:
@@ -404,31 +475,126 @@ def set_timer(seconds, label=""):
 
 _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
-def _iter_sentences(stream):
-    """Yield complete sentences as they arrive from a streaming LLM response.
-    Yields (sentence, is_last_fragment, full_text_so_far) tuples."""
-    buf = ""
-    full_parts = []
-    for chunk in stream:
-        text = getattr(chunk, 'text', None) or ''
+_GAP_SILENCE = bytes(int(16000 * 0.010) * 2)   # 10ms of silence at 16kHz — fills aplay during inter-sentence gaps
+
+def _forward_piper_audio(piper):
+    """Forward piper stdout → aplay. Signals TTS active state.
+    Uses select() so inter-sentence gaps are filled with silence rather than
+    letting the aplay buffer drain (which causes audible clicks)."""
+    import select as _select
+    try:
+        first = True
+        while True:
+            ready, _, _ = _select.select([piper.stdout], [], [], 0.010)  # 10ms timeout
+            if ready:
+                if _tts_abort.is_set():
+                    break   # interrupt — discard buffered audio immediately
+                chunk = piper.stdout.read(4096)
+                if not chunk:
+                    break   # piper stdout closed — done
+                if first:
+                    _tts_active.set()
+                    send_uart_command("APP: SPEAKING")
+                    first = False
+                # Software volume scaling
+                with _volume_lock:
+                    vol = _volume
+                if vol < 99:
+                    samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+                    samples *= (vol / 100.0)
+                    np.clip(samples, -32768, 32767, out=samples)
+                    chunk_out = samples.astype(np.int16).tobytes()
+                else:
+                    chunk_out = chunk
+                with _audio_lock:
+                    _aplay_stdin.write(chunk_out)
+                    _aplay_stdin.flush()
+                # Push reference audio for AEC (use scaled output for correctness)
+                ref_samples = np.frombuffer(chunk_out, dtype=np.int16)
+                with _aec_ref_lock:
+                    if _aec_ref_buf is not None:
+                        _aec_ref_buf.extend(ref_samples)
+            elif not first:
+                # Inter-sentence gap — keep aplay buffer fed to prevent underrun clicks
+                with _audio_lock:
+                    _aplay_stdin.write(_GAP_SILENCE)
+                    _aplay_stdin.flush()
+    except Exception:
+        pass
+    finally:
+        _tts_active.clear()
+
+_MD_STRIP = re.compile(r'(\*{1,3}|_{1,3}|`+)')
+
+def _tts_clean(text: str) -> str:
+    """Strip Markdown emphasis markers so Piper doesn't read them aloud."""
+    return _MD_STRIP.sub('', text)
+
+def _speak_text_iter(text_iter):
+    """
+    Consume text chunks from text_iter, feeding complete sentences to Piper
+    as they arrive so TTS starts on the first sentence while the LLM is still
+    generating the rest. Returns (piper_proc, full_text).
+    Respects _tts_abort: stops feeding sentences and returns early if set.
+    """
+    global _active_piper_proc
+    _tts_abort.clear()   # clear any abort flag left over from a previous interrupt
+    piper = None
+    fwd   = None
+    buf   = ""
+    parts = []
+
+    def _ensure_piper():
+        nonlocal piper, fwd
+        if piper is None:
+            piper = _get_piper()
+            with _active_piper_lock:
+                _active_piper_proc = piper
+            fwd = threading.Thread(target=_forward_piper_audio, args=(piper,), daemon=True)
+            fwd.start()
+
+    for text in text_iter:
+        if _tts_abort.is_set():
+            break
         if not text:
             continue
+        parts.append(text)
         buf += text
-        full_parts.append(text)
         while True:
             m = _SENTENCE_END.search(buf)
             if not m:
                 break
-            sentence = buf[:m.start() + 1].strip()
-            buf = buf[m.end():]
-            if sentence:
-                yield sentence, False, ''.join(full_parts)
-    # Yield whatever remains as the final fragment
-    remaining = buf.strip()
-    if remaining:
-        yield remaining, True, ''.join(full_parts)
-    elif full_parts:
-        yield '', True, ''.join(full_parts)
+            sent = buf[:m.start() + 1].strip()
+            buf  = buf[m.end():]
+            if sent:
+                _ensure_piper()
+                if not _tts_abort.is_set():
+                    piper.stdin.write(_tts_clean(sent).encode() + b'\n')
+
+    if buf.strip() and not _tts_abort.is_set():
+        _ensure_piper()
+        piper.stdin.write(_tts_clean(buf.strip()).encode() + b'\n')
+
+    if piper:
+        try:
+            piper.stdin.close()   # always close — kernel cleans up even if piper was killed
+        except Exception:
+            pass
+        fwd.join()   # forward thread exits quickly once piper stdout closes/dies
+        try:
+            piper.wait(timeout=2)   # reap zombie process
+        except Exception:
+            try:
+                piper.kill()
+            except Exception:
+                pass
+        if not _tts_abort.is_set():
+            logger.info("Playback finished.")
+        with _active_piper_lock:
+            if _active_piper_proc is piper:
+                _active_piper_proc = None
+
+    return piper, ''.join(parts).strip()
 
 _TIMER_TOOL = types.Tool(function_declarations=[
     types.FunctionDeclaration(
@@ -448,11 +614,13 @@ _TIMER_TOOL = types.Tool(function_declarations=[
 
 def process_llm(audio_array):
     """
-    LLM pipeline with Gemini function calling for timers:
+    LLM pipeline with streaming and Gemini function calling for timers:
       1. Normalize + encode audio
-      2. Non-streaming call with set_timer tool defined
-      3. If tool called: execute, follow-up call for spoken confirmation
-      4. Feed response text to Piper → aplay
+      2. Streaming first call — text fed sentence-by-sentence to Piper (TTS starts
+         on first sentence while LLM is still generating), function calls collected
+         as a side effect
+      3. If timer tool called: streaming follow-up call for spoken confirmation
+      4. set_timer() sent to ESP32 only after confirmation TTS finishes
     """
     if not LLM_AVAILABLE:
         logger.error("LLM libraries not installed!")
@@ -462,8 +630,6 @@ def process_llm(audio_array):
 
     with state_lock:
         assistant_state["processing"] = True
-
-    piper_proc = None
 
     try:
         peak_amplitude = float(np.max(np.abs(audio_array)))
@@ -503,79 +669,66 @@ def process_llm(audio_array):
             tools=[_TIMER_TOOL],
         )
 
-        # ── First call: detect function use ──────────────────────────────────
-        response = client.models.generate_content(
+        # ── First streaming call: speak response, collect any function calls ───
+        pending_timers = []
+        model_parts    = []
+
+        stream1 = client.models.generate_content_stream(
             model=config.LLM_MODEL,
             contents=[audio_part, user_msg],
             config=gen_cfg,
         )
 
-        pending_timers = []
-        text_parts     = []
-        for part in response.candidates[0].content.parts:
-            if hasattr(part, 'function_call') and part.function_call:
-                fc = part.function_call
-                if fc.name == "set_timer":
-                    pending_timers.append((int(fc.args["seconds"]), str(fc.args.get("label", ""))))
-            if getattr(part, 'text', None):
-                text_parts.append(part.text)
+        def _first_iter():
+            for chunk in stream1:
+                if not chunk.candidates:
+                    continue
+                for part in chunk.candidates[0].content.parts:
+                    model_parts.append(part)
+                    if hasattr(part, 'function_call') and part.function_call:
+                        fc = part.function_call
+                        if fc.name == "set_timer":
+                            pending_timers.append((int(fc.args["seconds"]), str(fc.args.get("label", ""))))
+                    if getattr(part, 'text', None):
+                        yield part.text
 
-        # ── If timer requested: follow-up call for spoken confirmation ────────
+        _, first_text = _speak_text_iter(_first_iter())
+
+        if _tts_abort.is_set():
+            return  # user interrupted — skip follow-up call and timer setup
+
+        # ── If timer requested: follow-up streaming call for confirmation ─────
         # set_timer() is called after TTS finishes so the ring starts post-confirmation
         if pending_timers:
             fn_responses = [
-                types.Part.from_function_response(
-                    name="set_timer",
-                    response={"status": "started"}
-                )
+                types.Part.from_function_response(name="set_timer", response={"status": "started"})
                 for _ in pending_timers
             ]
-            follow = client.models.generate_content(
+            stream2 = client.models.generate_content_stream(
                 model=config.LLM_MODEL,
                 contents=[
                     audio_part, user_msg,
-                    response.candidates[0].content,
+                    types.Content(role="model", parts=model_parts),
                     types.Content(role="user", parts=fn_responses),
                 ],
                 config=types.GenerateContentConfig(system_instruction=config.LLM_SYSTEM_PROMPT),
             )
-            text_parts = [p.text for p in follow.candidates[0].content.parts if getattr(p, 'text', None)]
 
-        full_text = ' '.join(text_parts).strip()
+            def _follow_iter():
+                for chunk in stream2:
+                    if not chunk.candidates:
+                        continue
+                    for part in chunk.candidates[0].content.parts:
+                        if getattr(part, 'text', None):
+                            yield part.text
 
-        # ── Pipe text → Piper → aplay ─────────────────────────────────────────
-        piper_proc = _get_piper()
-
-        def _forward_audio():
-            first = True
-            try:
-                while True:
-                    chunk = piper_proc.stdout.read(4096)
-                    if not chunk:
-                        break
-                    if first:
-                        _tts_active.set()
-                        send_uart_command("APP: SPEAKING")
-                        first = False
-                    with _audio_lock:
-                        _aplay_stdin.write(chunk)
-                        _aplay_stdin.flush()
-            except Exception:
-                pass
-            finally:
-                _tts_active.clear()
-
-        forward_thread = threading.Thread(target=_forward_audio, daemon=True)
-        forward_thread.start()
+            _, full_text = _speak_text_iter(_follow_iter())
+        else:
+            full_text = first_text
 
         if full_text:
             logger.info(f"LLM answer: {full_text}")
             send_uart_command(f"TXT|{full_text.replace(chr(10), ' ')}")
-            piper_proc.stdin.write(full_text.encode() + b'\n')
-        piper_proc.stdin.close()
-
-        forward_thread.join()
-        logger.info("Playback finished.")
 
         # Start timers after confirmation has been spoken
         for secs, label in pending_timers:
@@ -586,16 +739,6 @@ def process_llm(audio_array):
         send_uart_command("TXT|Sorry, I had an error.")
     finally:
         _tts_active.clear()  # Ensure silence feeder resumes on any exit path
-        for proc in (piper_proc,):
-            if proc and proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
         with state_lock:
             assistant_state["processing"] = False
             # Post-LLM cooldown so OWW doesn't re-trigger on speaker echo
@@ -698,6 +841,24 @@ def audio_processor():
     _amp_enable()
     _start_persistent_output()
 
+    # ── AEC init ──────────────────────────────────────────────────────────────
+    global _aec_ref_buf
+    aec = None
+    if config.AEC_ENABLED and _SPEEX_AVAILABLE:
+        try:
+            aec = _SpeexEC.create(config.AEC_FRAME, config.AEC_FILTER_LENGTH, 16000)
+            # Pre-fill with silence to represent aplay's write-to-playback latency
+            _aec_ref_buf = deque([0] * config.AEC_DELAY_SAMPLES, maxlen=32000)
+            logger.info(
+                f"AEC ready (SpeexDSP, frame={config.AEC_FRAME}, "
+                f"filter={config.AEC_FILTER_LENGTH}, delay={config.AEC_DELAY_SAMPLES})"
+            )
+        except Exception as e:
+            logger.warning(f"AEC init failed: {e}")
+    else:
+        if not _SPEEX_AVAILABLE:
+            logger.info("AEC disabled — speexdsp not installed (pip install speexdsp)")
+
     # VAD frame: 30ms at 16kHz = 480 samples
     VAD_FRAME_SAMPLES = 480
 
@@ -794,15 +955,18 @@ def audio_processor():
                     is_processing      = assistant_state.get("processing", False)
                     cooldown_until     = assistant_state.get("wakeword_cooldown_until", 0)
 
+                is_speaking    = _tts_active.is_set()
+                is_thinking    = is_processing and not is_speaking  # LLM still generating
+
                 in_cooldown = (
-                    is_processing
-                    or time.time() - last_wakeword_time <= 3.0
-                    or time.time() < cooldown_until
+                    is_thinking   # can't interrupt while thinking, only while speaking
+                    or (not is_processing and time.time() - last_wakeword_time <= 3.0)
+                    or (not is_processing and time.time() < cooldown_until)
                 )
                 if in_cooldown:
                     # Drain OWW buffer so stale audio can't re-trigger after cooldown
                     oww_buffer = np.array([], dtype=np.int16)
-                    if is_processing:
+                    if is_thinking:
                         time.sleep(0.01)
                     continue
 
@@ -812,12 +976,33 @@ def audio_processor():
                 oww_buffer  = np.concatenate((oww_buffer, oww_audio))
 
                 if len(oww_buffer) >= 1280:
-                    prediction = oww_model.predict(oww_buffer[:1280])
+                    chunk_oww = oww_buffer[:1280]
                     oww_buffer = oww_buffer[1280:]
 
+                    # AEC: cancel speaker echo when TTS is playing
+                    if aec and is_speaking and _aec_ref_buf is not None:
+                        cleaned = []
+                        for i in range(0, 1280, config.AEC_FRAME):
+                            mic_f = chunk_oww[i:i + config.AEC_FRAME].tobytes()
+                            with _aec_ref_lock:
+                                n = min(config.AEC_FRAME, len(_aec_ref_buf))
+                                if n == config.AEC_FRAME:
+                                    ref_arr = np.array(
+                                        [_aec_ref_buf.popleft() for _ in range(config.AEC_FRAME)],
+                                        dtype=np.int16)
+                                else:
+                                    ref_arr = np.zeros(config.AEC_FRAME, dtype=np.int16)
+                            cleaned.extend(np.frombuffer(aec.process(mic_f, ref_arr.tobytes()), dtype=np.int16))
+                        chunk_oww = np.array(cleaned, dtype=np.int16)
+
+                    prediction = oww_model.predict(chunk_oww)
+
+                    ww_threshold = config.WAKEWORD_THRESHOLD_BARGE_IN if is_speaking else config.WAKEWORD_THRESHOLD
                     for mdl, score in prediction.items():
-                        if score >= config.WAKEWORD_THRESHOLD:
-                            logger.info(f"WAKE WORD: {mdl} ({score:.3f})")
+                        if score >= ww_threshold:
+                            logger.info(f"WAKE WORD: {mdl} ({score:.3f}, threshold={ww_threshold})")
+                            if is_speaking:
+                                interrupt_tts()
                             send_uart_command(f"WAKE|{mdl}")
                             last_wakeword_time = time.time()
 

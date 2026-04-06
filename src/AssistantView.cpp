@@ -35,6 +35,10 @@ void AssistantView::set_state(AssistantState state) {
     current_state = state;
 }
 
+AssistantView::AssistantState AssistantView::get_state() {
+    return current_state;
+}
+
 void AssistantView::set_canvas(Arduino_Canvas *c) {
     canvas = c;
 }

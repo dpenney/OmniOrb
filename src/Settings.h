@@ -12,6 +12,7 @@ struct ProjectSettings {
     float range_nm;
     float gmt_offset;
     char timezone[64];
+    int volume;          // speaker volume 0-100, default 75
 
     ProjectSettings();
 };

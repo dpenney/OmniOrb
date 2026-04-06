@@ -39,6 +39,7 @@
 #include "Provisioning.h"
 #include "ClockView.h"
 #include "AssistantView.h"
+#include "SettingsView.h"
 #include <time.h>
 #include <ArduinoOTA.h>
 
@@ -47,8 +48,9 @@
 
 static ProjectSettings settings;
 
-enum AppState { APP_RADAR, APP_ASSISTANT, APP_CLOCK };
+enum AppState { APP_RADAR, APP_ASSISTANT, APP_CLOCK, APP_SETTINGS };
 static AppState current_app = APP_RADAR;
+static AppState prev_app    = APP_RADAR;   // where to return after settings
 static Arduino_Canvas *assistant_canvas = nullptr;
 
 
@@ -190,14 +192,53 @@ void notify_pi_app_mode(AppState mode) {
     Serial.printf("[UART→Pi] %s\n", msg.c_str());  // USB monitor visibility
 }
 
+// ─── Settings entry / exit ────────────────────────────────────────────────────
+void enter_settings() {
+    prev_app = current_app;
+    if (current_app == APP_CLOCK) {
+        lvgl_active = false;
+        lv_obj_t *blank = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(blank, lv_color_black(), 0);
+        lv_scr_load(blank);
+    }
+    current_app = APP_SETTINGS;
+    SettingsView::update();   // draw immediately on entry
+}
+
+void exit_settings() {
+    // Sync volume to Pi before leaving
+    String vmsg = String("VOL:") + String(settings.volume);
+    Serial0.println(vmsg);
+    Serial.printf("[UART→Pi] %s\n", vmsg.c_str());
+
+    current_app = prev_app;
+    if (prev_app == APP_CLOCK) {
+        lvgl_active = true;
+        ClockView::show();
+    } else if (prev_app == APP_ASSISTANT) {
+        AssistantView::show();
+        full_redraw();
+    } else {
+        full_redraw();
+    }
+}
+
 void process_swipe(int x1, int y1, int x2, int y2) {
     int dx = x2 - x1;
     int dy = y2 - y1;
 
+    // ── Settings view: swipe right exits; arc drag handled in loop() ─────────
+    if (current_app == APP_SETTINGS) {
+        if (abs(dx) > abs(dy) && dx > GESTURE_THRESHOLD) {
+            exit_settings();
+        }
+        return;
+    }
+
     if (abs(dx) < TAP_THRESHOLD && abs(dy) < TAP_THRESHOLD) {
         // Gesture too small, treat as a TAP
         int hit = find_nearest(x2, y2);
-        if (hit >= 0) {
+        if (hit >= 0 && hit < aircraft_count) {
             selected_idx = hit;
             xSemaphoreTake(ac_mutex, portMAX_DELAY);
             Aircraft &ac = aircraft[hit];
@@ -804,6 +845,7 @@ void setup() {
     full_redraw();
     notify_pi_settings();             // Tell Pi location + timezone on every boot
     notify_pi_app_mode(current_app);  // Tell Pi the initial screen on boot
+    Serial0.println(String("VOL:") + String(settings.volume));  // Sync volume on boot
 
     // Prepare assistant canvas
     assistant_canvas = new Arduino_Canvas(SCREEN_WIDTH, SCREEN_HEIGHT, gfx, 0, 0, 0);
@@ -814,6 +856,11 @@ void setup() {
     }
     AssistantView::set_canvas(assistant_canvas);
     AssistantView::init();
+
+    // Settings view shares the same canvas (never active simultaneously)
+    SettingsView::set_canvas(assistant_canvas);
+    SettingsView::set_vsync_sem(vsync_sem);
+    SettingsView::init(settings.volume);
 
     // Initialize LVGL
 
@@ -863,17 +910,80 @@ void loop() {
     // Touch processing
     touch_active = read_touch();
     bool is_new_tap = touch_active && !last_was_touching;
+
+    static bool long_press_fired  = false;
+    static bool gesture_consumed  = false;
+    static bool arc_dragging      = false;
+    #define LONG_PRESS_MS 800
+
     if (is_new_tap) {
-        touch_start_x = touch_x;
-        touch_start_y = touch_y;
-        last_touch_time = now;
+        touch_start_x    = touch_x;
+        touch_start_y    = touch_y;
+        last_touch_time  = now;
+        long_press_fired = false;
+        gesture_consumed = false;
+
+        // Arc drag: starts if finger lands on the arc ring zone
+        if (current_app == APP_SETTINGS) {
+            float dist = sqrtf((float)(touch_x - CX) * (touch_x - CX) +
+                               (float)(touch_y - CY) * (touch_y - CY));
+            arc_dragging = (dist >= 160.0f && dist <= 240.0f);
+            if (arc_dragging) gesture_consumed = true;  // block release handler
+        } else {
+            arc_dragging = false;
+        }
     }
 
-    // On touch release, process the gesture
-    if (!touch_active && last_was_touching) {
-        process_swipe(touch_start_x, touch_start_y, touch_x, touch_y);
+    // ── Live arc drag: update volume as finger moves along the ring ───────────
+    if (touch_active && arc_dragging) {
+        static unsigned long last_drag_ms = 0;
+        int new_vol = SettingsView::touch_to_volume(touch_x, touch_y);
+        if (new_vol != SettingsView::get_volume() && (now - last_drag_ms) >= 33) {
+            SettingsView::set_volume(new_vol);
+            SettingsView::update();
+            last_drag_ms = now;
+        }
     }
-    
+    if (!touch_active && arc_dragging) {
+        // Finger lifted — persist the current value (live drag already kept display current).
+        // Deliberately NOT calling update() here: any redraw on the lift frame causes a
+        // visible flash because the touch event and DMA flush race each other.
+        settings.volume = SettingsView::get_volume();
+        SettingsManager::save(settings);
+        String vmsg = String("VOL:") + String(settings.volume);
+        Serial0.println(vmsg);
+        Serial.printf("[UART→Pi] %s\n", vmsg.c_str());
+        arc_dragging = false;
+    }
+
+    // ── Long-press detection (800ms still hold — only outside arc zone) ───────
+    if (touch_active && !long_press_fired && !arc_dragging) {
+        int hold_dx = abs(touch_x - touch_start_x);
+        int hold_dy = abs(touch_y - touch_start_y);
+        if ((hold_dx + hold_dy) < TAP_THRESHOLD && (now - last_touch_time) >= LONG_PRESS_MS) {
+            long_press_fired = true;
+            gesture_consumed = true;
+            if (current_app != APP_SETTINGS) enter_settings();
+            else                              exit_settings();
+        }
+    }
+
+    // ── On release: process gesture (skipped if long-press or arc-drag consumed) ─
+    if (!touch_active && last_was_touching && !gesture_consumed) {
+        int dx = abs(touch_x - touch_start_x);
+        int dy = abs(touch_y - touch_start_y);
+        bool is_tap = (dx + dy) < TAP_THRESHOLD;
+
+        // Tap while assistant is speaking = interrupt
+        if (is_tap && AssistantView::get_state() == AssistantView::STATE_SPEAKING) {
+            AssistantView::set_state(AssistantView::STATE_IDLE);  // immediate visual feedback
+            Serial0.println("INTERRUPT");
+            Serial.println("[UART→Pi] INTERRUPT");
+        } else {
+            process_swipe(touch_start_x, touch_start_y, touch_x, touch_y);
+        }
+    }
+
     last_was_touching = touch_active;
 
     // ─── Serial0 Heartbeat (troubleshooting only) ─────────────────────────────
@@ -934,6 +1044,9 @@ void loop() {
         }
         ClockView::update_time();
         lv_timer_handler();
+    } else if (current_app == APP_SETTINGS) {
+        // Fully event-driven — redraws happen on entry and during/after arc drag only.
+        // The canvas is a persistent offscreen buffer; no idle refresh needed.
     }
 
     // ─── UART Remote Control (Pi Brains) ───

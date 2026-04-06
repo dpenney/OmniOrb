@@ -516,7 +516,7 @@ void ClockView::init() {
 
         num_labels[i] = lv_label_create(clock_screen);
         char buf[4];
-        sprintf(buf, "%d", i);
+        snprintf(buf, sizeof(buf), "%d", i);
         lv_label_set_text(num_labels[i], buf);
         lv_obj_set_style_text_font(num_labels[i], &lv_font_montserrat_40, 0);
         lv_obj_set_style_text_color(num_labels[i], lv_color_white(), 0);
@@ -596,7 +596,7 @@ void ClockView::update_time() {
     struct tm* tm_ptr = localtime(&tv.tv_sec);
     if (tm_ptr && tm_ptr->tm_sec != last_sec) {
         char buf[8];
-        sprintf(buf, "%02d.%02d", tm_ptr->tm_mon + 1, tm_ptr->tm_mday);
+        snprintf(buf, sizeof(buf), "%02d.%02d", tm_ptr->tm_mon + 1, tm_ptr->tm_mday);
         lv_label_set_text(date_label, buf);
         last_sec = tm_ptr->tm_sec;
     }
@@ -641,7 +641,7 @@ void ClockView::update_time() {
             static int last_day = -1;
             if (tm_ptr->tm_mday != last_day) {
                 char buf[8];
-                sprintf(buf, "%02d.%02d", tm_ptr->tm_mon + 1, tm_ptr->tm_mday);
+                snprintf(buf, sizeof(buf), "%02d.%02d", tm_ptr->tm_mon + 1, tm_ptr->tm_mday);
                 lv_label_set_text(date_label, buf);
                 last_day = tm_ptr->tm_mday;
             }

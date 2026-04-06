@@ -15,6 +15,7 @@ public:
     static void set_audio_intensity(int intensity);
     static void set_spectrum(const int* bins, int count);
     static void set_state(AssistantState state);
+    static AssistantState get_state();
 
     // Timer — managed by main.cpp
     static void  start_timer(uint32_t seconds, const String& label);
