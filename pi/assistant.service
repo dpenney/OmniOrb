@@ -3,9 +3,6 @@ Description=ESP32 Assistant Brains (Audio & Rotary)
 After=network.target
 
 [Service]
-# Mute the amp immediately — before Python starts — so the SD pin is never
-# floating while the I2S clock and ALSA drivers initialise
-ExecStartPre=/usr/bin/pinctrl set 13 op dl
 # Use the Python from our virtual environment
 ExecStart={{APP_PATH}}/venv/bin/python -u {{APP_PATH}}/assistant_brains.py
 WorkingDirectory={{APP_PATH}}

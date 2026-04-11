@@ -1,7 +1,11 @@
-import RPi.GPIO as GPIO
 import threading
 import time
 import config
+
+try:
+    import RPi.GPIO as GPIO
+except (ImportError, RuntimeError):
+    GPIO = None
 
 class RotaryEncoder:
     def __init__(self, clk_pin, dt_pin, sw_pin=None, callback=None):
@@ -10,19 +14,25 @@ class RotaryEncoder:
         self.sw_pin = sw_pin
         self.callback = callback
         self.value = 0
-        self.running = True
+        self.running = False
         
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.clk_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(self.dt_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        if self.sw_pin:
-            GPIO.setup(self.sw_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        if GPIO:
+            try:
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setup(self.clk_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                GPIO.setup(self.dt_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                if self.sw_pin:
+                    GPIO.setup(self.sw_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-        self.last_clk_state = GPIO.input(self.clk_pin)
-        
-        # Start polling thread
-        self.thread = threading.Thread(target=self._poll, daemon=True)
-        self.thread.start()
+                self.last_clk_state = GPIO.input(self.clk_pin)
+                self.running = True
+                
+                # Start polling thread
+                self.thread = threading.Thread(target=self._poll, daemon=True)
+                self.thread.start()
+            except Exception as e:
+                print(f"RotaryEncoder hardware init failed: {e}")
+                self.running = False
 
     def _poll(self):
         while self.running:

@@ -17,18 +17,21 @@ echo -e "${BLUE}------------------------------------------${NC}"
 echo -e "🚀 Starting Assistant Installation..."
 echo -e "${BLUE}------------------------------------------${NC}"
 
-# 1. User Validation
-if [ "$EUID" -eq 0 ]; then
-    echo -e "${RED}❌ Error: Please DO NOT run this script with 'sudo'. Run it as a normal user.${NC}"
-    echo "The script will use 'sudo' internally when it needs to."
-    exit 1
+# 1. Hardware Detection
+IS_RPI=0
+if grep -q "Raspberry Pi" /proc/device-tree/model 2>/dev/null; then
+    IS_RPI=1
+    echo -e "${GREEN}📍 Raspberry Pi detected.${NC}"
+else
+    echo -e "${YELLOW}📍 Non-RPi hardware detected (e.g. Particle Tachyon). Skipping Pi-specific drivers.${NC}"
 fi
 
-# 2. Install System Dependencies
+# 2. System Dependencies
 echo -e "📦 Checking system dependencies..."
-DEPENDENCIES="python3-venv python3-pip python3-dev portaudio19-dev python3-pyaudio python3-numpy rsync device-tree-compiler mpg123 libspeexdsp-dev"
-MISSING_DEPS=""
+# Core dependencies for all platforms
+DEPENDENCIES="python3.9 python3.9-venv python3.9-dev python3-pyaudio portaudio19-dev swig libspeexdsp-dev build-essential curl wget unzip alsa-utils"
 
+MISSING_DEPS=""
 for dep in $DEPENDENCIES; do
     if ! dpkg -l "$dep" >/dev/null 2>&1; then
         MISSING_DEPS="$MISSING_DEPS $dep"
@@ -40,22 +43,16 @@ if [ -n "$MISSING_DEPS" ]; then
     sudo apt-get update
     sudo apt-get install -y $MISSING_DEPS
 else
-    echo -e "${GREEN}✅ All system dependencies already installed.${NC}"
+    echo -e "${GREEN}✅ All core system dependencies already installed.${NC}"
 fi
 
 # 3. Create Virtual Environment
-# We ensure system-site-packages is enabled so we can use system numpy/pyaudio
-VENV_CFG="venv/pyvenv.cfg"
-if [ ! -f "venv/bin/pip" ] || [ ! -f "$VENV_CFG" ] || ! grep -q "include-system-site-packages = true" "$VENV_CFG"; then
-    echo -e "🐍 Creating/Updating virtual environment (venv)..."
-    if [ -d "venv" ]; then
-        echo -e "${YELLOW}🧹 Removing old/incompatible venv...${NC}"
-        rm -rf venv 
-    fi
-    python3 -m venv --system-site-packages venv
-else
-    echo -e "${GREEN}✅ Venv already exists and is correctly configured.${NC}"
+echo -e "🐍 Creating/Updating virtual environment (venv)..."
+if [ -d "venv" ]; then
+    echo -e "${YELLOW}🧹 Removing old/incompatible venv...${NC}"
+    rm -rf venv 
 fi
+python3.9 -m venv --system-site-packages venv
 
 # 4. Install Python Ingredients
 echo -e "📥 Installing python dependencies into venv..."
@@ -67,10 +64,15 @@ else
     exit 1
 fi
 
+if [ "$IS_RPI" -eq 1 ]; then
+    echo -e "📦 Installing Raspberry Pi specific support..."
+    ./venv/bin/pip install RPi.GPIO
+fi
+
 # 5. Piper TTS Binary
-PIPER_VERSION="1.2.0"
-PIPER_ARCH="aarch64"
-PIPER_TARBALL="piper_linux_${PIPER_ARCH}.tar.gz"
+PIPER_VERSION="v1.2.0"
+PIPER_ARCH="arm64"
+PIPER_TARBALL="piper_${PIPER_ARCH}.tar.gz"
 PIPER_URL="https://github.com/rhasspy/piper/releases/download/${PIPER_VERSION}/${PIPER_TARBALL}"
 
 if [ ! -f "venv/bin/piper" ]; then
@@ -109,28 +111,32 @@ else
 fi
 
 # 7. Boot Configuration (/boot/firmware/config.txt)
-echo -e "🔧 Checking /boot/firmware/config.txt..."
+echo -e "🔧 Checking Boot Configuration..."
 BOOT_CONFIG="/boot/firmware/config.txt"
 BOOT_CHANGED=0
 
-append_if_missing() {
-    local line="$1"
-    if ! grep -qF "$line" "$BOOT_CONFIG" 2>/dev/null; then
-        echo "$line" | sudo tee -a "$BOOT_CONFIG" > /dev/null
-        echo -e "${YELLOW}  Added: $line${NC}"
-        BOOT_CHANGED=1
+if [ -f "$BOOT_CONFIG" ]; then
+    append_if_missing() {
+        local line="$1"
+        if ! grep -qF "$line" "$BOOT_CONFIG" 2>/dev/null; then
+            echo "$line" | sudo tee -a "$BOOT_CONFIG" > /dev/null
+            echo -e "${YELLOW}  Added: $line${NC}"
+            BOOT_CHANGED=1
+        fi
+    }
+
+    append_if_missing "dtoverlay=googlevoicehat-soundcard"
+    append_if_missing "enable_uart=1"
+    append_if_missing "dtoverlay=disable-bt"
+    append_if_missing "gpio=13=op,dl"
+
+    if [ "$BOOT_CHANGED" -eq 1 ]; then
+        echo -e "${YELLOW}⚠️  $BOOT_CONFIG was updated — a reboot is required!${NC}"
+    else
+        echo -e "${GREEN}✅ Boot config already correct.${NC}"
     fi
-}
-
-append_if_missing "dtoverlay=googlevoicehat-soundcard"
-append_if_missing "enable_uart=1"
-append_if_missing "dtoverlay=disable-bt"
-append_if_missing "gpio=13=op,dl"
-
-if [ "$BOOT_CHANGED" -eq 1 ]; then
-    echo -e "${YELLOW}⚠️  /boot/firmware/config.txt was updated — a reboot is required!${NC}"
 else
-    echo -e "${GREEN}✅ Boot config already correct.${NC}"
+    echo -e "${YELLOW}⚠️  Warning: $BOOT_CONFIG not found. Skipping boot configuration.${NC}"
 fi
 
 # 8. Systemd Service Integration

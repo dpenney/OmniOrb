@@ -13,7 +13,10 @@ import serial
 import logging
 from logging.handlers import RotatingFileHandler
 
-import RPi.GPIO as GPIO
+try:
+    import RPi.GPIO as GPIO
+except (ImportError, RuntimeError):
+    GPIO = None
 from flask import Flask, jsonify
 from rotary_encoder import RotaryEncoder
 from dotenv import load_dotenv
@@ -747,22 +750,47 @@ def process_llm(audio_array):
 
 # ─── Speaker Init ─────────────────────────────────────────────────────────────
 
+def _init_hardware_pins():
+    """Initialise GPIO pins (Mute pin, Rotary encoder, etc.) if hardware is present."""
+    if not GPIO:
+        return
+    
+    try:
+        GPIO.setmode(GPIO.BCM)
+        
+        # Mute pin — initial state: MUTED (LOW if active HIGH, but SD pin is active HIGH, 
+        # so SD=LOW means shutdown/muted).
+        if config.PIN_AMP_MUTE is not None:
+            GPIO.setup(config.PIN_AMP_MUTE, GPIO.OUT, initial=GPIO.LOW)
+            logger.info(f"Hardware Mute pin {config.PIN_AMP_MUTE} initialised (LOW/MUTED)")
+            
+    except Exception as e:
+        logger.error(f"Hardware pin init failed: {e}")
+
+_init_hardware_pins()
+
 def _amp_enable():
     """Enable the amplifier (SD pin HIGH)."""
-    if config.PIN_AMP_MUTE is not None:
-        GPIO.output(config.PIN_AMP_MUTE, GPIO.HIGH)
+    if GPIO and config.PIN_AMP_MUTE is not None:
+        try:
+            GPIO.output(config.PIN_AMP_MUTE, GPIO.HIGH)
+        except Exception as e:
+            logger.error(f"Failed to enable amp: {e}")
 
 def _amp_mute():
     """Shut down the amplifier (SD pin LOW)."""
-    if config.PIN_AMP_MUTE is not None:
-        GPIO.output(config.PIN_AMP_MUTE, GPIO.LOW)
+    if GPIO and config.PIN_AMP_MUTE is not None:
+        try:
+            GPIO.output(config.PIN_AMP_MUTE, GPIO.LOW)
+        except Exception as e:
+            logger.error(f"Failed to mute amp: {e}")
 
 def _unmute_and_prime_speaker():
     """No-op when hardware SD pin is configured — amp is enabled only after
     audio data is already flowing (see _forward_audio). Kept for setups without
     a mute pin where ALSA buffer pre-init is still useful."""
-    if config.PIN_AMP_MUTE is not None:
-        logger.info("SD pin active — skipping software prime, amp stays muted")
+    if GPIO and config.PIN_AMP_MUTE is not None:
+        logger.info("SD pin active — skipping software prime, amp stays muted until playback")
         return
 
     # No SD pin: play silence to pre-init the ALSA buffer before first TTS call
