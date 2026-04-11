@@ -135,12 +135,19 @@ void SettingsView::update() {
     sv_canvas->setCursor(CX + (nchars * char_w) / 2 + 4, 200);
     sv_canvas->print("%");
 
-    // ── 8. Hint text ─────────────────────────────────────────────────────────
+    // ── 8. Diagnostics Button ────────────────────────────────────────────────
+    sv_canvas->drawRoundRect(CX - 100, 275, 200, 45, 6, SV_DIM);
+    sv_canvas->setTextColor(SV_MINT);
+    sv_canvas->setTextSize(1);
+    sv_canvas->setCursor(CX - 54, 292);
+    sv_canvas->print("AUDIO DIAGNOSTICS");
+
+    // ── 9. Hint text ─────────────────────────────────────────────────────────
     sv_canvas->setTextColor(SV_HINT);
     sv_canvas->setTextSize(1);
-    // "SWIPE UP/DN  LONG-PRESS EXIT" = 28 chars × 6px = 168px
-    sv_canvas->setCursor(CX - 84, 355);
-    sv_canvas->print("SWIPE UP/DN  LONG-PRESS EXIT");
+    // "SWIPE RIGHT TO EXIT" = 18 chars × 6px = 108px
+    sv_canvas->setCursor(CX - 54, 395);
+    sv_canvas->print("SWIPE RIGHT TO EXIT");
 
     // Sync to VSYNC before flushing — prevents DMA writing mid-scan (tearing/blink)
     if (sv_vsync_sem) xSemaphoreTake(sv_vsync_sem, portMAX_DELAY);

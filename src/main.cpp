@@ -40,6 +40,7 @@
 #include "ClockView.h"
 #include "AssistantView.h"
 #include "SettingsView.h"
+#include "DiagnosticsView.h"
 #include <time.h>
 #include <ArduinoOTA.h>
 
@@ -48,7 +49,7 @@
 
 static ProjectSettings settings;
 
-enum AppState { APP_RADAR, APP_ASSISTANT, APP_CLOCK, APP_SETTINGS };
+enum AppState { APP_RADAR, APP_ASSISTANT, APP_CLOCK, APP_SETTINGS, APP_DIAGNOSTICS };
 static AppState current_app = APP_RADAR;
 static AppState prev_app    = APP_RADAR;   // where to return after settings
 static Arduino_Canvas *assistant_canvas = nullptr;
@@ -228,9 +229,15 @@ void process_swipe(int x1, int y1, int x2, int y2) {
     int dy = y2 - y1;
 
     // ── Settings view: swipe right exits; arc drag handled in loop() ─────────
-    if (current_app == APP_SETTINGS) {
+    // ── Settings/Diagnostics view: swipe right exits; arc drag handled in loop() ──
+    if (current_app == APP_SETTINGS || current_app == APP_DIAGNOSTICS) {
         if (abs(dx) > abs(dy) && dx > GESTURE_THRESHOLD) {
-            exit_settings();
+            if (current_app == APP_DIAGNOSTICS) {
+                current_app = APP_SETTINGS;
+                // SettingsView update happens in next frame
+            } else {
+                exit_settings();
+            }
         }
         return;
     }
@@ -253,18 +260,25 @@ void process_swipe(int x1, int y1, int x2, int y2) {
         return;
     }
 
-    // Vertical Swipes (Zoom)
+    // Vertical Swipes
     if (abs(dy) > abs(dx)) {
-        if (dy < -GESTURE_THRESHOLD) {
-            // Swipe UP -> Zoom IN
-            range_nm = max((float)MIN_RANGE_NM, range_nm / 1.3f);
-            Serial.println("Gesture: SWIPE UP (Zoom IN)");
-            full_redraw();
-        } else if (dy > GESTURE_THRESHOLD) {
-            // Swipe DOWN -> Zoom OUT
-            range_nm = min((float)MAX_RANGE_NM, range_nm * 1.3f);
-            Serial.println("Gesture: SWIPE DOWN (Zoom OUT)");
-            full_redraw();
+        if (current_app == APP_ASSISTANT) {
+            if (abs(dy) > GESTURE_THRESHOLD) {
+                AssistantView::toggle_style();
+                Serial.println("Gesture: SWIPE (Switch Assistant Style)");
+            }
+        } else if (current_app == APP_RADAR) {
+            if (dy < -GESTURE_THRESHOLD) {
+                // Swipe UP -> Zoom IN
+                range_nm = max((float)MIN_RANGE_NM, range_nm / 1.3f);
+                Serial.println("Gesture: SWIPE UP (Zoom IN)");
+                full_redraw();
+            } else if (dy > GESTURE_THRESHOLD) {
+                // Swipe DOWN -> Zoom OUT
+                range_nm = min((float)MAX_RANGE_NM, range_nm * 1.3f);
+                Serial.println("Gesture: SWIPE DOWN (Zoom OUT)");
+                full_redraw();
+            }
         }
     } 
     // Horizontal Swipes (App Navigation Placeholder)
@@ -928,7 +942,18 @@ void loop() {
             float dist = sqrtf((float)(touch_x - CX) * (touch_x - CX) +
                                (float)(touch_y - CY) * (touch_y - CY));
             arc_dragging = (dist >= 160.0f && dist <= 240.0f);
-            if (arc_dragging) gesture_consumed = true;  // block release handler
+            if (arc_dragging) {
+                gesture_consumed = true;
+            } else {
+                // Not dragging the arc? Check for Diagnostic Button (Instant Switch)
+                // Expanded hit box: Y > 240 (bottom half) and not near edge
+                if (touch_y > 240 && touch_x > 100 && touch_x < 380) {
+                    current_app = APP_DIAGNOSTICS;
+                    DiagnosticsView::init();
+                    Serial.println("App State: DIAGNOSTICS (Instant)");
+                    gesture_consumed = true;
+                }
+            }
         } else {
             arc_dragging = false;
         }
@@ -944,6 +969,7 @@ void loop() {
             last_drag_ms = now;
         }
     }
+    
     if (!touch_active && arc_dragging) {
         // Finger lifted — persist the current value (live drag already kept display current).
         // Deliberately NOT calling update() here: any redraw on the lift frame causes a
@@ -1046,7 +1072,13 @@ void loop() {
         lv_timer_handler();
     } else if (current_app == APP_SETTINGS) {
         // Fully event-driven — redraws happen on entry and during/after arc drag only.
-        // The canvas is a persistent offscreen buffer; no idle refresh needed.
+    } else if (current_app == APP_DIAGNOSTICS) {
+        static uint32_t last_diag_req = 0;
+        if (now - last_diag_req > 200) { // 5Hz requests
+            Serial0.println("DIAG?");
+            last_diag_req = now;
+        }
+        DiagnosticsView::update();
     }
 
     // ─── UART Remote Control (Pi Brains) ───
@@ -1060,6 +1092,10 @@ void loop() {
             if (rx == "SYNC?") {
                 notify_pi_settings();
                 notify_pi_app_mode(current_app);
+            } else if (rx == "DIAG") {
+                current_app = APP_DIAGNOSTICS;
+                DiagnosticsView::init();
+                Serial.println("Force Switching to DIAGNOSTICS");
             } else if (rx == "Z+") {
                 range_nm = max((float)MIN_RANGE_NM, range_nm / 1.15f);
                 Serial.printf("Remote Zoom IN: %.1f nm\n", range_nm);
@@ -1105,6 +1141,19 @@ void loop() {
                 if (cmd == "THINKING") AssistantView::set_state(AssistantView::STATE_THINKING);
                 else if (cmd == "SPEAKING") AssistantView::set_state(AssistantView::STATE_SPEAKING);
                 else if (cmd == "ASSISTANT") AssistantView::set_state(AssistantView::STATE_IDLE);
+            } else if (rx.startsWith("EMO:")) {
+                String emo = rx.substring(4);
+                emo.trim();
+                if (emo == "NEUTRAL")       AssistantView::set_emotion(AssistantView::EMO_NEUTRAL);
+                else if (emo == "HAPPY")    AssistantView::set_emotion(AssistantView::EMO_HAPPY);
+                else if (emo == "SARDONIC") AssistantView::set_emotion(AssistantView::EMO_SARDONIC);
+                else if (emo == "ALERT")    AssistantView::set_emotion(AssistantView::EMO_ALERT);
+                else if (emo == "WINK")     AssistantView::set_emotion(AssistantView::EMO_WINK);
+            } else if (rx.startsWith("VMODE:")) {
+                String mode = rx.substring(6);
+                mode.trim();
+                if (mode == "IRIS")      AssistantView::set_style(AssistantView::STYLE_IRIS);
+                else if (mode == "FACE") AssistantView::set_style(AssistantView::STYLE_FACE);
             } else if (rx.startsWith("A")) {
                 int intensity = rx.substring(1).toInt();
                 AssistantView::set_audio_intensity(intensity);
@@ -1139,6 +1188,27 @@ void loop() {
                 if (a_data.startsWith("A")) {
                     int intensity = a_data.substring(1).toInt();
                     AssistantView::set_audio_intensity(intensity);
+                    DiagnosticsView::set_mic_intensity(intensity);
+                }
+            } else if (rx.startsWith("DIAG:")) {
+                // Parse DIAG:mic=23,ww=LOADED,pi=OK,rssi=-54,wake=10:21AM
+                String data = rx.substring(5);
+                int start = 0;
+                while (start < data.length()) {
+                    int comma = data.indexOf(',', start);
+                    String kv = (comma == -1) ? data.substring(start) : data.substring(start, comma);
+                    int eq = kv.indexOf('=');
+                    if (eq != -1) {
+                        String k = kv.substring(0, eq);
+                        String v = kv.substring(eq + 1);
+                        if (k == "mic") DiagnosticsView::set_mic_intensity(v.toInt());
+                        else if (k == "ww") DiagnosticsView::set_oww_status(v.c_str());
+                        else if (k == "pi") DiagnosticsView::set_pi_status(v.c_str());
+                        else if (k == "rssi") DiagnosticsView::set_wifi_rssi(v.toInt());
+                        else if (k == "wake") DiagnosticsView::set_last_wake(v.c_str());
+                    }
+                    if (comma == -1) break;
+                    start = comma + 1;
                 }
             }
         }

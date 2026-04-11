@@ -63,6 +63,27 @@ _device_settings = {
 }
 _device_settings_lock = threading.Lock()
 
+# ─── FFT / Spectrum Constants ────────────────────────────────────────────────
+_FFT_WEIGHTS = np.ones(16)
+_FFT_FLOOR   = np.array([0.673, 0.3535, 0.2799, 0.1647, 0.1024, 0.059, 0.0352, 0.0254,
+                         0.0179, 0.0129, 0.0094, 0.0072, 0.0055, 0.0043, 0.0035, 0.0028])
+
+def get_fft_bounds(chunk_size, sample_rate):
+    """Calculate frequency bin indices for a given chunk size and sample rate."""
+    freq_bounds = np.geomspace(80, 12000, 17)
+    return np.clip((freq_bounds * chunk_size / sample_rate).astype(int), 0, chunk_size // 2)
+
+def calculate_spectrum_bins(norm_samples, idx_bounds, gain=1.0):
+    """Compute 16 spectrum bins (0-100) from normalized float samples."""
+    fft_data = np.abs(np.fft.rfft(norm_samples))
+    bins = []
+    for i in range(16):
+        start = idx_bounds[i]
+        end   = max(start + 1, idx_bounds[i + 1])
+        mag   = max(0.0, np.mean(fft_data[start:end]) - _FFT_FLOOR[i])
+        bins.append(int(min(100, np.log1p(mag * 180.0 * gain * _FFT_WEIGHTS[i]) * 17.0)))
+    return bins
+
 # ─── Volume ───────────────────────────────────────────────────────────────────
 _volume      = 75          # 0-100; set by VOL: messages from ESP32
 _volume_lock = threading.Lock()
@@ -216,6 +237,26 @@ def serial_reader():
                         logger.info("[ESP32] Tap interrupt received")
                         interrupt_tts()
                         send_uart_command("APP: ASSISTANT")
+                    elif line == "DIAG?":
+                        # Send diagnostic payload
+                        with state_lock:
+                            mic_val = assistant_state.get("audio_intensity", 0)
+                            is_proc = assistant_state.get("processing", False)
+                        
+                        # Get last wake time string
+                        from datetime import datetime
+                        last_w = datetime.fromtimestamp(last_wakeword_time).strftime('%I:%M:%S %p') if last_wakeword_time > 0 else "NEVER"
+                        
+                        # Check OWW status
+                        ww_stat = "READY" if oww_model else "NOT LOADED"
+                        if is_proc: ww_stat = "PROC"
+                        
+                        # WiFi RSSI (approximate or placeholder if not easily reachable in this thread)
+                        # We can send it from the Pi's perspective or just a placeholder
+                        rssi = -50 
+                        
+                        diag_msg = f"DIAG:mic={mic_val},ww={ww_stat},pi=OK,rssi={rssi},wake={last_w}"
+                        send_uart_command(diag_msg)
                     elif line.startswith("VOL:"):
                         try:
                             global _volume
@@ -232,9 +273,9 @@ def serial_reader():
                     elif "APP:" in line:
                         app_mode = line.split("APP:", 1)[1].split()[0]
                         with state_lock:
-                            assistant_state["mic_active"] = (app_mode == "ASSISTANT")
+                            assistant_state["mic_active"] = (app_mode == "ASSISTANT" or app_mode == "SPEAKING")
                             assistant_state["radar_active"] = (app_mode == "RADAR")
-                        logger.info(f"[ESP32] {line} → mic_active={app_mode == 'ASSISTANT'}, radar_active={app_mode == 'RADAR'}")
+                        logger.info(f"[ESP32] {line} → mic_active={assistant_state['mic_active']}, radar_active={app_mode == 'RADAR'}")
                     elif line not in ("HB:OK",):   # suppress noisy heartbeat
                         logger.info(f"[ESP32] {line}")
         except Exception as e:
@@ -275,7 +316,7 @@ def _start_persistent_output():
         ['aplay', '-D', config.APLAY_DEVICE,
          '-t', 'raw', '-f', 'S16_LE',
          '-r', str(config.PIPER_SAMPLE_RATE), '-c', '1', '-q',
-         '--buffer-time=200000'],  # 200ms — balance between fast interrupt response and avoiding underruns
+         '--buffer-time=100000'],  # 100ms — tight sync between digital mouth and audio
         stdin=subprocess.PIPE,
         stderr=subprocess.DEVNULL
     )
@@ -517,6 +558,24 @@ def _forward_piper_audio(piper):
                 with _aec_ref_lock:
                     if _aec_ref_buf is not None:
                         _aec_ref_buf.extend(ref_samples)
+
+                # ── Digital Mouth Sync ──
+                # Calculate intensity + spectrum for the generated speech chunk
+                # Alsa buffer is 100ms. We add a small delay to compensate for the hardware latency.
+                samples_speech = np.frombuffer(chunk_out, dtype=np.int16)
+                if len(samples_speech) > 256:
+                    norm_speech = samples_speech.astype(np.float64) / 32768.0
+                    intensity = int(min(100, np.sqrt(np.mean(norm_speech**2)) * 450.0))
+                    
+                    chunk_sz = len(samples_speech)
+                    idx_bounds_speech = get_fft_bounds(chunk_sz, config.PIPER_SAMPLE_RATE)
+                    bins = calculate_spectrum_bins(norm_speech, idx_bounds_speech, gain=2.5)
+                    
+                    # Wait a tiny bit so the audio actually exits the speakers before the mouth moves
+                    # (Hardware/Alsa buffer compensation)
+                    time.sleep(0.06) 
+                    send_uart_command(f"S{','.join(map(str, bins))}|A{intensity}")
+
             elif not first:
                 # Inter-sentence gap — keep aplay buffer fed to prevent underrun clicks
                 with _audio_lock:
@@ -556,6 +615,9 @@ def _speak_text_iter(text_iter):
             fwd = threading.Thread(target=_forward_piper_audio, args=(piper,), daemon=True)
             fwd.start()
 
+    _TRANS_PATTERN = re.compile(r'\[TRANSCRIPT\]:\s*"(.*?)"', re.DOTALL)
+    logged_transcript = False
+
     for text in text_iter:
         if _tts_abort.is_set():
             break
@@ -563,7 +625,21 @@ def _speak_text_iter(text_iter):
             continue
         parts.append(text)
         buf += text
-        while True:
+
+        # Handle transcript logging/stripping at the very start of the buffer
+        if not logged_transcript:
+            if "]" in buf:
+                match = _TRANS_PATTERN.search(buf)
+                if match:
+                    transcript = match.group(1)
+                    logger.info(f"[USER TRANSCRIPT]: {transcript}")
+                    # Remove the transcript block from the buffer
+                    buf = buf[match.end():].lstrip()
+                    logged_transcript = True
+                elif len(buf) > 500: # Safety fallback if model fails to follow format
+                    logged_transcript = True
+
+        while logged_transcript: # Only start speaking once transcript is handled
             m = _SENTENCE_END.search(buf)
             if not m:
                 break
@@ -575,8 +651,16 @@ def _speak_text_iter(text_iter):
                     piper.stdin.write(_tts_clean(sent).encode() + b'\n')
 
     if buf.strip() and not _tts_abort.is_set():
-        _ensure_piper()
-        piper.stdin.write(_tts_clean(buf.strip()).encode() + b'\n')
+        # Final safety check: if transcript was never logged, try one last time
+        if not logged_transcript:
+            match = _TRANS_PATTERN.search(buf)
+            if match:
+                logger.info(f"[USER TRANSCRIPT]: {match.group(1)}")
+                buf = buf[match.end():].lstrip()
+        
+        if buf.strip():
+            _ensure_piper()
+            piper.stdin.write(_tts_clean(buf.strip()).encode() + b'\n')
 
     if piper:
         try:
@@ -662,10 +746,16 @@ def process_llm(audio_array):
         user_msg = (
             "Listen to the audio and answer the spoken question or fulfill the spoken request. "
             "Ignore background noises and clicks. "
+            "IMPORTANT: Always start your response with a clear transcription of what you heard in the audio in this exact format: [TRANSCRIPT]: \"user's spoken words\". "
+            "Then provide your actual answer on a new line. "
             "You can answer any question directly using your knowledge and the context below. "
             "Only call set_timer if the user explicitly asks to set or start a timer. "
             f"Context: {context}"
         )
+        # Log exactly what is being sent to the AI
+        logger.info(f"LLM SYSTEM PROMPT: {config.LLM_SYSTEM_PROMPT}")
+        logger.info(f"LLM USER MESSAGE: {user_msg}")
+
         audio_part = types.Part.from_bytes(data=wav_bytes, mime_type='audio/wav')
         gen_cfg    = types.GenerateContentConfig(
             system_instruction=config.LLM_SYSTEM_PROMPT,
@@ -871,6 +961,21 @@ def audio_processor():
 
     # ── AEC init ──────────────────────────────────────────────────────────────
     global _aec_ref_buf
+    
+    # VAD frame: 30ms at 16kHz = 480 samples
+    VAD_FRAME_SAMPLES = 480
+
+    # ── Pre-compute Mic FFT bounds ──
+    mic_idx_bounds = get_fft_bounds(CHUNK, RATE)
+
+    # ── Recording state ──
+    recording            = False
+    recording_end_time   = 0
+    query_buffer         = []
+    vad_speech_frames    = 0
+    vad_silence_frames   = 0
+    vad_frame_buf        = np.array([], dtype=np.int16)
+
     aec = None
     if config.AEC_ENABLED and _SPEEX_AVAILABLE:
         try:
@@ -1032,6 +1137,7 @@ def audio_processor():
                             if is_speaking:
                                 interrupt_tts()
                             send_uart_command(f"WAKE|{mdl}")
+                            send_uart_command("EMO:ALERT")
                             last_wakeword_time = time.time()
 
                             recording          = True
@@ -1064,16 +1170,11 @@ def audio_processor():
                 assistant_state["audio_intensity"] = intensity
 
             now = time.time()
-            if mic_active and now - last_send_time > (1.0 / config.AUDIO_UPDATE_HZ):
-                # FFT only at send rate (10Hz) — not on every 46Hz capture chunk
-                fft_data = np.abs(np.fft.rfft(norm_samples))
-                gain     = max(0.5, min(8.0, 1.0 / assistant_state["avg_rms"]))
-                bins = []
-                for i in range(16):
-                    start = _fft_idx_bounds[i]
-                    end   = max(start + 1, _fft_idx_bounds[i + 1])
-                    mag   = max(0.0, np.mean(fft_data[start:end]) - _fft_floor[i])
-                    bins.append(int(min(100, np.log1p(mag * 180.0 * gain * _fft_weights[i]) * 17.0)))
+            is_speaking = _tts_active.is_set()
+            if mic_active and not is_speaking and now - last_send_time > (1.0 / config.AUDIO_UPDATE_HZ):
+                # FFT only at send rate (10Hz) if not speaking (speech synthesis sends its own data)
+                gain = max(0.5, min(8.0, 1.0 / assistant_state["avg_rms"]))
+                bins = calculate_spectrum_bins(norm_samples, mic_idx_bounds, gain=gain)
                 send_uart_command(f"S{','.join(map(str, bins))}|A{intensity}")
                 last_send_time = now
 
@@ -1156,20 +1257,8 @@ def radar_stop():
 if __name__ == "__main__":
     _load_device_settings()
 
-    # Launch the ADS-B proxy as a subprocess — restarts automatically if it crashes
-    _proxy_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adsb_proxy_pi.py")
-    _proxy_python  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv/bin/python")
-    def _watch_proxy():
-        while True:
-            try:
-                logger.info("Starting adsb_proxy_pi.py")
-                proc = subprocess.Popen([_proxy_python, _proxy_script])
-                proc.wait()
-                logger.warning(f"adsb_proxy_pi.py exited (code {proc.returncode}), restarting in 5s")
-            except Exception as e:
-                logger.error(f"adsb_proxy watcher error: {e}")
-            time.sleep(5)
-    threading.Thread(target=_watch_proxy, daemon=True).start()
+    # The ADS-B proxy is now managed as a standalone systemd service (adsb_sidecar)
+    # so we no longer need to launch it as a subprocess here.
 
     reader_thread = threading.Thread(target=serial_reader, daemon=True)
     reader_thread.start()

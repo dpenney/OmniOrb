@@ -6,6 +6,8 @@
 class AssistantView {
 public:
     enum AssistantState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_SPEAKING };
+    enum Emotion { EMO_NEUTRAL, EMO_HAPPY, EMO_SARDONIC, EMO_ALERT, EMO_WINK };
+    enum AssistantStyle { STYLE_IRIS, STYLE_FACE };
 
     static void init();
     static void update();
@@ -16,6 +18,11 @@ public:
     static void set_spectrum(const int* bins, int count);
     static void set_state(AssistantState state);
     static AssistantState get_state();
+    static void set_emotion(Emotion emotion);
+    static Emotion get_emotion();
+    static void set_style(AssistantStyle style);
+    static AssistantStyle get_style();
+    static void toggle_style();
 
     // Timer — managed by main.cpp
     static void  start_timer(uint32_t seconds, const String& label);
@@ -28,6 +35,8 @@ public:
 
 private:
     static int freq_bins[16];
+    static void _draw_iris(float t);
+    static void _draw_face(float t);
 };
 
 #endif
