@@ -180,6 +180,11 @@ void notify_pi_settings() {
                  String(settings.home_lon, 6) + "," + String(settings.timezone);
     Serial0.println(msg);
     Serial.printf("[UART→Pi] %s\n", msg.c_str());
+
+    // Also sync current volume
+    String vmsg = String("VOL:") + String(settings.volume);
+    Serial0.println(vmsg);
+    Serial.printf("[UART→Pi] %s\n", vmsg.c_str());
 }
 
 void notify_pi_app_mode(AppState mode) {
@@ -1140,6 +1145,7 @@ void loop() {
                 cmd.trim();
                 if (cmd == "THINKING") AssistantView::set_state(AssistantView::STATE_THINKING);
                 else if (cmd == "SPEAKING") AssistantView::set_state(AssistantView::STATE_SPEAKING);
+                else if (cmd == "CONTINUITY") AssistantView::set_state(AssistantView::STATE_CONTINUITY);
                 else if (cmd == "ASSISTANT") AssistantView::set_state(AssistantView::STATE_IDLE);
             } else if (rx.startsWith("EMO:")) {
                 String emo = rx.substring(4);

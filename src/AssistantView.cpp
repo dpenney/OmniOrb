@@ -184,6 +184,12 @@ void AssistantView::_draw_iris(float t) {
     } else if (current_state == AssistantView::STATE_SPEAKING) {
         eff_glow = 0xF81F; // Magenta
         eff_accent = 0x780F; // Purple
+    } else if (current_state == AssistantView::STATE_CONTINUITY) {
+        eff_glow = 0x07E0; // Web Green (Matches LISTENING)
+        eff_accent = 0x00FF; // Deep Blue (Matches LISTENING)
+        
+        // Match the listening state animation floor
+        if (audio_scale < 0.1f) audio_scale = 0.1f;
     }
 
     canvas->fillCircle(CX, CY, iris_r + 15 + (int)(audio_scale * 30), eff_glow);
@@ -258,6 +264,10 @@ void AssistantView::_draw_face(float t) {
         eye_scale_v = 1.0f;
         eye_col = C_ACCENT; // Gold
         face_col = C_ACCENT;
+    } else if (current_state == AssistantView::STATE_CONTINUITY) {
+        eye_scale_v = 1.1f; // Slightly wider "attentive" eyes
+        eye_col = 0xFF40;   // Amber/Gold
+        face_col = 0xFF40;
     }
 
     auto draw_eye = [&](float x, float y, float r_base, float sv, uint16_t col, bool is_wink = false) {
@@ -351,15 +361,16 @@ void AssistantView::_draw_face(float t) {
     // Modernized UI Status
     canvas->setTextSize(2);
     canvas->setTextColor(C_SECONDARY);
-    canvas->setCursor(CX - 180, CY + 175);
+    canvas->setCursor(CX - 120, CY + 175);
     const char* ms = "MODE: STANDBY";
     if (current_state == AssistantView::STATE_LISTENING) ms = "MODE: HEURISTIC_SCAN";
     else if (current_state == AssistantView::STATE_THINKING) ms = "MODE: PROCESSING...";
-    else if (current_state == AssistantView::STATE_SPEAKING) ms = "MODE: SYTH_OUT";
+    else if (current_state == AssistantView::STATE_SPEAKING) ms = "MODE: SYNTH_OUT";
+    else if (current_state == AssistantView::STATE_CONTINUITY) ms = "MODE: CONTINUITY";
     canvas->print(ms);
 
     if (current_emotion != AssistantView::EMO_NEUTRAL) {
-        canvas->setCursor(CX - 180, CY + 195);
+        canvas->setCursor(CX - 120, CY + 195);
         const char* es = "";
         switch(current_emotion) {
             case AssistantView::EMO_HAPPY:    es = "BIAS: POSITIVE"; break;

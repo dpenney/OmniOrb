@@ -7,6 +7,8 @@ Write-Host "Syncing brain files to $User@${HostIp}..." -ForegroundColor Cyan
 scp ./pi/assistant_brains.py "${User}@${HostIp}:~/assistant/"
 scp ./pi/config.py "${User}@${HostIp}:~/assistant/"
 scp ./pi/HeyRobot.onnx "${User}@${HostIp}:~/assistant/"
+scp ./pi/*.py "${User}@${HostIp}:~/assistant/"
+scp ./pi/*.json "${User}@${HostIp}:~/assistant/"
 
 # Private sidecar -- gitignored, deployed separately
 if (Test-Path ./pi/adsb_proxy_pi.py) {

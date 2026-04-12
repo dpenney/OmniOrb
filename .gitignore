@@ -32,3 +32,5 @@ demo_c*/
 *.tar.gz
 .claude/settings.local.json
 pi/device_settings.json
+pi/private_memories.json
+pi/memory_store/

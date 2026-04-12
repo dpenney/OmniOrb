@@ -5,7 +5,7 @@
 
 class AssistantView {
 public:
-    enum AssistantState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_SPEAKING };
+    enum AssistantState { STATE_IDLE, STATE_LISTENING, STATE_THINKING, STATE_SPEAKING, STATE_CONTINUITY };
     enum Emotion { EMO_NEUTRAL, EMO_HAPPY, EMO_SARDONIC, EMO_ALERT, EMO_WINK };
     enum AssistantStyle { STYLE_IRIS, STYLE_FACE };
 

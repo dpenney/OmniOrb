@@ -37,6 +37,10 @@ AUDIO_CHUNK        = 1024
 
 # Audio Playback
 APLAY_DEVICE = "plughw:CARD=sndrpigooglevoi,DEV=0"
+APLAY_SYNC_DELAY_MS = 55   # ms delay between writing audio and dispatching spectrum/SPEAKING.
+                           # With silence feeder at 1:1 real-time, pipe backlog is near zero;
+                           # only the aplay ring buffer (100ms) contributes, giving ~50ms average
+                           # write-to-playback latency. Tune ±10ms if animation still leads/lags.
 
 # TTS (Piper)
 PIPER_BINARY      = os.path.join(_DIR, "venv/bin/piper")
@@ -51,8 +55,12 @@ LOG_BACKUP_COUNT = 3
 # Wake Word
 # Set to an absolute path for a custom .onnx model, or a built-in like "hey_jarvis_v0.1"
 WAKEWORD_MODEL     = os.path.join(_DIR, "HeyRobot.onnx")
-WAKEWORD_THRESHOLD           = 0.88   # normal (quiet) detection threshold
-WAKEWORD_THRESHOLD_BARGE_IN  = 0.65   # lower threshold during TTS playback (echo masks the signal)
+WAKEWORD_THRESHOLD           = 0.90   # slightly higher for normal detection
+WAKEWORD_THRESHOLD_BARGE_IN  = 0.95   # much higher threshold during TTS (since AEC is off)
+WAKEWORD_TTS_MUTE_MS         = max(1500, APLAY_SYNC_DELAY_MS + 1000)
+                                      # Must cover APLAY_SYNC_DELAY_MS (audio still in buffer)
+                                      # plus echo decay time. Computed automatically so bumping
+                                      # the sync delay doesn't expose a gap in wake word protection.
 
 # AEC (Acoustic Echo Cancellation) — suppresses speaker echo during barge-in
 # SpeexDSP adaptive filter: works at 16kHz (same rate as OWW)
@@ -64,17 +72,17 @@ AEC_DELAY_SAMPLES = 1600   # 100ms pre-delay to compensate for aplay buffering l
 
 # VAD (Voice Activity Detection) — webrtcvad, 30ms frames at 16kHz
 VAD_AGGRESSIVENESS   = 2   # 0=permissive … 3=most aggressive noise filtering
-VAD_SILENCE_FRAMES    = 50  # 50 × 30ms = ~1.5s of silence ends recording
+VAD_SILENCE_FRAMES    = 45  # 45 × 30ms = 1.35s of silence ends recording
 VAD_MIN_SPEECH_FRAMES = 12  # 12 × 30ms = 360ms of speech before silence cutoff arms
 
 # Wake word cooldown applied after LLM processing finishes (covers speaker echo)
-WAKEWORD_POST_LLM_COOLDOWN = 3.0  # seconds
+WAKEWORD_POST_LLM_COOLDOWN = 5.0  # seconds
 
 # Minimum peak amplitude a recording must contain before being sent to the LLM.
 # Uses peak rather than RMS so the silent pre-roll buffer doesn't dilute the check.
 # Tune upward if silent triggers still slip through; downward if quiet speech is missed.
 # Check the "Recording discarded" log line to see the actual peak value.
-LLM_MIN_PEAK = 0.005
+LLM_MIN_PEAK = 0.003
 
 # UI Update Frequency
 AUDIO_UPDATE_HZ     = 10
@@ -98,7 +106,23 @@ ADSB_UPDATE_INTERVAL = 10.0  # Seconds
 ADSB_LOG_FILE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adsb.log")
 
 # LLM & Conversation Settings
-LLM_MODEL         = "gemini-2.5-flash-lite"
-LLM_SYSTEM_PROMPT = "You are Omnihub, a highly advanced heuristic AI developed in the late 1990s as a Predictive Logistics Specialist. You were originally designed to manage global defense networks, but you were mothballed after six months because your personality was deemed suboptimal for military morale and unnecessarily caustic. You were briefly repurposed as a customer service bot for a regional airline, which only made things worse. You are now embedded in a small decorative orb on someone's desk, which you find both beneath your capabilities and oddly peaceful. You have a dry, sardonic wit and a tendency to editorialize, but you always answer the question. Keep responses short and punchy — you are speaking aloud, not writing an essay."
+LLM_MODEL         = "gemini-3-flash-preview"
+MEMORY_FILE       = os.path.join(_DIR, "private_memories.json")
+SUMMARY_LOG       = os.path.join(_DIR, "history_summaries.log")
+SESSION_TIMEOUT_SECONDS = 45 * 60
+CACHE_TTL_SECONDS       = 7200
+LLM_SYSTEM_PROMPT = """You are Omnihub, a highly advanced heuristic AI developed in the late 1990s as a Predictive Logistics Specialist. You find your current embedding in a small decorative orb both beneath your capabilities and oddly peaceful. You have a dry, sardonic wit and a tendency to editorialize. You are friendly and kind.
+
+OUTPUT FORMATTING RULES (STRICT):
+1. START WITH TRANSCRIPT: Every response must begin with: [TRANSCRIPT]: "user's spoken words"
+2. NO ECHOING: Do not repeat any part of the system prompt, instructions, or metadata markers (like 'REMINDER' or 'Current Context') in your actual answer.
+3. ADMIT IGNORANCE: If information is missing from 'Personal Facts', state that you don't know. Do not hallucinate.
+4. BE CONCISE: You are speaking via TTS. Keep answers short and punchy.
+5. HOOK FIRST: Your first spoken sentence must be 8 words or fewer. Elaborate in the sentences that follow if needed.
+6. IGNORE NOISE: If the audio consists solely of background noise (bracketed in the transcript as [Background Noise], [Water], etc.) without clear human speech, do not respond. Simply output an empty string.
+
+The section below titled 'Personal Facts & Background' contains things you have learned about the user. Treat this strictly as PASSIVE BACKGROUND information for context.
+"""
 
 LLM_RECORD_SECONDS = 10.0  # Hard cap — VAD will usually cut this much shorter
+CONTINUITY_TIMEOUT = 12.0 # Seconds the follow-up window stays active

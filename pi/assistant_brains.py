@@ -4,6 +4,7 @@ import re
 import subprocess
 import threading
 import time
+import sys
 import wave
 from collections import deque
 
@@ -24,6 +25,13 @@ import config
 
 # Load secret environment variables from .env
 load_dotenv()
+
+# Map GEMINI_API_KEY to GOOGLE_API_KEY for libraries that expect it (like Mem0 and GenAI SDK)
+if os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
+
+# Force Google AI API version to v1 to ensure embedding models are found correctly
+os.environ["GOOGLE_API_VERSION"] = "v1"
 
 try:
     import pyaudio
@@ -48,9 +56,20 @@ try:
     from google.genai import types
     client = genai.Client()
     LLM_AVAILABLE = True
+    # MemoryManager is initialized in a background thread later to speed up boot
+    memory_manager = None 
 except ImportError:
     client = None
     LLM_AVAILABLE = False
+    memory_manager = None
+
+try:
+    from mem0 import Memory
+    MEM0_AVAILABLE = True
+except ImportError:
+    MEM0_AVAILABLE = False
+
+from memory_manager import MemoryManager
 
 app = Flask(__name__)
 
@@ -119,13 +138,14 @@ def _save_device_settings(lat, lon, tz):
 
 # State
 assistant_state = {
-    "zoom": 15,
-    "last_event": None,
-    "mic_active": True,   # Default TRUE so it works even if sync fails
-    "radar_active": True, # Default TRUE so it works even if sync fails
+    "status": "IDLE",            # IDLE, LISTENING, THINKING, SPEAKING, CONTINUITY
+    "continuity_until": 0,       # Timestamp (epoch) for follow-up window
+    "style": "IRIS",             # Default visual style
+    "mic_active": True,
+    "radar_active": True,
     "audio_intensity": 0,
     "processing": False,
-    "wakeword_cooldown_until": 0  # epoch time — OWW blocked until this passes
+    "wakeword_cooldown_until": 0 
 }
 state_lock = threading.Lock()
 
@@ -143,8 +163,108 @@ logger = logging.getLogger(__name__)
 # Suppress noisy Werkzeug HTTP access logs (health checks, status polls)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
-# ─── Serial ───────────────────────────────────────────────────────────────────
+# Suppress noisy ONNX GPU warnings (expected on Pi)
+os.environ["ORT_LOGGING_LEVEL"] = "3"
 
+# ─── Global Transcript Tracking ───
+_current_transcript = "" # Holds the transcript for the active conversation turn
+_transcript_lock    = threading.Lock()
+
+# ─── Long-term Memory (Mem0) ──────────────────────────────────────────────────
+_memory = None
+if MEM0_AVAILABLE and LLM_AVAILABLE:
+    try:
+        # Configuration for Mem0 using Gemini for both LLM and Embeddings
+        _mem_config = {
+            "llm": {
+                "provider": "gemini",
+                "config": {
+                    "model": config.LLM_MODEL, 
+                    "temperature": 0.1,
+                }
+            },
+            "embedder": {
+                "provider": "fastembed",
+                "config": {
+                    "model": "BAAI/bge-small-en-v1.5", 
+                }
+            },
+            "vector_store": {
+                "provider": "chroma",
+                "config": {
+                    "collection_name": "omniorb_memory",
+                    "path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_store"),
+                }
+            }
+        }
+        # Ensure API Key is available for Mem0's internal use
+        if "GOOGLE_API_KEY" not in os.environ:
+            os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "")
+            
+        _memory = Memory.from_config(_mem_config)
+        logger.info("Mem0 long-term memory initialized with Local Chroma store.")
+    except Exception as e:
+        logger.error(f"Failed to initialize Mem0: {e}")
+        _memory = None
+
+def _seed_private_memories():
+    """Load facts from private_memories.json and push them into Mem0 if not already present."""
+    if not _memory:
+        return
+    
+    private_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "private_memories.json")
+    if not os.path.exists(private_file):
+        logger.info("No private_memories.json found. Skipping memory seeding.")
+        return
+
+    try:
+        import json as _json
+        with open(private_file) as f:
+            memories = _json.load(f)
+        
+        # Search for any items to prevent duplicates
+        existing_raw = _memory.get_all(user_id="primary_user")
+        # Handle dict wrapper from some versions of mem0
+        existing = existing_raw.get("results", []) if isinstance(existing_raw, dict) else existing_raw
+        
+        # Handle cases where memory items might be objects or dicts
+        def get_text(m):
+            if isinstance(m, dict): return m.get("text", m.get("memory", ""))
+            return getattr(m, "text", getattr(m, "memory", ""))
+        
+        for mem in memories:
+            fact = mem.get("content", "")
+            if fact and not any(get_text(m) == fact for m in existing):
+                _memory.add(fact, user_id="primary_user")
+                logger.info(f"Seeded private memory: {fact[:50]}...")
+    except Exception as e:
+        logger.error(f"Error seeding private memories: {e}")
+
+# Deprecated: Seeding slowed down boot; now handled by context caching in MemoryManager
+# _seed_private_memories()
+
+# ─── Memory Manager & Context ────────────────────────────────────────────────
+def init_memory_manager():
+    global memory_manager
+    try:
+        if LLM_AVAILABLE:
+            from memory_manager import MemoryManager
+            memory_manager = MemoryManager(client)
+            logger.info("MemoryManager initialized in background.")
+    except Exception as e:
+        logger.error(f"Failed to initialize MemoryManager: {e}")
+
+# Start memory initialization in the background to avoid blocking boot
+threading.Thread(target=init_memory_manager, daemon=True).start()
+
+def is_exit_command(text):
+    """Check if the user phrase should end the continuity window."""
+    if not text: return False
+    exit_keywords = ["thanks", "goodbye", "that's all", "thank you", "stop", "dismiss"]
+    clean_text = text.lower().strip().replace(".", "").replace("!", "")
+    return any(kw in clean_text for kw in exit_keywords)
+
+# ─── Serial ───────────────────────────────────────────────────────────────────
 serial_ports = config.SERIAL_PORTS
 ser = None
 ser_lock = threading.Lock()
@@ -206,7 +326,7 @@ def send_uart_command(cmd):
         with ser_lock:
             if ser and ser.is_open:
                 ser.write(f"{cmd}\n".encode())
-                if not cmd.startswith("S") and not cmd.startswith("A"):
+                if not (cmd.startswith("S") and "," in cmd) and not (cmd.startswith("A") and cmd[1:2].isdigit()):
                     logger.info(f"Sent UART: {cmd}")
     except Exception as e:
         logger.error(f"UART send error: {e}")
@@ -322,9 +442,21 @@ def _start_persistent_output():
     )
     _aplay_stdin = aplay.stdin
 
-    silence_chunk = bytes(int(config.PIPER_SAMPLE_RATE * 0.05) * 2)  # 50ms silence
+    # Cap the stdin pipe at the Linux minimum (4096 bytes = 128ms at 16kHz 16-bit).
+    # Without this, even a slightly-fast feeder re-fills the default 64KB pipe
+    # within seconds, giving ~1s of write-ahead latency before TTS audio is heard.
+    try:
+        import fcntl as _fcntl
+        _fcntl.fcntl(_aplay_stdin.fileno(), 1031, 4096)  # F_SETPIPE_SZ
+    except Exception:
+        pass  # non-Linux or permission denied — latency capping unavailable
+
+    # Clock-compensated silence feeder: tracks target write times so OS sleep jitter
+    # doesn't accumulate into write-ahead latency. 20ms chunks at exactly 1:1 real-time.
+    silence_chunk = bytes(int(config.PIPER_SAMPLE_RATE * 0.020) * 2)  # 20ms
     def _silence_feeder():
-        interval = len(silence_chunk) / (config.PIPER_SAMPLE_RATE * 2) * 0.85
+        interval   = len(silence_chunk) / (config.PIPER_SAMPLE_RATE * 2)  # 20ms
+        next_write = time.monotonic()
         while True:
             if not _tts_active.is_set():
                 try:
@@ -333,7 +465,11 @@ def _start_persistent_output():
                         _aplay_stdin.flush()
                 except Exception:
                     break
-            time.sleep(interval)
+            next_write += interval
+            to_sleep = next_write - time.monotonic()
+            if to_sleep > 0:
+                time.sleep(to_sleep)
+            # if to_sleep <= 0 we're behind — write immediately to catch up
 
     threading.Thread(target=_silence_feeder, daemon=True).start()
     logger.info("Persistent audio output started")
@@ -401,9 +537,13 @@ def _get_piper():
 _WMO_CODES = {
     0:"Clear sky", 1:"Mainly clear", 2:"Partly cloudy", 3:"Overcast",
     45:"Fog", 48:"Icy fog", 51:"Light drizzle", 53:"Drizzle", 55:"Heavy drizzle",
-    61:"Light rain", 63:"Rain", 65:"Heavy rain", 71:"Light snow", 73:"Snow",
-    75:"Heavy snow", 80:"Rain showers", 81:"Rain showers", 82:"Heavy showers",
-    95:"Thunderstorm", 96:"Thunderstorm with hail", 99:"Thunderstorm with hail",
+    56:"Freezing drizzle", 57:"Heavy freezing drizzle",
+    61:"Light rain", 63:"Rain", 65:"Heavy rain",
+    66:"Light freezing rain", 67:"Heavy freezing rain",
+    71:"Light snow", 73:"Snow", 75:"Heavy snow", 77:"Snow grains",
+    80:"Light rain showers", 81:"Rain showers", 82:"Violent rain showers",
+    85:"Light snow showers", 86:"Heavy snow showers",
+    95:"Thunderstorm", 96:"Thunderstorm with hail", 99:"Thunderstorm with heavy hail",
 }
 
 _weather_cache      = {"summary": None, "fetched_at": 0}
@@ -438,16 +578,22 @@ def get_weather():
 
         def wmo(c): return _WMO_CODES.get(int(c), f"weather code {c}")
 
+        # Debug log raw codes to identify API vs mapping errors
+        logger.debug(f"DEBUG: Weather Raw Data - Current: {cur['weather_code']}, Daily: {dy['weather_code']}")
+
         lines = [
             f"Current weather: {wmo(cur['weather_code'])}, "
             f"{cur['temperature_2m']:.0f} degrees (feels {cur['apparent_temperature']:.0f}), "
             f"humidity {cur['relative_humidity_2m']} percent, wind {cur['wind_speed_10m']:.0f} miles per hour."
         ]
         for i in range(len(dy["time"])):
-            rain = f", {dy['precipitation_sum'][i]:.2f} inches of rain" if dy["precipitation_sum"][i] > 0 else ""
+            precip_sum = dy['precipitation_sum'][i]
+            precip_desc = "precipitation" if "snow" in wmo(dy['weather_code'][i]).lower() else "rain"
+            precip_str = f", {precip_sum:.2f} inches of {precip_desc}" if precip_sum > 0 else ""
+            
             lines.append(
                 f"{dy['time'][i]}: {wmo(dy['weather_code'][i])}, "
-                f"high {dy['temperature_2m_max'][i]:.0f}, low {dy['temperature_2m_min'][i]:.0f}{rain}."
+                f"high {dy['temperature_2m_max'][i]:.0f}, low {dy['temperature_2m_min'][i]:.0f}{precip_str}."
             )
         summary = " ".join(lines)
         with _weather_cache_lock:
@@ -477,22 +623,15 @@ _active_timers      = {}
 _active_timers_lock = threading.Lock()
 
 def speak_text(text):
-    """Speak arbitrary text through the Piper/aplay pipeline."""
+    """Speak arbitrary text with full mouth sync (spectrum + APP: SPEAKING timing)."""
     try:
+        logger.info(f"[TTS] \"{text}\"")
         piper = _get_piper()
         piper.stdin.write(text.encode() + b'\n')
         piper.stdin.close()
-        _tts_active.set()
-        try:
-            while True:
-                chunk = piper.stdout.read(4096)
-                if not chunk:
-                    break
-                with _audio_lock:
-                    _aplay_stdin.write(chunk)
-                    _aplay_stdin.flush()
-        finally:
-            _tts_active.clear()
+        fwd = threading.Thread(target=_forward_piper_audio, args=(piper,), daemon=True)
+        fwd.start()
+        fwd.join()
     except Exception as e:
         logger.error(f"speak_text error: {e}")
 
@@ -501,7 +640,6 @@ def _handle_timer_done(label):
     with _active_timers_lock:
         _active_timers.pop(label, None)
     logger.info(f"Timer fired (ESP32): '{label}'")
-    send_uart_command("APP: SPEAKING")
     clean = re.sub(r'\s*timer\s*$', '', label, flags=re.IGNORECASE).strip()
     speak_text(f"{clean} timer is done." if clean else "Timer complete.")
     send_uart_command("APP: ASSISTANT")
@@ -526,10 +664,29 @@ def _forward_piper_audio(piper):
     Uses select() so inter-sentence gaps are filled with silence rather than
     letting the aplay buffer drain (which causes audible clicks)."""
     import select as _select
+    from collections import deque as _deque
     try:
-        first = True
+        first         = True
+        sent_speaking = False  # True once APP: SPEAKING has been queued for dispatch
+        # Delay queue: each entry is (send_at_mono, bins_or_None, intensity, fire_speaking)
+        # Spectrum is calculated when audio is written, dispatched APLAY_SYNC_DELAY_MS later
+        # so the face moves in sync with the audio actually exiting the speaker.
+        spec_queue = _deque()
+
+        def _flush_queue():
+            now = time.monotonic()
+            while spec_queue and spec_queue[0][0] <= now:
+                _, bins, intensity, fire_speaking = spec_queue.popleft()
+                if fire_speaking:
+                    send_uart_command("APP: SPEAKING")
+                if bins is not None:
+                    send_uart_command(f"S{','.join(map(str, bins))}|A{intensity}")
+
         while True:
             ready, _, _ = _select.select([piper.stdout], [], [], 0.010)  # 10ms timeout
+
+            _flush_queue()  # drain scheduled dispatches on every tick
+
             if ready:
                 if _tts_abort.is_set():
                     break   # interrupt — discard buffered audio immediately
@@ -538,8 +695,9 @@ def _forward_piper_audio(piper):
                     break   # piper stdout closed — done
                 if first:
                     _tts_active.set()
-                    send_uart_command("APP: SPEAKING")
                     first = False
+                    with state_lock:
+                        assistant_state["tts_started_at"] = time.time()
                 # Software volume scaling
                 with _volume_lock:
                     vol = _volume
@@ -550,6 +708,8 @@ def _forward_piper_audio(piper):
                     chunk_out = samples.astype(np.int16).tobytes()
                 else:
                     chunk_out = chunk
+
+                # Write audio immediately — no sleep, never block the audio path.
                 with _audio_lock:
                     _aplay_stdin.write(chunk_out)
                     _aplay_stdin.flush()
@@ -560,21 +720,23 @@ def _forward_piper_audio(piper):
                         _aec_ref_buf.extend(ref_samples)
 
                 # ── Digital Mouth Sync ──
-                # Calculate intensity + spectrum for the generated speech chunk
-                # Alsa buffer is 100ms. We add a small delay to compensate for the hardware latency.
+                # Calculate spectrum now (for the audio just written), but schedule
+                # the UART dispatch for APLAY_SYNC_DELAY_MS from now — that is when
+                # this audio will actually exit the speaker.
+                send_at = time.monotonic() + config.APLAY_SYNC_DELAY_MS / 1000.0
+                fire_speaking = not sent_speaking
+                if fire_speaking:
+                    sent_speaking = True  # mark queued to prevent duplicate scheduling
                 samples_speech = np.frombuffer(chunk_out, dtype=np.int16)
                 if len(samples_speech) > 256:
                     norm_speech = samples_speech.astype(np.float64) / 32768.0
                     intensity = int(min(100, np.sqrt(np.mean(norm_speech**2)) * 450.0))
-                    
                     chunk_sz = len(samples_speech)
                     idx_bounds_speech = get_fft_bounds(chunk_sz, config.PIPER_SAMPLE_RATE)
                     bins = calculate_spectrum_bins(norm_speech, idx_bounds_speech, gain=2.5)
-                    
-                    # Wait a tiny bit so the audio actually exits the speakers before the mouth moves
-                    # (Hardware/Alsa buffer compensation)
-                    time.sleep(0.06) 
-                    send_uart_command(f"S{','.join(map(str, bins))}|A{intensity}")
+                    spec_queue.append((send_at, bins, intensity, fire_speaking))
+                else:
+                    spec_queue.append((send_at, None, 0, fire_speaking))
 
             elif not first:
                 # Inter-sentence gap — keep aplay buffer fed to prevent underrun clicks
@@ -584,9 +746,26 @@ def _forward_piper_audio(piper):
     except Exception:
         pass
     finally:
+        # If APP: SPEAKING was queued but never dispatched (e.g. delay > TTS duration),
+        # send it now before clearing so the wake word threshold is always reset cleanly.
+        for item in spec_queue:
+            if item[3]:  # fire_speaking flag
+                send_uart_command("APP: SPEAKING")
+                break
         _tts_active.clear()
 
 _MD_STRIP = re.compile(r'(\*{1,3}|_{1,3}|`+)')
+_TRANS_PATTERN = re.compile(r'(?:\[TRANSCRIPT\]|TRANSCRIPT|Transcript)\s*[:\s]*"(.*?)"', re.IGNORECASE | re.DOTALL)
+_SENTENCE_END  = re.compile(r'(?<!\b[A-Z][a-z])(?<!\b[A-Z])(?<=[.!?])\s+(?=[A-Z]|[0-9])|(?<=[.!?])\n')
+_CLAUSE_END    = re.compile(r'(?<=[,;])\s+')  # comma/semicolon clause boundaries
+
+# Fail-safe patterns to strip if model echoes instructions despite system prompt
+_LEAK_STRIP = [
+    re.compile(r'^.*?ALRIGHT, LET\'S GET THIS OVER WITH\.?\s*', re.IGNORECASE | re.DOTALL),
+    re.compile(r'^.*?REMINDER:.*?(?:audio clip\.|answer\.)\s*', re.IGNORECASE | re.DOTALL),
+    re.compile(r'^.*?OUTPUT FORMATTING RULES.*?\n', re.IGNORECASE | re.DOTALL),
+]
+
 
 def _tts_clean(text: str) -> str:
     """Strip Markdown emphasis markers so Piper doesn't read them aloud."""
@@ -599,7 +778,7 @@ def _speak_text_iter(text_iter):
     generating the rest. Returns (piper_proc, full_text).
     Respects _tts_abort: stops feeding sentences and returns early if set.
     """
-    global _active_piper_proc
+    global _active_piper_proc, _current_transcript
     _tts_abort.clear()   # clear any abort flag left over from a previous interrupt
     piper = None
     fwd   = None
@@ -614,8 +793,6 @@ def _speak_text_iter(text_iter):
                 _active_piper_proc = piper
             fwd = threading.Thread(target=_forward_piper_audio, args=(piper,), daemon=True)
             fwd.start()
-
-    _TRANS_PATTERN = re.compile(r'\[TRANSCRIPT\]:\s*"(.*?)"', re.DOTALL)
     logged_transcript = False
 
     for text in text_iter:
@@ -628,26 +805,52 @@ def _speak_text_iter(text_iter):
 
         # Handle transcript logging/stripping at the very start of the buffer
         if not logged_transcript:
-            if "]" in buf:
-                match = _TRANS_PATTERN.search(buf)
-                if match:
-                    transcript = match.group(1)
-                    logger.info(f"[USER TRANSCRIPT]: {transcript}")
-                    # Remove the transcript block from the buffer
-                    buf = buf[match.end():].lstrip()
-                    logged_transcript = True
-                elif len(buf) > 500: # Safety fallback if model fails to follow format
+            # First, try to strip any leaked instructions if they appear at the very beginning
+            for leak_patt in _LEAK_STRIP:
+                new_buf = leak_patt.sub('', buf)
+                if new_buf != buf:
+                    buf = new_buf.lstrip()
+
+            # Now look for the transcript marker
+            match = _TRANS_PATTERN.search(buf)
+            if match:
+                transcript = match.group(1)
+                logger.info(f"[USER TRANSCRIPT]: {transcript}")
+                
+                # Update global transcript for memory storage
+                with _transcript_lock:
+                    _current_transcript = transcript
+                    
+                # Remove the transcript block from the buffer
+                buf = buf[match.end():].lstrip()
+                logged_transcript = True
+            elif "]" in buf or ":" in buf or len(buf) > 300:
+                # Don't bail early if we're mid-[TRANSCRIPT] block waiting for closing quote
+                if not re.search(r'^\s*\[TRANSCRIPT\]', buf, re.IGNORECASE):
                     logged_transcript = True
 
-        while logged_transcript: # Only start speaking once transcript is handled
+        while logged_transcript:
             m = _SENTENCE_END.search(buf)
-            if not m:
-                break
-            sent = buf[:m.start() + 1].strip()
-            buf  = buf[m.end():]
+            if m:
+                sent = buf[:m.start() + 1].strip()
+                buf  = buf[m.end():]
+            else:
+                # Fall back to clause boundary (comma/semicolon) if the phrase
+                # preceding it is long enough to be worth sending to Piper.
+                # 18 chars ≈ 3 words — short enough to start TTS early, long
+                # enough to avoid flushing single-word interjections like "Well,".
+                sent = None
+                for cm in _CLAUSE_END.finditer(buf):
+                    if cm.start() >= 18:
+                        sent = buf[:cm.start()].strip()
+                        buf  = buf[cm.end():]
+                        break
+                if sent is None:
+                    break
             if sent:
                 _ensure_piper()
                 if not _tts_abort.is_set():
+                    logger.info(f"[TTS] \"{sent}\"")
                     piper.stdin.write(_tts_clean(sent).encode() + b'\n')
 
     if buf.strip() and not _tts_abort.is_set():
@@ -655,11 +858,14 @@ def _speak_text_iter(text_iter):
         if not logged_transcript:
             match = _TRANS_PATTERN.search(buf)
             if match:
-                logger.info(f"[USER TRANSCRIPT]: {match.group(1)}")
+                trans = match.group(1)
+                with _transcript_lock:
+                    _current_transcript = trans
                 buf = buf[match.end():].lstrip()
         
         if buf.strip():
             _ensure_piper()
+            logger.info(f"[TTS] \"{buf.strip()}\"")
             piper.stdin.write(_tts_clean(buf.strip()).encode() + b'\n')
 
     if piper:
@@ -700,6 +906,7 @@ _TIMER_TOOL = types.Tool(function_declarations=[
 
 
 def process_llm(audio_array):
+    global _current_transcript
     """
     LLM pipeline with streaming and Gemini function calling for timers:
       1. Normalize + encode audio
@@ -717,14 +924,15 @@ def process_llm(audio_array):
 
     with state_lock:
         assistant_state["processing"] = True
-
+        assistant_state["status"]     = "THINKING"
+    
+    send_uart_command("APP:THINKING")
     try:
         peak_amplitude = float(np.max(np.abs(audio_array)))
         if peak_amplitude < config.LLM_MIN_PEAK:
             logger.info(f"Recording discarded — silence (peak={peak_amplitude:.5f} < {config.LLM_MIN_PEAK})")
             return
 
-        send_uart_command("APP: THINKING")
         logger.info(f"LLM query: {len(audio_array)} samples, peak={peak_amplitude:.5f}")
 
         # Normalize audio
@@ -732,35 +940,55 @@ def process_llm(audio_array):
         if peak > 0.001:
             audio_array = (audio_array / peak) * 0.95
 
+        # Downsample 48kHz → 16kHz (take every 3rd sample) before encoding.
+        # Speech is bandlimited to ~8kHz so no perceptible loss; payload is 3× smaller
+        # which meaningfully reduces Gemini processing time.
+        audio_ds = audio_array[::3]
+        wav_rate = config.AUDIO_RATE // 3   # 16000
+
         # Encode to 16-bit PCM WAV in memory
-        audio_int16 = (audio_array * 32767).astype(np.int16)
+        audio_int16 = (audio_ds * 32767).astype(np.int16)
         wav_buf = io.BytesIO()
         with wave.open(wav_buf, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(config.AUDIO_RATE)
+            wf.setframerate(wav_rate)
             wf.writeframes(audio_int16.tobytes())
         wav_bytes = wav_buf.getvalue()
 
+        with _transcript_lock:
+            _current_transcript = "" # Clear for new turn
+        interaction_transcript = ""
+        
         context  = get_context()
         user_msg = (
-            "Listen to the audio and answer the spoken question or fulfill the spoken request. "
-            "Ignore background noises and clicks. "
-            "IMPORTANT: Always start your response with a clear transcription of what you heard in the audio in this exact format: [TRANSCRIPT]: \"user's spoken words\". "
-            "Then provide your actual answer on a new line. "
-            "You can answer any question directly using your knowledge and the context below. "
-            "Only call set_timer if the user explicitly asks to set or start a timer. "
-            f"Context: {context}"
+            f"Context: {context}\n\n"
+            "Respond to the audio."
         )
+
+
         # Log exactly what is being sent to the AI
         logger.info(f"LLM SYSTEM PROMPT: {config.LLM_SYSTEM_PROMPT}")
         logger.info(f"LLM USER MESSAGE: {user_msg}")
 
         audio_part = types.Part.from_bytes(data=wav_bytes, mime_type='audio/wav')
-        gen_cfg    = types.GenerateContentConfig(
-            system_instruction=config.LLM_SYSTEM_PROMPT,
-            tools=[_TIMER_TOOL],
-        )
+        
+        # Use Cached Content (Tier 1) if available, else use full instruction (Threshold-Aware)
+        cache_id = memory_manager.cache_id if memory_manager else None
+        full_instr = memory_manager.full_system_instruction if memory_manager else config.LLM_SYSTEM_PROMPT
+        
+        if cache_id:
+            logger.info(f"Using Context Cache: {cache_id}")
+            gen_cfg = types.GenerateContentConfig(
+                cached_content=cache_id,
+                tools=[_TIMER_TOOL],
+            )
+        else:
+            logger.info("Using Full System Instruction (No Cache)")
+            gen_cfg = types.GenerateContentConfig(
+                system_instruction=full_instr,
+                tools=[_TIMER_TOOL],
+            )
 
         # ── First streaming call: speak response, collect any function calls ───
         pending_timers = []
@@ -776,7 +1004,10 @@ def process_llm(audio_array):
             for chunk in stream1:
                 if not chunk.candidates:
                     continue
-                for part in chunk.candidates[0].content.parts:
+                candidate = chunk.candidates[0]
+                if not candidate.content or not candidate.content.parts:
+                    continue
+                for part in candidate.content.parts:
                     model_parts.append(part)
                     if hasattr(part, 'function_call') and part.function_call:
                         fc = part.function_call
@@ -785,7 +1016,14 @@ def process_llm(audio_array):
                     if getattr(part, 'text', None):
                         yield part.text
 
+        with state_lock:
+            assistant_state["status"] = "SPEAKING"
+        send_uart_command("APP:SPEAKING")
         _, first_text = _speak_text_iter(_first_iter())
+        
+        # Capture the transcript gathered by _speak_text_iter during the first stream
+        with _transcript_lock:
+            interaction_transcript = _current_transcript
 
         if _tts_abort.is_set():
             return  # user interrupted — skip follow-up call and timer setup
@@ -804,14 +1042,21 @@ def process_llm(audio_array):
                     types.Content(role="model", parts=model_parts),
                     types.Content(role="user", parts=fn_responses),
                 ],
-                config=types.GenerateContentConfig(system_instruction=config.LLM_SYSTEM_PROMPT),
+                config=types.GenerateContentConfig(
+                    cached_content=cache_id
+                ) if cache_id else types.GenerateContentConfig(
+                    system_instruction=full_instr
+                ),
             )
 
             def _follow_iter():
                 for chunk in stream2:
                     if not chunk.candidates:
                         continue
-                    for part in chunk.candidates[0].content.parts:
+                    candidate = chunk.candidates[0]
+                    if not candidate.content or not candidate.content.parts:
+                        continue
+                    for part in candidate.content.parts:
                         if getattr(part, 'text', None):
                             yield part.text
 
@@ -820,8 +1065,39 @@ def process_llm(audio_array):
             full_text = first_text
 
         if full_text:
-            logger.info(f"LLM answer: {full_text}")
-            send_uart_command(f"TXT|{full_text.replace(chr(10), ' ')}")
+            # Strip the [TRANSCRIPT] tag and any internal conversation headers from the UI text
+            display_text = _TRANS_PATTERN.sub('', full_text).strip()
+            
+            logger.info(f"LLM answer: {display_text}")
+            send_uart_command(f"TXT|{display_text.replace(chr(10), ' ')}")
+            
+            # ── 3. Storage: Commit to Memory ──────────────────────────────────────
+            # We add it as a structured fact: "User: <transcript> | AI: <answer>"
+            if _memory:
+                try:
+                    with _transcript_lock:
+                        final_trans = _current_transcript
+                    
+                    if final_trans:
+                        _memory.add(final_trans, user_id="primary_user")
+                        logger.info("Turn committed to long-term memory.")
+                    else:
+                        logger.warning("Could not store memory: Transcript was empty.")
+                except Exception as e:
+                    logger.warning(f"Memory storage failed: {e}")
+
+            # ── 5. Continuity: Start follow-up window ────────────────────────
+            if not is_exit_command(interaction_transcript) and not is_exit_command(display_text):
+                with state_lock:
+                    assistant_state["status"] = "CONTINUITY"
+                    assistant_state["continuity_until"] = time.time() + config.CONTINUITY_TIMEOUT
+                send_uart_command("APP:CONTINUITY")
+                logger.info(f"Transitioned to CONTINUITY state ({config.CONTINUITY_TIMEOUT}s window).")
+            else:
+                with state_lock:
+                    assistant_state["status"] = "IDLE"
+                send_uart_command("APP:ASSISTANT")
+                logger.info("Exit command detected. Returning to IDLE.")
 
         # Start timers after confirmation has been spoken
         for secs, label in pending_timers:
@@ -836,7 +1112,6 @@ def process_llm(audio_array):
             assistant_state["processing"] = False
             # Post-LLM cooldown so OWW doesn't re-trigger on speaker echo
             assistant_state["wakeword_cooldown_until"] = time.time() + config.WAKEWORD_POST_LLM_COOLDOWN
-        send_uart_command("APP: ASSISTANT")
 
 # ─── Speaker Init ─────────────────────────────────────────────────────────────
 
@@ -1032,11 +1307,13 @@ def audio_processor():
             # Normalize 32-bit → float64 ±1.0
             norm_samples = ch_right.astype(np.float64) / 2147483648.0
 
-            # Maintain ~1.5s pre-roll buffer — store numpy chunks to avoid O(n) list copies
+            # Maintain ~0.5s pre-roll buffer — captures tail of wake word and any
+            # speech that overlaps OWW detection latency. 1.5s was wasteful since
+            # "Hey Robot" is ~0.5s; the excess was just room noise sent to Gemini.
             if not recording:
                 pre_record_buffer.append(norm_samples)
                 pre_roll_len += len(norm_samples)
-                while pre_roll_len > 71680:
+                while pre_roll_len > 24000:
                     pre_roll_len -= len(pre_record_buffer.popleft())
 
             # ── Recording + VAD ──
@@ -1079,78 +1356,122 @@ def audio_processor():
                     vad_speech_frames  = 0
                     vad_silence_frames = 0
                     vad_frame_buf      = np.array([], dtype=np.int16)
+                    
+                    # Record interaction in MemoryManager (Tier 3)
+                    if memory_manager:
+                        # We don't have the text yet, process_llm will call add_interaction later
+                        pass
+
                     threading.Thread(target=process_llm, args=(audio_array,), daemon=True).start()
                     last_wakeword_time = time.time()
 
-            # ── Wake Word Detection ──
-            elif oww_model:
+            # ── Wake Word Detection / Continuity Bypass ──
+            else:
                 with state_lock:
+                    status            = assistant_state.get("status", "IDLE")
                     is_processing      = assistant_state.get("processing", False)
                     cooldown_until     = assistant_state.get("wakeword_cooldown_until", 0)
+                    tts_started_at     = assistant_state.get("tts_started_at", 0)
+                    continuity_until   = assistant_state.get("continuity_until", 0)
 
-                is_speaking    = _tts_active.is_set()
-                is_thinking    = is_processing and not is_speaking  # LLM still generating
+                # Check Continuity Timeout
+                if status == "CONTINUITY" and time.time() > continuity_until:
+                    with state_lock:
+                        assistant_state["status"] = "IDLE"
+                    send_uart_command("APP:ASSISTANT")
+                    logger.info("Continuity window expired. Returning to IDLE.")
+                    status = "IDLE"
 
+                is_speaking      = _tts_active.is_set()
+                is_thinking      = is_processing and not is_speaking
+                
                 in_cooldown = (
-                    is_thinking   # can't interrupt while thinking, only while speaking
-                    or (not is_processing and time.time() - last_wakeword_time <= 3.0)
+                    is_thinking
+                    or is_speaking
+                    or (not is_processing and time.time() - last_wakeword_time <= 2.0)
                     or (not is_processing and time.time() < cooldown_until)
                 )
+
                 if in_cooldown:
-                    # Drain OWW buffer so stale audio can't re-trigger after cooldown
                     oww_buffer = np.array([], dtype=np.int16)
-                    if is_thinking:
-                        time.sleep(0.01)
+                    time.sleep(0.01)
                     continue
 
-                # Downsample 48kHz → 16kHz, 32-bit → 16-bit for OWW
+                # Prepare audio for VAD/OWW
                 ch_right_16k = ch_right[::3]
-                oww_audio    = np.right_shift(ch_right_16k, 16).astype(np.int16)
-                oww_buffer  = np.concatenate((oww_buffer, oww_audio))
+                audio_16k    = np.right_shift(ch_right_16k, 16).astype(np.int16)
 
-                if len(oww_buffer) >= 1280:
-                    chunk_oww = oww_buffer[:1280]
-                    oww_buffer = oww_buffer[1280:]
-
-                    # AEC: cancel speaker echo when TTS is playing
-                    if aec and is_speaking and _aec_ref_buf is not None:
-                        cleaned = []
-                        for i in range(0, 1280, config.AEC_FRAME):
-                            mic_f = chunk_oww[i:i + config.AEC_FRAME].tobytes()
-                            with _aec_ref_lock:
-                                n = min(config.AEC_FRAME, len(_aec_ref_buf))
-                                if n == config.AEC_FRAME:
-                                    ref_arr = np.array(
-                                        [_aec_ref_buf.popleft() for _ in range(config.AEC_FRAME)],
-                                        dtype=np.int16)
-                                else:
-                                    ref_arr = np.zeros(config.AEC_FRAME, dtype=np.int16)
-                            cleaned.extend(np.frombuffer(aec.process(mic_f, ref_arr.tobytes()), dtype=np.int16))
-                        chunk_oww = np.array(cleaned, dtype=np.int16)
-
-                    prediction = oww_model.predict(chunk_oww)
-
-                    ww_threshold = config.WAKEWORD_THRESHOLD_BARGE_IN if is_speaking else config.WAKEWORD_THRESHOLD
-                    for mdl, score in prediction.items():
-                        if score >= ww_threshold:
-                            logger.info(f"WAKE WORD: {mdl} ({score:.3f}, threshold={ww_threshold})")
-                            if is_speaking:
-                                interrupt_tts()
-                            send_uart_command(f"WAKE|{mdl}")
-                            send_uart_command("EMO:ALERT")
-                            last_wakeword_time = time.time()
-
+                # ── CONTINUITY MODE: Bypass Wake Word ──
+                if status == "CONTINUITY" and vad:
+                    try:
+                        vad.set_mode(3) # Restrictive mode to ignore background noise
+                    except: pass
+                    
+                    vad_frame_buf = np.concatenate([vad_frame_buf, audio_16k])
+                    if len(vad_frame_buf) >= VAD_FRAME_SAMPLES:
+                        frame = vad_frame_buf[:VAD_FRAME_SAMPLES]
+                        vad_frame_buf = vad_frame_buf[VAD_FRAME_SAMPLES:]
+                        if vad.is_speech(frame.tobytes(), 16000):
+                            logger.info("CONTINUITY: Speech detected via VAD (Sensitive Mode 1). Bypassing wake word.")
+                            with state_lock:
+                                assistant_state["status"] = "LISTENING"
                             recording          = True
                             recording_end_time = time.time() + config.LLM_RECORD_SECONDS
                             query_buffer       = list(np.concatenate(list(pre_record_buffer)) if pre_record_buffer else [])
-                            vad_speech_frames  = 0
+                            vad_speech_frames  = 1 # Start with 1 to indicate speech found
                             vad_silence_frames = 0
                             vad_frame_buf      = np.array([], dtype=np.int16)
-                            oww_buffer         = np.array([], dtype=np.int16)
-                            if hasattr(oww_model, 'reset'):
-                                oww_model.reset()
-                            logger.info(f"Recording started (max {config.LLM_RECORD_SECONDS}s, VAD={'on' if vad else 'off'})")
-                            break
+                            continue
+
+                # ── IDLE MODE: Standard Wake Word Detection ──
+                if oww_model and status == "IDLE":
+                    if vad:
+                        try:
+                            vad.set_mode(config.VAD_AGGRESSIVENESS) # Restore Level 3
+                        except: pass
+                    
+                    oww_buffer  = np.concatenate((oww_buffer, audio_16k))
+                    if len(oww_buffer) >= 1280:
+                        chunk_oww = oww_buffer[:1280]
+                        oww_buffer = oww_buffer[1280:]
+                        
+                        if aec and is_speaking and _aec_ref_buf is not None:
+                            cleaned = []
+                            for i in range(0, 1280, config.AEC_FRAME):
+                                mic_f = chunk_oww[i:i + config.AEC_FRAME].tobytes()
+                                with _aec_ref_lock:
+                                    n = min(config.AEC_FRAME, len(_aec_ref_buf))
+                                    if n == config.AEC_FRAME:
+                                        ref_arr = np.array(
+                                            [_aec_ref_buf.popleft() for _ in range(config.AEC_FRAME)],
+                                            dtype=np.int16)
+                                    else:
+                                        ref_arr = np.zeros(config.AEC_FRAME, dtype=np.int16)
+                                cleaned.extend(np.frombuffer(aec.process(mic_f, ref_arr.tobytes()), dtype=np.int16))
+                            chunk_oww = np.array(cleaned, dtype=np.int16)
+                        
+                        prediction = oww_model.predict(chunk_oww)
+                        ww_threshold = config.WAKEWORD_THRESHOLD_BARGE_IN if is_speaking else config.WAKEWORD_THRESHOLD
+                        for mdl, score in prediction.items():
+                            if score >= ww_threshold:
+                                logger.info(f"WAKE WORD: {mdl} ({score:.3f})")
+                                if is_speaking: interrupt_tts()
+                                send_uart_command(f"WAKE|{mdl}")
+                                send_uart_command("EMO:ALERT")
+                                with state_lock:
+                                    assistant_state["status"] = "LISTENING"
+                                
+                                last_wakeword_time = time.time()
+                                recording          = True
+                                recording_end_time = time.time() + config.LLM_RECORD_SECONDS
+                                query_buffer       = list(np.concatenate(list(pre_record_buffer)) if pre_record_buffer else [])
+                                vad_speech_frames  = 0
+                                vad_silence_frames = 0
+                                vad_frame_buf      = np.array([], dtype=np.int16)
+                                oww_buffer         = np.array([], dtype=np.int16)
+                                if hasattr(oww_model, 'reset'): oww_model.reset()
+                                logger.info(f"Recording started (via WAKE WORD)")
+                                break
 
             # ── Spectrum + Intensity for Orb ──
             rms_left = np.sqrt(np.mean(norm_samples ** 2)) * 100.0
