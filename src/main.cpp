@@ -41,15 +41,18 @@
 #include "AssistantView.h"
 #include "SettingsView.h"
 #include "DiagnosticsView.h"
+#include "GlobeView.h"
 #include <time.h>
 #include <ArduinoOTA.h>
 
 
 #include <lvgl.h>
 
-static ProjectSettings settings;
+ProjectSettings settings;
+bool pi_connected = false;
+uint32_t last_pi_msg_ms = 0;
 
-enum AppState { APP_RADAR, APP_ASSISTANT, APP_CLOCK, APP_SETTINGS, APP_DIAGNOSTICS };
+enum AppState { APP_RADAR, APP_ASSISTANT, APP_CLOCK, APP_GLOBE, APP_SETTINGS, APP_DIAGNOSTICS };
 static AppState current_app = APP_RADAR;
 static AppState prev_app    = APP_RADAR;   // where to return after settings
 static Arduino_Canvas *assistant_canvas = nullptr;
@@ -138,28 +141,11 @@ bool read_touch() {
 
 #define MAX_AIRCRAFT 64
 
-struct Aircraft {
-    // Data from ADS-B
-    char    hex[8], callsign[10];
-    float   lat, lon;
-    int     altitude, speed, heading;
-    bool    has_pos;
-    uint32_t seen_ms;
-    bool    position_updated; // true if updated since last sweep
-    bool    is_dimmed;        // true if currently in dimmed state
-    // Derived
-    float   bearing;      // 0=N clockwise
-    // Paint state (Core 1 only)
-    int     paint_x, paint_y, paint_hdg;
-    char    paint_cs[10];
-    bool    paint_valid;
-};
-
-static Aircraft aircraft[MAX_AIRCRAFT];
-static int      aircraft_count = 0;
+Aircraft aircraft[MAX_AIRCRAFT];
+int      aircraft_count = 0;
 
 // Mutex protecting aircraft[] and aircraft_count
-static SemaphoreHandle_t ac_mutex;
+SemaphoreHandle_t ac_mutex;
 
 // ─── Gesture Detection ───────────────────────────────────────────────────────
 #define GESTURE_THRESHOLD 50
@@ -192,6 +178,9 @@ void notify_pi_app_mode(AppState mode) {
     if (mode == APP_ASSISTANT) modeStr = "ASSISTANT";
     else if (mode == APP_CLOCK) modeStr = "CLOCK";
     else if (mode == APP_RADAR) modeStr = "RADAR";
+    else if (mode == APP_GLOBE) modeStr = "GLOBE";
+    else if (mode == APP_SETTINGS) modeStr = "SETTINGS";
+    else if (mode == APP_DIAGNOSTICS) modeStr = "DIAGNOSTICS";
     
     String msg = "APP:" + modeStr;
     Serial0.println(msg);                          // Hardware UART0 → Pi
@@ -289,12 +278,15 @@ void process_swipe(int x1, int y1, int x2, int y2) {
     // Horizontal Swipes (App Navigation Placeholder)
     else {
         if (dx < -GESTURE_THRESHOLD) {
-            Serial.println("Gesture: SWIPE LEFT (Radar -> Assistant -> Clock)");
+            Serial.println("Gesture: SWIPE LEFT (Radar -> Globe -> Assistant -> Clock)");
             if (current_app == APP_RADAR) {
+                current_app = APP_GLOBE;
+                notify_pi_app_mode(current_app);
+                GlobeView::show();
+            } else if (current_app == APP_GLOBE) {
                 current_app = APP_ASSISTANT;
                 AssistantView::show();
                 notify_pi_app_mode(current_app);
-                full_redraw();
             } else if (current_app == APP_ASSISTANT) {
                 current_app = APP_CLOCK;
                 notify_pi_app_mode(current_app);
@@ -302,7 +294,7 @@ void process_swipe(int x1, int y1, int x2, int y2) {
                 ClockView::show();
             }
         } else if (dx > GESTURE_THRESHOLD) {
-            Serial.println("Gesture: SWIPE RIGHT (Clock -> Assistant -> Radar)");
+            Serial.println("Gesture: SWIPE RIGHT (Clock -> Assistant -> Globe -> Radar)");
             if (current_app == APP_CLOCK) {
                 lvgl_active = false;  // Stop LVGL from flushing over radar
                 current_app = APP_ASSISTANT;
@@ -312,8 +304,11 @@ void process_swipe(int x1, int y1, int x2, int y2) {
                 lv_obj_t *blank = lv_obj_create(NULL);
                 lv_obj_set_style_bg_color(blank, lv_color_black(), 0);
                 lv_scr_load(blank);
-                full_redraw();
             } else if (current_app == APP_ASSISTANT) {
+                current_app = APP_GLOBE;
+                notify_pi_app_mode(current_app);
+                GlobeView::show();
+            } else if (current_app == APP_GLOBE) {
                 current_app = APP_RADAR;
                 notify_pi_app_mode(current_app);
                 full_redraw();
@@ -376,12 +371,14 @@ void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *c
         uint32_t w = (area->x2 - area->x1 + 1);
         uint32_t h = (area->y2 - area->y1 + 1);
         
-        // Wait for VSYNC signal before drawing to prevent "cut" tearing lines on the screen
+        // Wait for VSYNC immediately before writing to the display to prevent tearing.
+        // This ensures the render time of lv_timer_handler doesn't push the DMA write
+        // into the middle of the display's active scanout.
         if (vsync_sem) {
+            xSemaphoreTake(vsync_sem, 0); // Drain stale token
             xSemaphoreTake(vsync_sem, portMAX_DELAY);
         }
         
-        // Copy LVGL's PSRAM buffer to the Arduino_GFX PSRAM buffer exactly after VSYNC
         gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
     }
     lv_disp_flush_ready(disp_drv);
@@ -723,7 +720,7 @@ static void draw_radar_timer_ring() {
         for (float a = start_rad; a <= start_rad + FULL; a += STEP) {
             float cs = cosf(a), sn = sinf(a);
             for (int tt = 0; tt < 10; tt++)
-                gfx->drawPixel(CX + (int)((240 - tt) * cs), CY + (int)((240 - tt) * sn), C_BG);
+                gfx->drawPixel(CX + (int)((238 - tt) * cs), CY + (int)((238 - tt) * sn), C_BG);
         }
         return;
     }
@@ -750,7 +747,7 @@ static void draw_radar_timer_ring() {
         uint16_t px_col = (a <= end_rad) ? col : C_BG;
         float cs = cosf(a), sn = sinf(a);
         for (int tt = 0; tt < 10; tt++)
-            gfx->drawPixel(CX + (int)((240 - tt) * cs), CY + (int)((240 - tt) * sn), px_col);
+            gfx->drawPixel(CX + (int)((238 - tt) * cs), CY + (int)((238 - tt) * sn), px_col);
     }
 }
 
@@ -782,16 +779,40 @@ void setup() {
     vsync_sem = xSemaphoreCreateBinary();
 
     gfx = create_waveshare_28C_rgb_panel();
-    gfx->begin();
+    bool gfx_ok = gfx->begin();
+    Serial.printf("gfx->begin() = %s\n", gfx_ok ? "OK" : "FAILED");
+
+    // If display init failed, halt here rather than crashing in VSYNC registration
+    if (!gfx_ok) {
+        Serial.println("FATAL: gfx begin failed — halting");
+        for (;;) delay(1000);
+    }
+
+#ifdef DISPLAY_TEST_MODE
+    // Bare-bones diagnostic: direct draw, no WiFi/canvas/LVGL/tasks.
+    // If flicker is still visible here, the cause is hardware or display timing.
+    gfx->fillScreen(0x0000);
+    gfx->setTextColor(0xFFFF, 0x0000);
+    gfx->setTextSize(3);
+    gfx->setCursor(60, 160); gfx->print("DISPLAY TEST");
+    gfx->setTextSize(2);
+    gfx->setCursor(60, 210); gfx->print("No WiFi");
+    gfx->setCursor(60, 235); gfx->print("No canvas");
+    gfx->setCursor(60, 260); gfx->print("No LVGL");
+    gfx->setCursor(60, 285); gfx->print("Direct GFX only");
+    for (;;) delay(100);
+#endif
 
     // ─── VSYNC Callback Registration Hack ───
     // Arduino_GFX abstracts the ESP32-S3 RGB LCD driver, keeping `_panel_handle`
     // inaccessible. We redefine private to public in the header to access the handle
     // and manually register the VSYNC interrupt that LVGL depends on.
+    Serial.println("Registering VSYNC callback...");
     esp_lcd_rgb_panel_event_callbacks_t cbs = {
         .on_vsync = example_lvgl_on_vsync_callback,
     };
     esp_lcd_rgb_panel_register_event_callbacks(gfx->_rgbpanel->_panel_handle, &cbs, NULL);
+    Serial.println("VSYNC registered OK");
 
     touch_init();
 
@@ -874,10 +895,13 @@ void setup() {
         assistant_canvas = nullptr;
     }
     AssistantView::set_canvas(assistant_canvas);
+    AssistantView::set_gfx(gfx);
+    AssistantView::set_vsync_sem(vsync_sem);
     AssistantView::init();
 
     // Settings view shares the same canvas (never active simultaneously)
     SettingsView::set_canvas(assistant_canvas);
+    SettingsView::set_gfx(gfx);
     SettingsView::set_vsync_sem(vsync_sem);
     SettingsView::init(settings.volume);
 
@@ -886,17 +910,13 @@ void setup() {
 
 
     lv_init();
-    
-    // Allocate two full-screen buffers in PSRAM for double buffering. 
-    // This allows LVGL to draw into one buffer entirely while the LCD 
-    // peripheral is safely streaming from the other, thus avoiding tearing.
+    // Full-screen PSRAM double buffers. Must use MALLOC_CAP_SPIRAM — internal SRAM
+    // is exhausted by the 115KB DMA bounce buffer and FreeRTOS stacks.
     size_t buf_size = SCREEN_WIDTH * SCREEN_HEIGHT;
     lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(buf_size * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
     lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(buf_size * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
-    
     if (!buf1 || !buf2) {
-        Serial.println("LVGL double buffer PSRAM allocation failed! Falling back to SRAM single buffer...");
-        // Fallback to smaller single buffer in SRAM if PSRAM fails
+        Serial.println("LVGL PSRAM buffer alloc failed, falling back to 40-row SRAM");
         buf_size = SCREEN_WIDTH * 40;
         buf1 = (lv_color_t *)malloc(buf_size * sizeof(lv_color_t));
         buf2 = NULL;
@@ -908,8 +928,8 @@ void setup() {
     disp_drv.ver_res = SCREEN_HEIGHT;
     disp_drv.flush_cb = my_disp_flush;
     disp_drv.draw_buf = &draw_buf;
-    disp_drv.full_refresh = 1;      // Fix tearing issue with ESP32 DMA
-    disp_drv.antialiasing = 1;      // Smooth out the second hand
+    disp_drv.full_refresh = 1;      // Re-enabled: Fix tearing issue with ESP32 DMA
+    disp_drv.antialiasing = 1;
     lv_disp_drv_register(&disp_drv);
 
     static lv_indev_drv_t indev_drv;
@@ -919,6 +939,7 @@ void setup() {
     lv_indev_drv_register(&indev_drv);
 
     ClockView::init();
+    GlobeView::init();
 
     notify_pi_app_mode(current_app);
 }
@@ -933,6 +954,7 @@ void loop() {
     static bool long_press_fired  = false;
     static bool gesture_consumed  = false;
     static bool arc_dragging      = false;
+    static bool touch_has_moved   = false;
     #define LONG_PRESS_MS 800
 
     if (is_new_tap) {
@@ -941,6 +963,7 @@ void loop() {
         last_touch_time  = now;
         long_press_fired = false;
         gesture_consumed = false;
+        touch_has_moved  = false;
 
         // Arc drag: starts if finger lands on the arc ring zone
         if (current_app == APP_SETTINGS) {
@@ -962,6 +985,13 @@ void loop() {
         } else {
             arc_dragging = false;
         }
+    }
+
+    // ── Track movement to prevent accidental long-presses ─────────────────────
+    if (touch_active && !touch_has_moved) {
+        int dx = abs(touch_x - touch_start_x);
+        int dy = abs(touch_y - touch_start_y);
+        if (dx + dy > TAP_THRESHOLD) touch_has_moved = true;
     }
 
     // ── Live arc drag: update volume as finger moves along the ring ───────────
@@ -987,8 +1017,15 @@ void loop() {
         arc_dragging = false;
     }
 
+    static int prev_touch_y = 0;
+    // ── Live globe drag: update globe tilt ───────────
+    if (touch_active && current_app == APP_GLOBE && !is_new_tap) {
+        float delta_tilt = (touch_y - prev_touch_y) * 0.008f;
+        GlobeView::add_tilt(delta_tilt);
+    }
+
     // ── Long-press detection (800ms still hold — only outside arc zone) ───────
-    if (touch_active && !long_press_fired && !arc_dragging) {
+    if (touch_active && !long_press_fired && !arc_dragging && !touch_has_moved) {
         int hold_dx = abs(touch_x - touch_start_x);
         int hold_dy = abs(touch_y - touch_start_y);
         if ((hold_dx + hold_dy) < TAP_THRESHOLD && (now - last_touch_time) >= LONG_PRESS_MS) {
@@ -1016,6 +1053,7 @@ void loop() {
     }
 
     last_was_touching = touch_active;
+    if (touch_active) prev_touch_y = touch_y;
 
     // ─── Serial0 Heartbeat (troubleshooting only) ─────────────────────────────
     static unsigned long last_hb_ms = 0;
@@ -1023,6 +1061,10 @@ void loop() {
         Serial0.println("HB:OK");
         Serial.println("[UART→Pi] HB:OK");
         last_hb_ms = now;
+    }
+
+    if (now - last_pi_msg_ms > 15000) {
+        pi_connected = false;
     }
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1074,151 +1116,174 @@ void loop() {
             last_timer_arc_ms = now;
         }
         ClockView::update_time();
+        // VSYNC waiting is now handled inside my_disp_flush to ensure it happens
+        // immediately before the DMA transfer, not before the rendering.
         lv_timer_handler();
-    } else if (current_app == APP_SETTINGS) {
-        // Fully event-driven — redraws happen on entry and during/after arc drag only.
-    } else if (current_app == APP_DIAGNOSTICS) {
+    } else if (current_app == APP_GLOBE) {
+        GlobeView::update();
+    } else if (current_app == APP_SETTINGS || current_app == APP_DIAGNOSTICS) {
         static uint32_t last_diag_req = 0;
         if (now - last_diag_req > 200) { // 5Hz requests
             Serial0.println("DIAG?");
             last_diag_req = now;
         }
-        DiagnosticsView::update();
+        if (current_app == APP_DIAGNOSTICS) {
+            DiagnosticsView::update();
+        }
     }
 
     // ─── UART Remote Control (Pi Brains) ───
-    Stream* inputs[] = {&Serial, &Serial0};
-    for (Stream* s : inputs) {
-        while (s->available()) {
-            String rx = s->readStringUntil('\n');
-            rx.trim();
-            if (rx.length() == 0) continue;
+    static String rx_buf_usb = "";
+    static String rx_buf_uart = "";
 
-            if (rx == "SYNC?") {
-                notify_pi_settings();
-                notify_pi_app_mode(current_app);
-            } else if (rx == "DIAG") {
-                current_app = APP_DIAGNOSTICS;
-                DiagnosticsView::init();
-                Serial.println("Force Switching to DIAGNOSTICS");
-            } else if (rx == "Z+") {
-                range_nm = max((float)MIN_RANGE_NM, range_nm / 1.15f);
-                Serial.printf("Remote Zoom IN: %.1f nm\n", range_nm);
-                full_redraw();
-            } else if (rx == "Z-") {
-                range_nm = min((float)MAX_RANGE_NM, range_nm * 1.15f);
-                Serial.printf("Remote Zoom OUT: %.1f nm\n", range_nm);
-                full_redraw();
-            } else if (rx.startsWith("TIMER:START:")) {
-                // Format: TIMER:START:<seconds>:<label>
-                String rest = rx.substring(12);
-                int colon = rest.indexOf(':');
-                uint32_t secs;
-                String lbl;
-                if (colon != -1) {
-                    secs = (uint32_t)rest.substring(0, colon).toInt();
-                    lbl  = rest.substring(colon + 1);
-                } else {
-                    secs = (uint32_t)rest.toInt();
-                    lbl  = "";
-                }
-                AssistantView::start_timer(secs, lbl);
-            } else if (rx == "TIMER:CANCEL") {
-                AssistantView::clear_timer();
-            } else if (rx.startsWith("WAKE|")) {
-                // Switch to assistant view from any screen
-                if (current_app != APP_ASSISTANT) {
-                    if (current_app == APP_CLOCK) {
-                        lvgl_active = false;
-                        lv_obj_t *blank = lv_obj_create(NULL);
-                        lv_obj_set_style_bg_color(blank, lv_color_black(), 0);
-                        lv_scr_load(blank);
-                    }
-                    current_app = APP_ASSISTANT;
-                    AssistantView::show();
-                    notify_pi_app_mode(current_app);
-                    full_redraw();
-                }
-                AssistantView::set_state(AssistantView::STATE_LISTENING);
-            } else if (rx.startsWith("APP:")) {
-                String cmd = rx.substring(4);
-                cmd.trim();
-                if (cmd == "THINKING") AssistantView::set_state(AssistantView::STATE_THINKING);
-                else if (cmd == "SPEAKING") AssistantView::set_state(AssistantView::STATE_SPEAKING);
-                else if (cmd == "CONTINUITY") AssistantView::set_state(AssistantView::STATE_CONTINUITY);
-                else if (cmd == "ASSISTANT") AssistantView::set_state(AssistantView::STATE_IDLE);
-            } else if (rx.startsWith("EMO:")) {
-                String emo = rx.substring(4);
-                emo.trim();
-                if (emo == "NEUTRAL")       AssistantView::set_emotion(AssistantView::EMO_NEUTRAL);
-                else if (emo == "HAPPY")    AssistantView::set_emotion(AssistantView::EMO_HAPPY);
-                else if (emo == "SARDONIC") AssistantView::set_emotion(AssistantView::EMO_SARDONIC);
-                else if (emo == "ALERT")    AssistantView::set_emotion(AssistantView::EMO_ALERT);
-                else if (emo == "WINK")     AssistantView::set_emotion(AssistantView::EMO_WINK);
-            } else if (rx.startsWith("VMODE:")) {
-                String mode = rx.substring(6);
-                mode.trim();
-                if (mode == "IRIS")      AssistantView::set_style(AssistantView::STYLE_IRIS);
-                else if (mode == "FACE") AssistantView::set_style(AssistantView::STYLE_FACE);
-            } else if (rx.startsWith("A")) {
-                int intensity = rx.substring(1).toInt();
-                AssistantView::set_audio_intensity(intensity);
-            } else if (rx.startsWith("S")) {
-                // Parse combined spectrum and intensity: S20,45,0,3...|A100
-                int pipe_idx = rx.indexOf('|');
-                String s_data;
-                String a_data = "";
-                if (pipe_idx != -1) {
-                    s_data = rx.substring(1, pipe_idx);
-                    a_data = rx.substring(pipe_idx + 1);
-                } else {
-                    s_data = rx.substring(1);
-                }
-
-                // Parse Spectrum Bins
-                int bins[16];
-                int bin_idx = 0;
-                int start_idx = 0;
-                while (bin_idx < 16 && start_idx < s_data.length()) {
-                    int next_comma = s_data.indexOf(',', start_idx);
-                    if (next_comma == -1) {
-                        bins[bin_idx++] = s_data.substring(start_idx).toInt();
-                        break;
-                    }
-                    bins[bin_idx++] = s_data.substring(start_idx, next_comma).toInt();
-                    start_idx = next_comma + 1;
-                }
-                AssistantView::set_spectrum(bins, bin_idx);
-
-                // Parse Intensity if present
-                if (a_data.startsWith("A")) {
-                    int intensity = a_data.substring(1).toInt();
-                    AssistantView::set_audio_intensity(intensity);
-                    DiagnosticsView::set_mic_intensity(intensity);
-                }
-            } else if (rx.startsWith("DIAG:")) {
-                // Parse DIAG:mic=23,ww=LOADED,pi=OK,rssi=-54,wake=10:21AM
-                String data = rx.substring(5);
-                int start = 0;
-                while (start < data.length()) {
-                    int comma = data.indexOf(',', start);
-                    String kv = (comma == -1) ? data.substring(start) : data.substring(start, comma);
-                    int eq = kv.indexOf('=');
-                    if (eq != -1) {
-                        String k = kv.substring(0, eq);
-                        String v = kv.substring(eq + 1);
-                        if (k == "mic") DiagnosticsView::set_mic_intensity(v.toInt());
-                        else if (k == "ww") DiagnosticsView::set_oww_status(v.c_str());
-                        else if (k == "pi") DiagnosticsView::set_pi_status(v.c_str());
-                        else if (k == "rssi") DiagnosticsView::set_wifi_rssi(v.toInt());
-                        else if (k == "wake") DiagnosticsView::set_last_wake(v.c_str());
-                    }
-                    if (comma == -1) break;
-                    start = comma + 1;
-                }
+    auto handle_cmd = [&](String rx) {
+        rx.trim();
+        if (rx.length() == 0) return;
+        if (!pi_connected) {
+            pi_connected = true;
+            if (strlen(settings.wifi_ssid) > 0) {
+                Serial0.printf("WIFI:%s|%s\n", settings.wifi_ssid, settings.wifi_password);
             }
         }
+        last_pi_msg_ms = millis();
+        if (rx == "HB:ACK") {
+            return;
+        } else if (rx == "SYNC?") {
+
+
+            notify_pi_settings();
+            notify_pi_app_mode(current_app);
+        } else if (rx == "DIAG") {
+            current_app = APP_DIAGNOSTICS;
+            DiagnosticsView::init();
+            Serial.println("Force Switching to DIAGNOSTICS");
+        } else if (rx == "Z+") {
+            range_nm = max((float)MIN_RANGE_NM, range_nm / 1.15f);
+            Serial.printf("Remote Zoom IN: %.1f nm\n", range_nm);
+            full_redraw();
+        } else if (rx == "Z-") {
+            range_nm = min((float)MAX_RANGE_NM, range_nm * 1.15f);
+            Serial.printf("Remote Zoom OUT: %.1f nm\n", range_nm);
+            full_redraw();
+        } else if (rx.startsWith("TIMER:START:")) {
+            String rest = rx.substring(12);
+            int colon = rest.indexOf(':');
+            uint32_t secs;
+            String lbl;
+            if (colon != -1) {
+                secs = (uint32_t)rest.substring(0, colon).toInt();
+                lbl  = rest.substring(colon + 1);
+            } else {
+                secs = (uint32_t)rest.toInt();
+                lbl  = "";
+            }
+            AssistantView::start_timer(secs, lbl);
+        } else if (rx == "TIMER:CANCEL") {
+            AssistantView::clear_timer();
+        } else if (rx.startsWith("WAKE|")) {
+            if (current_app != APP_ASSISTANT) {
+                if (current_app == APP_CLOCK) {
+                    lvgl_active = false;
+                    lv_obj_t *blank = lv_obj_create(NULL);
+                    lv_obj_set_style_bg_color(blank, lv_color_black(), 0);
+                    lv_scr_load(blank);
+                }
+                current_app = APP_ASSISTANT;
+                AssistantView::show();
+                notify_pi_app_mode(current_app);
+            }
+            AssistantView::set_state(AssistantView::STATE_LISTENING);
+        } else if (rx.startsWith("APP:")) {
+            String cmd = rx.substring(4);
+            cmd.trim();
+            if (cmd == "THINKING") AssistantView::set_state(AssistantView::STATE_THINKING);
+            else if (cmd == "SPEAKING") AssistantView::set_state(AssistantView::STATE_SPEAKING);
+            else if (cmd == "CONTINUITY") AssistantView::set_state(AssistantView::STATE_CONTINUITY);
+            else if (cmd == "ASSISTANT") AssistantView::set_state(AssistantView::STATE_IDLE);
+        } else if (rx.startsWith("EMO:")) {
+            String emo = rx.substring(4);
+            emo.trim();
+            if (emo == "NEUTRAL")       AssistantView::set_emotion(AssistantView::EMO_NEUTRAL);
+            else if (emo == "HAPPY")    AssistantView::set_emotion(AssistantView::EMO_HAPPY);
+            else if (emo == "SARDONIC") AssistantView::set_emotion(AssistantView::EMO_SARDONIC);
+            else if (emo == "ALERT")    AssistantView::set_emotion(AssistantView::EMO_ALERT);
+            else if (emo == "WINK")     AssistantView::set_emotion(AssistantView::EMO_WINK);
+        } else if (rx.startsWith("VMODE:")) {
+            String mode = rx.substring(6);
+            mode.trim();
+            if (mode == "IRIS")      AssistantView::set_style(AssistantView::STYLE_IRIS);
+            else if (mode == "FACE") AssistantView::set_style(AssistantView::STYLE_FACE);
+        } else if (rx.startsWith("A")) {
+            int intensity = rx.substring(1).toInt();
+            AssistantView::set_audio_intensity(intensity);
+        } else if (rx.startsWith("S")) {
+            int pipe_idx = rx.indexOf('|');
+            String s_data;
+            String a_data = "";
+            if (pipe_idx != -1) {
+                s_data = rx.substring(1, pipe_idx);
+                a_data = rx.substring(pipe_idx + 1);
+            } else {
+                s_data = rx.substring(1);
+            }
+            int bins[16];
+            int bin_idx = 0;
+            int start_idx = 0;
+            while (bin_idx < 16 && start_idx < s_data.length()) {
+                int next_comma = s_data.indexOf(',', start_idx);
+                if (next_comma == -1) {
+                    bins[bin_idx++] = s_data.substring(start_idx).toInt();
+                    break;
+                }
+                bins[bin_idx++] = s_data.substring(start_idx, next_comma).toInt();
+                start_idx = next_comma + 1;
+            }
+            AssistantView::set_spectrum(bins, bin_idx);
+            if (a_data.startsWith("A")) {
+                int intensity = a_data.substring(1).toInt();
+                AssistantView::set_audio_intensity(intensity);
+                DiagnosticsView::set_mic_intensity(intensity);
+            }
+        } else if (rx.startsWith("DIAG:")) {
+            String data = rx.substring(5);
+            int start = 0;
+            while (start < data.length()) {
+                int comma = data.indexOf(',', start);
+                String kv = (comma == -1) ? data.substring(start) : data.substring(start, comma);
+                int eq = kv.indexOf('=');
+                if (eq != -1) {
+                    String k = kv.substring(0, eq);
+                    String v = kv.substring(eq + 1);
+                    if (k == "mic") DiagnosticsView::set_mic_intensity(v.toInt());
+                    else if (k == "ww") DiagnosticsView::set_oww_status(v.c_str());
+                    else if (k == "pi") DiagnosticsView::set_pi_status(v.c_str());
+                    else if (k == "rssi") {
+                        DiagnosticsView::set_wifi_rssi(v.toInt());
+                        SettingsView::set_pi_rssi(v.toInt());
+                    }
+                    else if (k == "wake") DiagnosticsView::set_last_wake(v.c_str());
+                }
+                if (comma == -1) break;
+                start = comma + 1;
+            }
+        } else if (rx.startsWith("SLEEP:")) {
+            int mode = rx.substring(6).toInt();
+            // Bypassing AssistantView::set_state to prevent task deadlock during animation
+            set_display_power(mode == 0); // 1 = Sleep (Off), 0 = Wake (On)
+        }
+    };
+
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n') { handle_cmd(rx_buf_usb); rx_buf_usb = ""; }
+        else if (c != '\r') rx_buf_usb += c;
     }
+    while (Serial0.available()) {
+        char c = Serial0.read();
+        if (c == '\n') { handle_cmd(rx_buf_uart); rx_buf_uart = ""; }
+        else if (c != '\r') rx_buf_uart += c;
+    }
+
     
     ArduinoOTA.handle();
 

@@ -47,9 +47,6 @@ bool Touch_GT911::read() {
     if (touch_cnt > 0) {
         uint8_t buf[40]; // 5 touches * 8 bytes each
         if (readRegisterData(GT911_READ_XY_REG + 1, buf, touch_cnt * 8)) {
-            Serial.print("DEBUG [GT911] Raw bytes: ");
-            for(int j=0; j<touch_cnt*8; j++) Serial.printf("%02X ", buf[j]);
-            Serial.println();
             points = touch_cnt;
             for (int i = 0; i < touch_cnt; i++) {
                 // Each point is 8 bytes: [TrackID, X_Low, X_High, Y_Low, Y_High, Size_Low, Size_High, Reserved]

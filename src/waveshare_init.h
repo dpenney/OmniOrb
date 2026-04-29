@@ -9,3 +9,4 @@ extern TCA9554PWR io_expander;
 extern Arduino_RGB_Display *gfx;
 
 Arduino_RGB_Display *create_waveshare_28C_rgb_panel();
+void set_display_power(bool on);

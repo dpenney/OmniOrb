@@ -98,14 +98,20 @@ static void drawTriangleTip(lv_draw_ctx_t *draw_ctx, lv_point_t center,
     float w_rear  = width * 1.1f;   // width at the flat back end (flared counterweight)
     float w_gap   = w_pivot + (w_peak - w_pivot) * (gap_len / peak_dist); // interpolated
 
-    // ── Helper: draw a filled triangle ─────────────────────────────────────
+    // ── Helpers: draw filled polygons (no interior seam from triangle splits) ──
+    lv_draw_rect_dsc_t poly_dsc_tt;
+    lv_draw_rect_dsc_init(&poly_dsc_tt);
+    poly_dsc_tt.bg_opa = LV_OPA_COVER;
+
     auto tri = [&](lv_point_t a, lv_point_t b, lv_point_t c, lv_color_t col) {
-        lv_draw_rect_dsc_t dsc;
-        lv_draw_rect_dsc_init(&dsc);
-        dsc.bg_color = col;
-        dsc.bg_opa   = LV_OPA_COVER;
+        poly_dsc_tt.bg_color = col;
         lv_point_t pts[3] = {a, b, c};
-        lv_draw_polygon(draw_ctx, &dsc, pts, 3);
+        lv_draw_polygon(draw_ctx, &poly_dsc_tt, pts, 3);
+    };
+    auto quad = [&](lv_point_t a, lv_point_t b, lv_point_t c, lv_point_t d, lv_color_t col) {
+        poly_dsc_tt.bg_color = col;
+        lv_point_t pts[4] = {a, b, c, d};
+        lv_draw_polygon(draw_ctx, &poly_dsc_tt, pts, 4);
     };
 
     // ── Compute named polygon vertices ──────────────────────────────────────
@@ -138,31 +144,24 @@ static void drawTriangleTip(lv_draw_ctx_t *draw_ctx, lv_point_t center,
                       (lv_coord_t)(center.y + gap_len*sinA - w_gap*sinP) };
 
     // ── Layer 1: Full white forward lance ────────────────────────────────────
-    // Covers from the grey/white boundary (+gap_len) to the tip.
-    // Shape: trapezoid (gap_len → peak_dist) + triangle (peak_dist → tip)
-    tri(gL, gR, kL, color);   // left half of trapezoid
-    tri(gR, kR, kL, color);   // right half of trapezoid
-    tri(kL, kR, TIP, color);  // triangle taper to the tip
+    // Merged into single pentagon — eliminates seam at the kL/kR belly edge
+    {
+        poly_dsc_tt.bg_color = color;
+        lv_point_t lance[5] = {gL, gR, kR, TIP, kL};
+        lv_draw_polygon(draw_ctx, &poly_dsc_tt, lance, 5);
+    }
 
     // ── Layer 2: Full white sweep from pivot to gap (thin visible stub) ─────
-    // Draws the very small white section right at the pivot (from 0 to gap_len).
-    // This ensures a crisp white region is visible between grey rear and grey front.
-    // (Covered mostly by Layer 3 grey, but needed for exact colour boundary.)
-    tri(pL, pR, gL, color);
-    tri(pR, gR, gL, color);
+    quad(pL, pR, gR, gL, color);
 
     // ── Layer 3: Dark grey counterweight region ──────────────────────────────
-    // Covers from the rear end (-back_len) forward to just past the pivot (+gap_len).
-    // Uses the same dark grey as the stubby for a consistent instrument family look.
     lv_color_t grey = lv_color_make(60, 60, 60);
 
     // Rear to pivot section (trapezoid, wider at back, narrower at pivot)
-    tri(rL, rR, pL, grey);
-    tri(rR, pR, pL, grey);
+    quad(rL, rR, pR, pL, grey);
 
     // Pivot to gap_len section (trapezoid, covering the small forward grey stub)
-    tri(pL, pR, gL, grey);
-    tri(pR, gR, gL, grey);
+    quad(pL, pR, gR, gL, grey);
 
     // ── Layer 4: Flat rear end cap ────────────────────────────────────────────
     // The rear end is flat (unlike the stubby's lollipop).
@@ -249,13 +248,9 @@ static void drawStubby(lv_draw_ctx_t *draw_ctx, lv_point_t center,
         lv_point_t q3 = { (lv_coord_t)(center.x + len*cosA),
                           (lv_coord_t)(center.y + len*sinA) };
 
-        // Fan triangulation from rear-left corner: covers full pentagon
-        lv_point_t t1[3] = {q0, q1, q2};
-        lv_point_t t2[3] = {q0, q2, q3};
-        lv_point_t t3[3] = {q0, q3, q4};
-        lv_draw_polygon(draw_ctx, &dsc, t1, 3);
-        lv_draw_polygon(draw_ctx, &dsc, t2, 3);
-        lv_draw_polygon(draw_ctx, &dsc, t3, 3);
+        // Single pentagon — LVGL scanline fills without interior seam artifacts
+        lv_point_t pentagon[5] = {q0, q1, q2, q3, q4};
+        lv_draw_polygon(draw_ctx, &dsc, pentagon, 5);
     }
 
     // ── Layer 2: Dark grey counterweight rectangle ────────────────────────────
@@ -278,11 +273,9 @@ static void drawStubby(lv_draw_ctx_t *draw_ctx, lv_point_t center,
         lv_point_t g3 = { (lv_coord_t)(center.x + gap_len*cosA + (width/2)*cosPerp),
                           (lv_coord_t)(center.y + gap_len*sinA + (width/2)*sinPerp) };
 
-        // Two triangles cover the rectangle
-        lv_point_t r1[3] = {g0, g1, g2};
-        lv_point_t r2[3] = {g0, g2, g3};
-        lv_draw_polygon(draw_ctx, &dsc, r1, 3);
-        lv_draw_polygon(draw_ctx, &dsc, r2, 3);
+        // Single quad — no interior diagonal seam
+        lv_point_t grey_quad[4] = {g0, g1, g2, g3};
+        lv_draw_polygon(draw_ctx, &dsc, grey_quad, 4);
     }
 
     // ── Layer 3: Lollipop circle — caps the rear (counterweight) end ─────────
@@ -399,19 +392,17 @@ static void drawNeedleWithWeight(lv_draw_ctx_t *draw_ctx, lv_point_t center, flo
     polyOutline(draw_ctx, full_outline, 4);
 
     // ── Segment 1: The rear/pivot area (Dark Grey) ───────────────────────────
+    // Single quad per trapezoid — avoids antialiased interior seam from triangle splits
     poly_dsc.bg_color = dark_grey;
     lv_point_t pts_rear[4] = {pB_L, pB_R, pP_R, pP_L};
     lv_point_t pts_mid[4]  = {pP_L, pP_R, pG_R, pG_L};
-    // Draw via two triangles per trapezoid to ensure LVGL renders it solidly
-    lv_point_t tR1[3] = {pB_L, pB_R, pP_R}; lv_point_t tR2[3] = {pB_L, pP_R, pP_L};
-    lv_point_t tM1[3] = {pP_L, pP_R, pG_R}; lv_point_t tM2[3] = {pP_L, pG_R, pG_L};
-    lv_draw_polygon(draw_ctx, &poly_dsc, tR1, 3); lv_draw_polygon(draw_ctx, &poly_dsc, tR2, 3);
-    lv_draw_polygon(draw_ctx, &poly_dsc, tM1, 3); lv_draw_polygon(draw_ctx, &poly_dsc, tM2, 3);
+    lv_draw_polygon(draw_ctx, &poly_dsc, pts_rear, 4);
+    lv_draw_polygon(draw_ctx, &poly_dsc, pts_mid, 4);
 
     // ── Segment 2: The tip area (Orange) ─────────────────────────────────────
     poly_dsc.bg_color = color;
-    lv_point_t tF1[3] = {pG_L, pG_R, pT_R}; lv_point_t tF2[3] = {pG_L, pT_R, pT_L};
-    lv_draw_polygon(draw_ctx, &poly_dsc, tF1, 3); lv_draw_polygon(draw_ctx, &poly_dsc, tF2, 3);
+    lv_point_t pts_fwd[4] = {pG_L, pG_R, pT_R, pT_L};
+    lv_draw_polygon(draw_ctx, &poly_dsc, pts_fwd, 4);
 
 
     // ── Counterweight Circle (Dark Grey) ─────────────────────────────────────

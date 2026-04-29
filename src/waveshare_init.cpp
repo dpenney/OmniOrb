@@ -13,6 +13,7 @@
 #include <driver/spi_master.h>
 
 static spi_device_handle_t SPI_handle = NULL;
+static Arduino_RGB_Display *global_gfx = NULL;
 
 void ST7701_WriteCommand(uint8_t cmd) {
     spi_transaction_t spi_tran = {};
@@ -137,15 +138,44 @@ Arduino_RGB_Display *create_waveshare_28C_rgb_panel() {
         1 /* hsync_polarity */, 40 /* hsync_front_porch */, 8 /* hsync_pulse_width */, 40 /* hsync_back_porch */,
         1 /* vsync_polarity */, 10 /* vsync_front_porch */, 2 /* vsync_pulse_width */, 20 /* vsync_back_porch */,
         // PCLK (Pixel Clock) setting:
-        // Set to 16MHz (16000000). A clock that is too fast (e.g. 18MHz) can cause the DMA 
-        // to struggle with PSRAM bandwidth, leading to shifting or jittery 'cut' lines.
-        0 /* pclk_active_neg */, 16000000 /* prefer_speed */, false /* useBigEndian */,
-        0 /* de_idle_high */, 0 /* pclk_idle_high */, 4800 /* bounce_buffer_size */
+        // Set to 14MHz (14000000) to balance refresh stability and PSRAM bandwidth.
+        // Bounce buffer reverted to stable 28800.
+        0 /* pclk_active_neg */, 14000000 /* prefer_speed */, false /* useBigEndian */,
+        0 /* de_idle_high */, 0 /* pclk_idle_high */, 28800 /* bounce_buffer_size */
     );
 
     Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
         480 /* width */, 480 /* height */, rgbpanel, 0 /* rotation */, true /* auto_flush */
     );
+    global_gfx = gfx;
 
     return gfx;
 }
+
+void set_display_power(bool on) {
+    // 1. Log receipt immediately
+    Serial0.printf("EXEC:SLEEP_%d\n", on);
+    Serial0.flush();
+
+    if (on) {
+        // Wake: Restore Driver and Backlight
+        if (global_gfx) global_gfx->displayOn();
+        ledcAttach(LCD_BL, 20000, 10);
+        ledcWrite(LCD_BL, 1023);
+    } else {
+        // Sleep: Kill Backlight FIRST (aggressive detachment), then Driver
+        ledcDetach(LCD_BL);
+        pinMode(LCD_BL, OUTPUT);
+        digitalWrite(LCD_BL, LOW);
+        
+        if (global_gfx) global_gfx->displayOff();
+    }
+    
+    Serial0.printf("ACK:SLEEP_%s\n", on ? "OFF" : "ON");
+    Serial0.flush();
+}
+
+
+
+
+

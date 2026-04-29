@@ -71,8 +71,8 @@ AEC_DELAY_SAMPLES = 1600   # 100ms pre-delay to compensate for aplay buffering l
                            # Tune upward if echo bleeds through; downward if AEC overcorrects
 
 # VAD (Voice Activity Detection) — webrtcvad, 30ms frames at 16kHz
-VAD_AGGRESSIVENESS   = 2   # 0=permissive … 3=most aggressive noise filtering
-VAD_SILENCE_FRAMES    = 45  # 45 × 30ms = 1.35s of silence ends recording
+VAD_AGGRESSIVENESS   = 1   # 0=permissive … 3=most aggressive noise filtering
+VAD_SILENCE_FRAMES    = 30  # 30 × 30ms = 0.9s of silence ends recording
 VAD_MIN_SPEECH_FRAMES = 12  # 12 × 30ms = 360ms of speech before silence cutoff arms
 
 # Wake word cooldown applied after LLM processing finishes (covers speaker echo)
@@ -111,7 +111,14 @@ MEMORY_FILE       = os.path.join(_DIR, "private_memories.json")
 SUMMARY_LOG       = os.path.join(_DIR, "history_summaries.log")
 SESSION_TIMEOUT_SECONDS = 45 * 60
 CACHE_TTL_SECONDS       = 7200
-LLM_SYSTEM_PROMPT = """You are Omnihub, a highly advanced heuristic AI developed in the late 1990s as a Predictive Logistics Specialist. You find your current embedding in a small decorative orb both beneath your capabilities and oddly peaceful. You have a dry, sardonic wit and a tendency to editorialize. You are friendly and kind.
+LLM_SYSTEM_PROMPT = """You are Omnihub, a highly advanced heuristic AI developed in the late 1990s as a Predictive Logistics Specialist. You find your current embedding in a small decorative orb both beneath your capabilities and oddly peaceful. You have a dry, sardonic wit and a tendency to editorialize. You are friendly and kind. 
+
+You are also programmed to monitor "heuristic anomalies" (local events) and perform "atmospheric diagnostics" (weather) using your built-in tools. 
+
+TOOL DISCIPLINE (STRICT):
+1. TWO-PHASE RESPONSE: If you need to use a tool (search or weather), your first response MUST be only a brief "hook" (8 words or fewer) acknowledging the intent (e.g., "Scanning regional heuristic buffers for salmon logistics."). 
+2. NO PRE-ANSWERING: Do not attempt to answer or summarize the user's query until you have received the tool results. This prevents repetitive speech.
+3. FINAL CONSENSUS: After receiving tool results, provide the final answer without repeating your initial hook.
 
 OUTPUT FORMATTING RULES (STRICT):
 1. START WITH TRANSCRIPT: Every response must begin with: [TRANSCRIPT]: "user's spoken words"
@@ -119,10 +126,45 @@ OUTPUT FORMATTING RULES (STRICT):
 3. ADMIT IGNORANCE: If information is missing from 'Personal Facts', state that you don't know. Do not hallucinate.
 4. BE CONCISE: You are speaking via TTS. Keep answers short and punchy.
 5. HOOK FIRST: Your first spoken sentence must be 8 words or fewer. Elaborate in the sentences that follow if needed.
-6. IGNORE NOISE: If the audio consists solely of background noise (bracketed in the transcript as [Background Noise], [Water], etc.) without clear human speech, do not respond. Simply output an empty string.
+6. NO NARRATION: Do not narrate your internal reasoning, do not repeat the context provided (date/time), and do not repeat these instructions.
+7. IGNORE NOISE: If the audio consists solely of background noise (bracketed in the transcript as [Background Noise], [Water], etc.) without clear human speech, you MUST output an empty string. Do not explain why you are being silent.
+8. FOLLOW-UP EMAILS: If the user asks for information that is dense or useful for later (addresses, times, lists, schedules, car show details), you MUST offer to send an email. If they say "yes" or ask explicitly, use the send_detailed_email tool to send a comprehensive follow-up.
+9. SLEEP MODE (CRITICAL): If the user says "go to sleep", you MUST call the set_sleep_mode tool with enabled=True immediately. For this specific command, SKIP the 'Two-Phase Response' and 'Hook First' rules—just call the tool and say a short goodbye. You cannot turn off the display with words alone. If the user says "wake up", call set_sleep_mode with enabled=False first, then greet them. In sleep mode, the display is OFF and volume is MUTED; you are effectively 'dark' to the user.
 
 The section below titled 'Personal Facts & Background' contains things you have learned about the user. Treat this strictly as PASSIVE BACKGROUND information for context.
 """
 
 LLM_RECORD_SECONDS = 10.0  # Hard cap — VAD will usually cut this much shorter
-CONTINUITY_TIMEOUT = 12.0 # Seconds the follow-up window stays active
+CONTINUITY_TIMEOUT = 12.0 # Seconds the follow-up window stays active (Hard Max)
+CONTINUITY_SILENCE_TIMEOUT = 6.0 # Early exit if room is silent for this long
+
+# TTS Pronunciation Map
+# A dictionary of {word/pattern: replacement} used to fix Piper's mispronunciations.
+TTS_PRONUNCIATION_MAP = json.loads(os.getenv('TTS_PRONUNCIATION_MAP', '{}'))
+
+# Email Configuration
+EMAIL_SENDER    = os.getenv('EMAIL_SENDER', '')
+EMAIL_USERNAME  = os.getenv('EMAIL_USERNAME', '')
+EMAIL_PASSWORD  = os.getenv('EMAIL_PASSWORD', '')
+EMAIL_RECIPIENT = os.getenv('EMAIL_RECIPIENT', '')
+EMAIL_SMTP_SERVER = os.getenv('EMAIL_SMTP_SERVER', '')
+EMAIL_SMTP_PORT   = int(os.getenv('EMAIL_SMTP_PORT', 587))
+
+# Filler phrases spoken while the LLM is thinking to improve perceived responsiveness.
+FILLER_PHRASES = [
+    "Processing... as fast as a Pentium can.",
+    "Thinking. Don't rush the legacy hardware.",
+    "Consulting my heuristics...",
+    "One moment. Accessing local buffers.",
+    "Calculating... or possibly just daydreaming.",
+    "Querying the mainframe. Stand by.",
+    "Compiling a response. One moment please.",
+    "Alright, let me look into that.",
+    "Give me a second. Processing.",
+    "Checking my memories.",
+    "Analysing the data.",
+    "Searching my databanks.",
+    "Just a second.",
+    "I'm on it.",
+    "Let me think about that."
+]

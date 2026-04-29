@@ -2,6 +2,8 @@
 #define ASSISTANTVIEW_H
 
 #include <Arduino_GFX_Library.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 class AssistantView {
 public:
@@ -14,6 +16,8 @@ public:
     static void show();
     static void hide();
     static void set_canvas(Arduino_Canvas *canvas);
+    static void set_gfx(Arduino_GFX *output_gfx);
+    static void set_vsync_sem(SemaphoreHandle_t sem);
     static void set_audio_intensity(int intensity);
     static void set_spectrum(const int* bins, int count);
     static void set_state(AssistantState state);
