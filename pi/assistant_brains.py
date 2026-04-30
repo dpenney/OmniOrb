@@ -177,21 +177,24 @@ _transcript_lock    = threading.Lock()
 
 # ─── Long-term Memory (Mem0) ──────────────────────────────────────────────────
 _memory = None
-if MEM0_AVAILABLE and LLM_AVAILABLE:
+
+def _init_mem0():
+    global _memory
+    if not (MEM0_AVAILABLE and LLM_AVAILABLE):
+        return
     try:
-        # Configuration for Mem0 using Gemini for both LLM and Embeddings
         _mem_config = {
             "llm": {
                 "provider": "gemini",
                 "config": {
-                    "model": config.LLM_MODEL, 
+                    "model": config.LLM_MODEL,
                     "temperature": 0.1,
                 }
             },
             "embedder": {
                 "provider": "fastembed",
                 "config": {
-                    "model": "BAAI/bge-small-en-v1.5", 
+                    "model": "BAAI/bge-small-en-v1.5",
                 }
             },
             "vector_store": {
@@ -202,15 +205,15 @@ if MEM0_AVAILABLE and LLM_AVAILABLE:
                 }
             }
         }
-        # Ensure API Key is available for Mem0's internal use
         if "GOOGLE_API_KEY" not in os.environ:
             os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "")
-            
         _memory = Memory.from_config(_mem_config)
         logger.info("Mem0 long-term memory initialized with Local Chroma store.")
     except Exception as e:
         logger.error(f"Failed to initialize Mem0: {e}")
         _memory = None
+
+threading.Thread(target=_init_mem0, daemon=True).start()
 
 def _seed_private_memories():
     """Load facts from private_memories.json and push them into Mem0 if not already present."""
@@ -580,10 +583,6 @@ def _get_piper():
         threading.Thread(target=_warmup_piper, daemon=True).start()
     return p
 
-# Initial warmup at boot
-for _ in range(_MAX_WARM_PIPERS):
-    threading.Thread(target=_warmup_piper, daemon=True).start()
-
 # ─── Weather + Context ────────────────────────────────────────────────────────
 
 _WMO_CODES = {
@@ -856,19 +855,20 @@ def _speak_text_iter(text_iter):
     Respects _tts_abort: stops feeding sentences and returns early if set.
     """
     global _active_piper_proc, _current_transcript
-    
-    # Interrupt any active filler phrase or previous speech
-    interrupt_tts()
-    
-    _tts_abort.clear()   # clear any abort flag left over from a previous interrupt
+    _tts_abort.clear()   # clear any stale abort flag from a previous barge-in
     piper = None
     fwd   = None
     buf   = ""
     parts = []
+    first_flush_done = False   # True once we've sent the first chunk to Piper
+    piper_pending    = ""      # accumulates subsequent sentences before flushing
 
     def _ensure_piper():
         nonlocal piper, fwd
         if piper is None:
+            # Interrupt filler only now — we have real text ready to speak
+            interrupt_tts()
+            _tts_abort.clear()
             piper = _get_piper()
             with _active_piper_lock:
                 _active_piper_proc = piper
@@ -932,11 +932,21 @@ def _speak_text_iter(text_iter):
                 _ensure_piper()
                 if not _tts_abort.is_set():
                     logger.info(f"[TTS] \"{sent}\"")
-                    piper.stdin.write(_tts_clean(sent).encode() + b'\n')
+                    clean = _tts_clean(sent)
+                    if not first_flush_done:
+                        # First chunk: write immediately for fast TTS start
+                        piper.stdin.write(clean.encode() + b'\n')
+                        first_flush_done = True
+                    else:
+                        # Batch subsequent sentences — fewer \n = fewer inference gaps
+                        piper_pending += (" " if piper_pending else "") + clean
+                        if len(piper_pending) >= 80:
+                            piper.stdin.write(piper_pending.encode() + b'\n')
+                            piper_pending = ""
 
-    if buf.strip() and not _tts_abort.is_set():
+    if (buf.strip() or piper_pending) and not _tts_abort.is_set():
         # Final safety check: if transcript was never logged, try one last time
-        if not logged_transcript:
+        if not logged_transcript and buf.strip():
             buf_for_match = buf + '\n'
             match = _TRANS_PATTERN.search(buf_for_match)
             if match:
@@ -944,11 +954,15 @@ def _speak_text_iter(text_iter):
                 with _transcript_lock:
                     _current_transcript = trans
                 buf = buf_for_match[match.end():].lstrip()
-        
-        if buf.strip():
+
+        # Flush pending batch + remaining buf as a single Piper write to avoid
+        # an extra inference-gap pause at the end of the response.
+        clean_buf  = _tts_clean(buf.strip()) if buf.strip() else ""
+        flush_text = " ".join(filter(None, [piper_pending, clean_buf]))
+        if flush_text:
             _ensure_piper()
-            logger.info(f"[TTS] \"{buf.strip()}\"")
-            piper.stdin.write(_tts_clean(buf.strip()).encode() + b'\n')
+            logger.info(f"[TTS] \"{flush_text}\"")
+            piper.stdin.write(flush_text.encode() + b'\n')
 
     if piper:
         try:
@@ -1452,6 +1466,9 @@ def audio_processor():
                 with state_lock:
                     assistant_state["oww_ready"] = True
                 logger.info(f"OWW model loaded: {wakeword_models[0]}")
+                # Piper warmup deferred until here so OWW had full CPU during load
+                for _ in range(_MAX_WARM_PIPERS):
+                    threading.Thread(target=_warmup_piper, daemon=True).start()
         except Exception as e:
             logger.error(f"OWW load failed: {e}")
 
@@ -1476,6 +1493,9 @@ def audio_processor():
 
     _amp_enable()
     _start_persistent_output()
+    logger.info("=" * 60)
+    logger.info("  ASSISTANT READY — listening for wake word")
+    logger.info("=" * 60)
 
     # ── AEC init ──────────────────────────────────────────────────────────────
     global _aec_ref_buf
@@ -1874,14 +1894,8 @@ if __name__ == "__main__":
     send_uart_command("APP:ASSISTANT")
     logger.info("Sent boot synchronization command: APP:ASSISTANT")
 
-    # Pre-warm Piper so the first query has no model-load delay
-    threading.Thread(target=_warmup_piper, daemon=True).start()
-
     audio_thread = threading.Thread(target=audio_processor, daemon=True)
     audio_thread.start()
     logger.info("Audio processor thread started")
-
-    app.run(host=config.FLASK_HOST, port=config.FLASK_PORT)
-
 
     app.run(host=config.FLASK_HOST, port=config.FLASK_PORT)

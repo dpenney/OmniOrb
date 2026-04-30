@@ -1,6 +1,6 @@
 [Unit]
 Description=ESP32 Assistant Brains (Audio & Rotary)
-After=network.target
+Wants=network.target
 
 [Service]
 # Use the Python from our virtual environment
