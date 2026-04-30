@@ -535,7 +535,7 @@ def interrupt_tts():
 
 _warm_pipers = deque()
 _warm_piper_lock = threading.Lock()
-_MAX_WARM_PIPERS = 2
+_MAX_WARM_PIPERS = 3
 
 def _spawn_piper():
     """Spawn a Piper process with the model already loaded, ready to receive text."""
@@ -856,24 +856,44 @@ def _speak_text_iter(text_iter):
     """
     global _active_piper_proc, _current_transcript
     _tts_abort.clear()   # clear any stale abort flag from a previous barge-in
-    piper = None
-    fwd   = None
-    buf   = ""
-    parts = []
-    first_flush_done = False   # True once we've sent the first chunk to Piper
-    piper_pending    = ""      # accumulates subsequent sentences before flushing
 
-    def _ensure_piper():
-        nonlocal piper, fwd
-        if piper is None:
-            # Interrupt filler only now — we have real text ready to speak
+    # Two-Piper pipeline:
+    #   piper_a — plays the first chunk immediately for fast TTS start
+    #   piper_b — receives all remaining chunks and runs ONNX inference
+    #             concurrently while piper_a's audio is being heard
+    piper_a   = None
+    piper_b   = None
+    fwd_a     = None
+    buf       = ""
+    parts     = []
+    a_fed     = False  # True once piper_a has its text and stdin is closed
+    b_pending = ""     # batches short sentences before writing to piper_b
+
+    def _ensure_piper_a():
+        nonlocal piper_a, fwd_a
+        if piper_a is None:
             interrupt_tts()
             _tts_abort.clear()
-            piper = _get_piper()
+            piper_a = _get_piper()
             with _active_piper_lock:
-                _active_piper_proc = piper
-            fwd = threading.Thread(target=_forward_piper_audio, args=(piper,), daemon=True)
-            fwd.start()
+                _active_piper_proc = piper_a
+            fwd_a = threading.Thread(target=_forward_piper_audio, args=(piper_a,), daemon=True)
+            fwd_a.start()
+
+    def _flush_to_b(text, final=False):
+        """Buffer text for piper_b; write when batch is big enough or final=True."""
+        nonlocal piper_b, b_pending
+        if text:
+            b_pending += (" " if b_pending else "") + text
+        if b_pending and (final or len(b_pending) >= 80):
+            if piper_b is None:
+                piper_b = _get_piper()
+            try:
+                piper_b.stdin.write(b_pending.encode() + b'\n')
+            except Exception:
+                pass
+            b_pending = ""
+
     logged_transcript = False
 
     for text in text_iter:
@@ -886,27 +906,20 @@ def _speak_text_iter(text_iter):
 
         # Handle transcript logging/stripping at the very start of the buffer
         if not logged_transcript:
-            # First, try to strip any leaked instructions if they appear at the very beginning
             for leak_patt in _LEAK_STRIP:
                 new_buf = leak_patt.sub('', buf)
                 if new_buf != buf:
                     buf = new_buf.lstrip()
 
-            # Now look for the transcript marker
             match = _TRANS_PATTERN.search(buf)
             if match:
                 transcript = match.group(1)
                 logger.info(f"[USER TRANSCRIPT]: {transcript}")
-                
-                # Update global transcript for memory storage
                 with _transcript_lock:
                     _current_transcript = transcript
-                    
-                # Remove the transcript block from the buffer
                 buf = buf[match.end():].lstrip()
                 logged_transcript = True
             elif "]" in buf or ":" in buf or len(buf) > 300:
-                # Don't bail early if we're mid-[TRANSCRIPT] block waiting for closing quote
                 if not re.search(r'^\s*\[TRANSCRIPT\]', buf, re.IGNORECASE):
                     logged_transcript = True
 
@@ -916,10 +929,6 @@ def _speak_text_iter(text_iter):
                 sent = buf[:m.start() + 1].strip()
                 buf  = buf[m.end():]
             else:
-                # Fall back to clause boundary (comma/semicolon) if the phrase
-                # preceding it is long enough to be worth sending to Piper.
-                # 18 chars ≈ 3 words — short enough to start TTS early, long
-                # enough to avoid flushing single-word interjections like "Well,".
                 sent = None
                 for cm in _CLAUSE_END.finditer(buf):
                     if cm.start() >= 18:
@@ -928,24 +937,25 @@ def _speak_text_iter(text_iter):
                         break
                 if sent is None:
                     break
-            if sent:
-                _ensure_piper()
-                if not _tts_abort.is_set():
-                    logger.info(f"[TTS] \"{sent}\"")
-                    clean = _tts_clean(sent)
-                    if not first_flush_done:
-                        # First chunk: write immediately for fast TTS start
-                        piper.stdin.write(clean.encode() + b'\n')
-                        first_flush_done = True
-                    else:
-                        # Batch subsequent sentences — fewer \n = fewer inference gaps
-                        piper_pending += (" " if piper_pending else "") + clean
-                        if len(piper_pending) >= 80:
-                            piper.stdin.write(piper_pending.encode() + b'\n')
-                            piper_pending = ""
+            if sent and not _tts_abort.is_set():
+                logger.info(f"[TTS] \"{sent}\"")
+                clean = _tts_clean(sent)
+                if not a_fed:
+                    # First sentence → Piper A: starts playing immediately
+                    _ensure_piper_a()
+                    if not _tts_abort.is_set():
+                        piper_a.stdin.write(clean.encode() + b'\n')
+                        try:
+                            piper_a.stdin.close()  # A is single-chunk only
+                        except Exception:
+                            pass
+                        a_fed = True
+                else:
+                    # Remaining sentences → Piper B: infers while A plays
+                    _flush_to_b(clean)
 
-    if (buf.strip() or piper_pending) and not _tts_abort.is_set():
-        # Final safety check: if transcript was never logged, try one last time
+    # ── Final flush ──────────────────────────────────────────────────────────
+    if (buf.strip() or b_pending) and not _tts_abort.is_set():
         if not logged_transcript and buf.strip():
             buf_for_match = buf + '\n'
             match = _TRANS_PATTERN.search(buf_for_match)
@@ -955,35 +965,67 @@ def _speak_text_iter(text_iter):
                     _current_transcript = trans
                 buf = buf_for_match[match.end():].lstrip()
 
-        # Flush pending batch + remaining buf as a single Piper write to avoid
-        # an extra inference-gap pause at the end of the response.
-        clean_buf  = _tts_clean(buf.strip()) if buf.strip() else ""
-        flush_text = " ".join(filter(None, [piper_pending, clean_buf]))
-        if flush_text:
-            _ensure_piper()
-            logger.info(f"[TTS] \"{flush_text}\"")
-            piper.stdin.write(flush_text.encode() + b'\n')
+        clean_buf = _tts_clean(buf.strip()) if buf.strip() else ""
+        if not a_fed:
+            # Response was short enough to fit in one chunk — use piper_a only
+            if clean_buf:
+                _ensure_piper_a()
+                if not _tts_abort.is_set():
+                    piper_a.stdin.write(clean_buf.encode() + b'\n')
+                    try:
+                        piper_a.stdin.close()
+                    except Exception:
+                        pass
+                    a_fed = True
+        else:
+            _flush_to_b(clean_buf, final=True)
 
-    if piper:
+    # ── Drain Piper A ────────────────────────────────────────────────────────
+    if piper_a:
         try:
-            piper.stdin.close()   # always close — kernel cleans up even if piper was killed
+            piper_a.stdin.close()  # no-op if already closed above
         except Exception:
             pass
-        fwd.join()   # forward thread exits quickly once piper stdout closes/dies
+        if fwd_a:
+            fwd_a.join()
         try:
-            piper.wait(timeout=2)   # reap zombie process
+            piper_a.wait(timeout=2)
         except Exception:
             try:
-                piper.kill()
+                piper_a.kill()
             except Exception:
                 pass
-        if not _tts_abort.is_set():
-            logger.info("Playback finished.")
         with _active_piper_lock:
-            if _active_piper_proc is piper:
+            if _active_piper_proc is piper_a:
                 _active_piper_proc = None
 
-    return piper, ''.join(parts).strip()
+    # ── Play Piper B (pre-computed during A's playback) ──────────────────────
+    if piper_b:
+        try:
+            piper_b.stdin.close()  # signal end-of-input so piper_b finishes
+        except Exception:
+            pass
+        if not _tts_abort.is_set():
+            with _active_piper_lock:
+                _active_piper_proc = piper_b
+            fwd_b = threading.Thread(target=_forward_piper_audio, args=(piper_b,), daemon=True)
+            fwd_b.start()
+            fwd_b.join()
+            with _active_piper_lock:
+                if _active_piper_proc is piper_b:
+                    _active_piper_proc = None
+        try:
+            piper_b.wait(timeout=2)
+        except Exception:
+            try:
+                piper_b.kill()
+            except Exception:
+                pass
+
+    if not _tts_abort.is_set():
+        logger.info("Playback finished.")
+
+    return piper_a or piper_b, ''.join(parts).strip()
 
 _TIMER_TOOL = types.Tool(function_declarations=[
     types.FunctionDeclaration(
