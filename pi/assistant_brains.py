@@ -881,15 +881,17 @@ def _speak_text_iter(text_iter):
             fwd_a.start()
 
     def _flush_to_b(text, final=False):
-        """Buffer text for piper_b; write when batch is big enough or final=True."""
+        """Accumulate text for piper_b; write everything as ONE line when final=True.
+        One line = one ONNX inference run = continuous audio with no within-B gaps."""
         nonlocal piper_b, b_pending
         if text:
             b_pending += (" " if b_pending else "") + text
-        if b_pending and (final or len(b_pending) >= 80):
+        if final and b_pending:
             if piper_b is None:
                 piper_b = _get_piper()
             try:
                 piper_b.stdin.write(b_pending.encode() + b'\n')
+                piper_b.stdin.flush()
             except Exception:
                 pass
             b_pending = ""
@@ -980,6 +982,13 @@ def _speak_text_iter(text_iter):
         else:
             _flush_to_b(clean_buf, final=True)
 
+    # ── Signal piper_b end-of-input NOW so it computes during A's playback ───
+    if piper_b:
+        try:
+            piper_b.stdin.close()
+        except Exception:
+            pass
+
     # ── Drain Piper A ────────────────────────────────────────────────────────
     if piper_a:
         try:
@@ -999,12 +1008,8 @@ def _speak_text_iter(text_iter):
             if _active_piper_proc is piper_a:
                 _active_piper_proc = None
 
-    # ── Play Piper B (pre-computed during A's playback) ──────────────────────
+    # ── Play Piper B (already computed during A's playback) ──────────────────
     if piper_b:
-        try:
-            piper_b.stdin.close()  # signal end-of-input so piper_b finishes
-        except Exception:
-            pass
         if not _tts_abort.is_set():
             with _active_piper_lock:
                 _active_piper_proc = piper_b
