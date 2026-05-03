@@ -25,6 +25,7 @@ class RotaryEncoder:
                     GPIO.setup(self.sw_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
                 self.last_clk_state = GPIO.input(self.clk_pin)
+                self.last_sw_state  = GPIO.input(self.sw_pin) if self.sw_pin else GPIO.HIGH
                 self.running = True
                 
                 # Start polling thread
@@ -54,8 +55,13 @@ class RotaryEncoder:
             
             # Switch check
             if self.sw_pin:
-                # Add simple switch polling or keep interrupt for switch
-                pass
+                sw_state = GPIO.input(self.sw_pin)
+                if sw_state != self.last_sw_state:
+                    self.last_sw_state = sw_state
+                    if sw_state == GPIO.LOW: # Pressed (assuming pull-up)
+                        if self.callback:
+                            self.callback("press", None, self.value)
+                    time.sleep(0.05) # Debounce
                 
             time.sleep(config.ENCODER_POLL_SLEEP)
 

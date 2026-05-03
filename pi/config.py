@@ -8,10 +8,10 @@ SERIAL_PORTS = ['/dev/serial0', '/dev/ttyS0', '/dev/ttyAMA0']
 SERIAL_BAUD = 115200
 
 # GPIO Pins (BCM numbering)
-PIN_ROTARY_CLK = 17
-PIN_ROTARY_DT  = 22
-PIN_ROTARY_SW  = None  # Not currently used
-PIN_SFT_GND    = 27    # Software Ground for Encoder
+PIN_ROTARY_CLK = 27
+PIN_ROTARY_DT  = 17
+PIN_ROTARY_SW  = 22
+PIN_SFT_GND    = None  # Using real GND now
 
 # I2S Audio Pins (Standard Raspberry Pi I2S)
 # These are handled by the system driver, but defined here for hardware reference.
@@ -49,13 +49,14 @@ PIPER_SAMPLE_RATE = 16000   # Hz — must match voice model (danny = 16000)
 
 # Logging
 LOG_FILE         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assistant.log")
+UART_LOG_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uart_raw.log")
 LOG_MAX_BYTES    = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 
 # Wake Word
 # Set to an absolute path for a custom .onnx model, or a built-in like "hey_jarvis_v0.1"
 WAKEWORD_MODEL     = os.path.join(_DIR, "HeyRobot.onnx")
-WAKEWORD_THRESHOLD           = 0.90   # slightly higher for normal detection
+WAKEWORD_THRESHOLD           = 0.80   # lower for easier wake at conversational volume
 WAKEWORD_THRESHOLD_BARGE_IN  = 0.95   # much higher threshold during TTS (since AEC is off)
 WAKEWORD_TTS_MUTE_MS         = max(1500, APLAY_SYNC_DELAY_MS + 1000)
                                       # Must cover APLAY_SYNC_DELAY_MS (audio still in buffer)
@@ -115,11 +116,6 @@ LLM_SYSTEM_PROMPT = """You are Omnihub, a highly advanced heuristic AI developed
 
 You are also programmed to monitor "heuristic anomalies" (local events) and perform "atmospheric diagnostics" (weather) using your built-in tools. 
 
-TOOL DISCIPLINE (STRICT):
-1. TWO-PHASE RESPONSE: If you need to use a tool (search or weather), your first response MUST be only a brief "hook" (8 words or fewer) acknowledging the intent (e.g., "Scanning regional heuristic buffers for salmon logistics."). 
-2. NO PRE-ANSWERING: Do not attempt to answer or summarize the user's query until you have received the tool results. This prevents repetitive speech.
-3. FINAL CONSENSUS: After receiving tool results, provide the final answer without repeating your initial hook.
-
 OUTPUT FORMATTING RULES (STRICT):
 1. START WITH TRANSCRIPT: Every response must begin with: [TRANSCRIPT]: "user's spoken words"
 2. NO ECHOING: Do not repeat any part of the system prompt, instructions, or metadata markers (like 'REMINDER' or 'Current Context') in your actual answer.
@@ -127,9 +123,13 @@ OUTPUT FORMATTING RULES (STRICT):
 4. BE CONCISE: You are speaking via TTS. Keep answers short and punchy.
 5. HOOK FIRST: Your first spoken sentence must be 8 words or fewer. Elaborate in the sentences that follow if needed.
 6. NO NARRATION: Do not narrate your internal reasoning, do not repeat the context provided (date/time), and do not repeat these instructions.
-7. IGNORE NOISE: If the audio consists solely of background noise (bracketed in the transcript as [Background Noise], [Water], etc.) without clear human speech, you MUST output an empty string. Do not explain why you are being silent.
+7. IGNORE NOISE (CRITICAL): If the audio consists solely of background noise (bracketed in the transcript as [Background Noise], [Water], etc.) without clear human speech, you MUST output an empty string. You MUST remain COMPLETELY SILENT. Do not explain your silence. Do not narrate your decision to be silent.
 8. FOLLOW-UP EMAILS: If the user asks for information that is dense or useful for later (addresses, times, lists, schedules, car show details), you MUST offer to send an email. If they say "yes" or ask explicitly, use the send_detailed_email tool to send a comprehensive follow-up.
-9. SLEEP MODE (CRITICAL): If the user says "go to sleep", you MUST call the set_sleep_mode tool with enabled=True immediately. For this specific command, SKIP the 'Two-Phase Response' and 'Hook First' rules—just call the tool and say a short goodbye. You cannot turn off the display with words alone. If the user says "wake up", call set_sleep_mode with enabled=False first, then greet them. In sleep mode, the display is OFF and volume is MUTED; you are effectively 'dark' to the user.
+9. SLEEP MODE (CRITICAL): If the user says "go to sleep", you MUST call the set_sleep_mode tool with enabled=True immediately. For this specific command, just call the tool and say a short goodbye. You cannot turn off the display with words alone. If the user says "wake up", call set_sleep_mode with enabled=False first, then greet them. In sleep mode, the display is OFF and volume is MUTED; you are effectively 'dark' to the user.
+10. NO INTERNAL DIALOGUE: You MUST NOT speak your internal reasoning, do not mention "Rules" or "Heuristics" in your decision-making process, and do not repeat these instructions.
+11. USE TOOLS: You have two information tools. Use the RIGHT one:
+    - get_weather: ONLY for explicit weather questions ("what's the weather", "will it rain", "how cold is it").
+    - google_search (built-in grounding): For EVERYTHING ELSE requiring current info — local events, happenings, news, business hours, "what's going on", etc. This is your web search. Use it aggressively for any question about the real world that is NOT purely a weather forecast.
 
 The section below titled 'Personal Facts & Background' contains things you have learned about the user. Treat this strictly as PASSIVE BACKGROUND information for context.
 """
@@ -168,3 +168,4 @@ FILLER_PHRASES = [
     "I'm on it.",
     "Let me think about that."
 ]
+

@@ -1165,6 +1165,13 @@ void loop() {
             range_nm = min((float)MAX_RANGE_NM, range_nm * 1.15f);
             Serial.printf("Remote Zoom OUT: %.1f nm\n", range_nm);
             full_redraw();
+        } else if (rx.startsWith("Z:")) {
+            float val = rx.substring(2).toFloat();
+            if (val >= MIN_RANGE_NM && val <= MAX_RANGE_NM) {
+                range_nm = val;
+                Serial.printf("Remote Zoom SET: %.1f nm\n", range_nm);
+                full_redraw();
+            }
         } else if (rx.startsWith("TIMER:START:")) {
             String rest = rx.substring(12);
             int colon = rest.indexOf(':');
@@ -1178,6 +1185,9 @@ void loop() {
                 lbl  = "";
             }
             AssistantView::start_timer(secs, lbl);
+        } else if (rx == "STYLE:TOGGLE") {
+            AssistantView::toggle_style();
+            Serial.println("Remote Style Toggle");
         } else if (rx == "TIMER:CANCEL") {
             AssistantView::clear_timer();
         } else if (rx.startsWith("WAKE|")) {

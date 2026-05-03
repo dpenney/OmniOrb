@@ -13,10 +13,10 @@ build_log.txt
 pi/venv/
 pi/__pycache__/
 pi/*.pyc
-pi/.env
+# pi/.env
 pi/assistant.log
-pi/adsb_proxy_pi.py
-pi/install_adsb_sidecar.sh
+# pi/adsb_proxy_pi.py
+# pi/install_adsb_sidecar.sh
 pi/flights.json
 
 # Other
@@ -32,5 +32,5 @@ demo_c*/
 *.tar.gz
 .claude/settings.local.json
 pi/device_settings.json
-pi/private_memories.json
-pi/memory_store/
+# pi/private_memories.json
+# pi/memory_store/
