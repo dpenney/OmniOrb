@@ -1154,19 +1154,31 @@ def _send_email_task(subject, body):
 _prev_volume = 75
 def _set_sleep_mode(enabled):
     global _volume, _prev_volume
+    with state_lock:
+        already_sleeping = assistant_state.get("is_sleeping", False)
+    
     if enabled:
+        if already_sleeping: return
+        # Save current volume and mute
+        with _volume_lock:
+            _prev_volume = _volume
+            _volume = 0
+        
         send_uart_command("SLEEP:1")
         with state_lock:
             assistant_state["is_sleeping"] = True
-        logger.info("Device entering SLEEP mode (Volume mute deferred until speech ends)")
+        logger.info(f"Device entering SLEEP mode (Volume {_prev_volume} -> 0)")
     else:
-        with state_lock:
-            assistant_state["is_sleeping"] = False
+        if not already_sleeping: return
         # Restore volume
         with _volume_lock:
             _volume = _prev_volume
+        
+        with state_lock:
+            assistant_state["is_sleeping"] = False
+        
         send_uart_command("SLEEP:0")
-        logger.info("Device WAKING UP from sleep mode")
+        logger.info(f"Device WAKING UP from sleep mode (Volume -> {_volume})")
 
 
 
@@ -1951,6 +1963,13 @@ def on_encoder_event(event, direction, value):
         else:
             # Default press action: Back to Radar
             send_uart_command("APP:RADAR")
+            
+    elif event == "long_press":
+        with state_lock:
+            is_sleeping = assistant_state.get("is_sleeping", False)
+        
+        logger.info(f"Encoder Button: Long Press! Toggling sleep: {not is_sleeping}")
+        _set_sleep_mode(not is_sleeping)
 
 # ─── Hardware Init ────────────────────────────────────────────────────────────
 
