@@ -22,6 +22,10 @@ class RotaryEncoder:
         self.sw_pressed_at = 0
         self.sw_last_state = 1 # Default to Pull-up active (Idle)
         self.long_press_fired = False
+        
+        # Detent/Step scaling
+        self.step_count = 0
+        self.steps_per_action = 2
 
         if GPIO:
             try:
@@ -51,14 +55,18 @@ class RotaryEncoder:
             
             if clk_state != self.last_clk_state:
                 if dt_state != clk_state:
-                    self.value += 1
-                    direction = "CW"
+                    self.step_count += 1
                 else:
-                    self.value -= 1
-                    direction = "CCW"
+                    self.step_count -= 1
                 
-                if self.callback:
-                    self.callback("rotate", direction, self.value)
+                # Only fire callback when enough steps (phase transitions) accumulate for one detent
+                if abs(self.step_count) >= self.steps_per_action:
+                    direction = "CW" if self.step_count > 0 else "CCW"
+                    self.value += (1 if self.step_count > 0 else -1)
+                    self.step_count = 0 # Reset for next detent
+                    
+                    if self.callback:
+                        self.callback("rotate", direction, self.value)
                 
             self.last_clk_state = clk_state
             
