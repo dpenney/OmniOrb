@@ -2,6 +2,7 @@ import os
 import time
 import json
 import struct
+import logging
 import threading
 import requests
 from logging.handlers import RotatingFileHandler
