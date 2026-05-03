@@ -209,6 +209,7 @@ def get_aircraft():
     except Exception as e:
         logger.warning(f"Bad params: {e}")
 
+    logger.info(f"Incoming request from {request.remote_addr}")
     return jsonify(latest_flights)
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
