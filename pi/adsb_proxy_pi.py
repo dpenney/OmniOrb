@@ -2,14 +2,26 @@ import os
 import time
 import json
 import struct
-import logging
 import threading
 import requests
+from logging.handlers import RotatingFileHandler
+import config
 from flask import Flask, jsonify, request
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("adsb_proxy_sidecar")
+logger.setLevel(logging.INFO)
+
+# File Handler (Rotating)
+log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adsb.log")
+file_handler = RotatingFileHandler(log_file, maxBytes=config.LOG_MAX_BYTES, backupCount=config.LOG_BACKUP_COUNT)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+
+# Stream Handler (Stdout)
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(stream_handler)
 
 try:
     import zstandard as zstd
