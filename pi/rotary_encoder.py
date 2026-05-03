@@ -16,6 +16,13 @@ class RotaryEncoder:
         self.value = 0
         self.running = False
         
+        # Long press and debouncing settings
+        self.long_press_ms = 2000
+        self.debounce_ms = 50
+        self.sw_pressed_at = 0
+        self.sw_last_state = 1 # Default to Pull-up active (Idle)
+        self.long_press_fired = False
+
         if GPIO:
             try:
                 GPIO.setmode(GPIO.BCM)
@@ -23,6 +30,8 @@ class RotaryEncoder:
                 GPIO.setup(self.dt_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
                 if self.sw_pin:
                     GPIO.setup(self.sw_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                    # Use current state as baseline
+                    self.sw_last_state = GPIO.input(self.sw_pin)
 
                 self.last_clk_state = GPIO.input(self.clk_pin)
                 self.running = True
@@ -36,6 +45,7 @@ class RotaryEncoder:
 
     def _poll(self):
         while self.running:
+            # 1. Rotation Check
             clk_state = GPIO.input(self.clk_pin)
             dt_state = GPIO.input(self.dt_pin)
             
@@ -52,10 +62,33 @@ class RotaryEncoder:
                 
             self.last_clk_state = clk_state
             
-            # Switch check
+            # 2. Switch Check (Polling with Debounce and Long-Press)
             if self.sw_pin:
-                # Add simple switch polling or keep interrupt for switch
-                pass
+                sw_state = GPIO.input(self.sw_pin)
+                now_ms = time.time() * 1000
+                
+                if sw_state == 0 and self.sw_last_state == 1:
+                    # Press down (Transition 1 -> 0)
+                    self.sw_pressed_at = now_ms
+                    self.long_press_fired = False
+                elif sw_state == 1 and self.sw_last_state == 0:
+                    # Release (Transition 0 -> 1)
+                    if self.sw_pressed_at > 0:
+                        duration = now_ms - self.sw_pressed_at
+                        # Only fire press if it wasn't a long press and exceeds debounce threshold
+                        if not self.long_press_fired and duration >= self.debounce_ms:
+                            if self.callback:
+                                self.callback("press", None, None)
+                    self.sw_pressed_at = 0
+                elif sw_state == 0 and self.sw_last_state == 0:
+                    # Still holding (State 0)
+                    if not self.long_press_fired and self.sw_pressed_at > 0:
+                        if (now_ms - self.sw_pressed_at) >= self.long_press_ms:
+                            self.long_press_fired = True
+                            if self.callback:
+                                self.callback("long_press", None, None)
+                
+                self.sw_last_state = sw_state
                 
             time.sleep(config.ENCODER_POLL_SLEEP)
 
