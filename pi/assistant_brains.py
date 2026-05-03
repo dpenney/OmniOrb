@@ -151,6 +151,7 @@ assistant_state = {
     "oww_ready": False,
     "zoom": 15,                  # Radar zoom level (nautical miles), mirrors ESP32 DEFAULT_RANGE_NM
     "is_sleeping": False,
+    "current_app": "RADAR",      # Current active screen on ESP32
 }
 state_lock = threading.Lock()
 
@@ -164,6 +165,14 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Dedicated Raw UART Logger
+uart_logger = logging.getLogger("uart_raw")
+uart_logger.setLevel(logging.DEBUG)
+uart_handler = RotatingFileHandler(config.UART_LOG_FILE, maxBytes=config.LOG_MAX_BYTES, backupCount=config.LOG_BACKUP_COUNT)
+uart_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+uart_logger.addHandler(uart_handler)
+uart_logger.propagate = False # Don't send raw traffic to the main assistant.log
 
 # Suppress noisy Werkzeug HTTP access logs (health checks, status polls)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
@@ -432,12 +441,17 @@ def serial_reader():
                     elif "APP:" in line:
                         app_mode = line.split("APP:", 1)[1].split()[0]
                         with state_lock:
+                            assistant_state["current_app"] = app_mode
                             assistant_state["mic_active"] = (app_mode == "ASSISTANT" or app_mode == "SPEAKING")
                             assistant_state["radar_active"] = (app_mode == "RADAR")
-                        logger.info(f"[ESP32] {line} → mic_active={assistant_state['mic_active']}, radar_active={app_mode == 'RADAR'}")
+                        logger.info(f"[ESP32] {line} → app={app_mode}, mic_active={assistant_state['mic_active']}")
                     elif line == "HB:OK":
                         send_uart_command("HB:ACK")
-                    elif line not in ("HB:OK",):   # suppress noisy heartbeat
+                    
+                    # Log ALL traffic to the raw UART log
+                    uart_logger.debug(line)
+
+                    if line not in ("HB:OK",) and not line.startswith("DIAG:"):
                         logger.info(f"[ESP32] {line}")
         except Exception as e:
             logger.error(f"Serial read error: {e}")
@@ -675,10 +689,16 @@ _TIMER_TAG = re.compile(r'\[TIMER:(\d+)(?::([^\]]*))?\]')
 _active_timers      = {}
 _active_timers_lock = threading.Lock()
 
-def speak_filler():
-    """Pick a random filler phrase and speak it asynchronously."""
+_last_assistant_response = ""   # injected as context in CONTINUITY follow-ups
+
+def speak_filler(is_continuity=False):
+    """Pick a random filler phrase and speak it asynchronously. Bypassed in continuity."""
+    if is_continuity:
+        return
+        
     if not hasattr(config, "FILLER_PHRASES") or not config.FILLER_PHRASES:
         return
+        
     phrase = random.choice(config.FILLER_PHRASES)
     logger.info(f"[FILLER] Selecting phrase: \"{phrase}\"")
     # speak_text blocks until finished, so run in thread
@@ -867,7 +887,6 @@ def _speak_text_iter(text_iter):
     buf       = ""
     parts     = []
     a_fed     = False  # True once piper_a has its text and stdin is closed
-    b_pending = ""     # batches short sentences before writing to piper_b
 
     def _ensure_piper_a():
         nonlocal piper_a, fwd_a
@@ -880,21 +899,20 @@ def _speak_text_iter(text_iter):
             fwd_a = threading.Thread(target=_forward_piper_audio, args=(piper_a,), daemon=True)
             fwd_a.start()
 
-    def _flush_to_b(text, final=False):
-        """Accumulate text for piper_b; write everything as ONE line when final=True.
-        One line = one ONNX inference run = continuous audio with no within-B gaps."""
-        nonlocal piper_b, b_pending
-        if text:
-            b_pending += (" " if b_pending else "") + text
-        if final and b_pending:
-            if piper_b is None:
-                piper_b = _get_piper()
-            try:
-                piper_b.stdin.write(b_pending.encode() + b'\n')
-                piper_b.stdin.flush()
-            except Exception:
-                pass
-            b_pending = ""
+    def _flush_to_b(text, final=False):  # final unused, kept for call-site compat
+        """Write text to piper_b immediately — one line per sentence.
+        B starts ONNX inference as each sentence arrives so its audio is
+        buffered in the pipe by the time A finishes playing."""
+        nonlocal piper_b
+        if not text:
+            return
+        if piper_b is None:
+            piper_b = _get_piper()
+        try:
+            piper_b.stdin.write(text.encode() + b'\n')
+            piper_b.stdin.flush()
+        except Exception:
+            pass
 
     logged_transcript = False
 
@@ -957,7 +975,7 @@ def _speak_text_iter(text_iter):
                     _flush_to_b(clean)
 
     # ── Final flush ──────────────────────────────────────────────────────────
-    if (buf.strip() or b_pending) and not _tts_abort.is_set():
+    if buf.strip() and not _tts_abort.is_set():
         if not logged_transcript and buf.strip():
             buf_for_match = buf + '\n'
             match = _TRANS_PATTERN.search(buf_for_match)
@@ -982,7 +1000,7 @@ def _speak_text_iter(text_iter):
         else:
             _flush_to_b(clean_buf, final=True)
 
-    # ── Signal piper_b end-of-input NOW so it computes during A's playback ───
+    # ── Close piper_b stdin so it knows there's no more text coming ─────────
     if piper_b:
         try:
             piper_b.stdin.close()
@@ -1070,16 +1088,17 @@ _TIMER_TOOL = types.Tool(function_declarations=[
     ),
     types.FunctionDeclaration(
         name="get_weather",
-        description="Fetch current weather conditions and a 3-day forecast for the user's location.",
+        description="Fetch current weather conditions and a 3-day forecast for the user's location. Use ONLY for weather-specific questions. Do NOT call this for events, local happenings, or general 'what's going on' questions — use google_search grounding for those.",
         parameters=types.Schema(
             type="OBJECT",
             properties={},
             required=[],
         )
     )
-
 ]) if LLM_AVAILABLE else None
 
+# Transparent grounding: model retrieves via Google Search internally and returns
+# grounded text directly in the stream — no function_call parts exposed to the client.
 _SEARCH_TOOL = types.Tool(
     google_search=types.GoogleSearch()
 ) if LLM_AVAILABLE else None
@@ -1152,7 +1171,7 @@ def _set_sleep_mode(enabled):
 
 
 def process_llm(audio_array):
-    global _current_transcript
+    global _current_transcript, _last_assistant_response
     """
     LLM pipeline with streaming and Gemini function calling for timers:
       1. Normalize + encode audio
@@ -1172,17 +1191,20 @@ def process_llm(audio_array):
         peak_amplitude = float(np.max(np.abs(audio_array)))
         if peak_amplitude < config.LLM_MIN_PEAK:
             logger.info(f"Recording discarded — silence (peak={peak_amplitude:.5f} < {config.LLM_MIN_PEAK})")
-            # Return the ESP32 to IDLE/Radar screen
+            # Return the ESP32 to IDLE/Radar screen and reset state
+            with state_lock:
+                assistant_state["status"] = "IDLE"
             send_uart_command("APP:ASSISTANT")
             return
 
         # Valid audio detected — now start the "thinking" UX
         with state_lock:
+            prev_status = assistant_state.get("status")
             assistant_state["processing"] = True
             assistant_state["status"]     = "THINKING"
         
         send_uart_command("APP:THINKING")
-        speak_filler()
+        speak_filler(is_continuity=(prev_status == "CONTINUITY"))
 
         logger.info(f"LLM query: {len(audio_array)} samples, peak={peak_amplitude:.5f}")
 
@@ -1212,6 +1234,8 @@ def process_llm(audio_array):
         interaction_transcript = ""
         
         user_msg = f"[Current Context: {get_context()}]"
+        if prev_status == "CONTINUITY" and _last_assistant_response:
+            user_msg += f"\n[Your previous response was: \"{_last_assistant_response}\". The user is now following up.]"
 
 
         # Log exactly what is being sent to the AI
@@ -1224,29 +1248,27 @@ def process_llm(audio_array):
         cache_id = memory_manager.cache_id if memory_manager else None
         full_instr = memory_manager.full_system_instruction if memory_manager else config.LLM_SYSTEM_PROMPT
         
+        _tool_cfg = types.ToolConfig(include_server_side_tool_invocations=True)
         if cache_id:
             logger.info(f"Using Context Cache: {cache_id}")
             gen_cfg = types.GenerateContentConfig(
                 cached_content=cache_id,
                 tools=_ALL_TOOLS,
-                tool_config=types.ToolConfig(
-                    include_server_side_tool_invocations=True
-                )
+                tool_config=_tool_cfg,
             )
         else:
             logger.info("Using Full System Instruction (No Cache)")
             gen_cfg = types.GenerateContentConfig(
                 system_instruction=full_instr,
                 tools=_ALL_TOOLS,
-                tool_config=types.ToolConfig(
-                    include_server_side_tool_invocations=True
-                )
+                tool_config=_tool_cfg,
             )
 
         # ── First streaming call: speak response, collect any function calls ───
-        pending_timers = []
-        fn_responses   = []
-        model_parts    = []
+        pending_timers    = []
+        fn_responses      = []
+        model_parts       = []
+        has_server_call   = [False]  # set True when google_search fires in stream1
 
         stream1 = client.models.generate_content_stream(
             model=config.LLM_MODEL,
@@ -1269,35 +1291,45 @@ def process_llm(audio_array):
                             enabled = fc.args["enabled"]
                             logger.info(f"Executing Tool: set_sleep_mode - {enabled}")
                             _set_sleep_mode(enabled)
-                            fn_responses.append(types.Part.from_function_response(
+                            fn_responses.append(types.Part(function_response=types.FunctionResponse(
                                 name="set_sleep_mode",
-                                response={"status": "success", "is_sleeping": enabled}
-                            ))
+                                response={"status": "success", "is_sleeping": enabled},
+                                id=fc.id
+                            )))
                         elif fc.name == "set_timer":
                             secs = int(fc.args["seconds"])
                             label = str(fc.args.get("label", ""))
                             pending_timers.append((secs, label))
-                            fn_responses.append(types.Part.from_function_response(
+                            fn_responses.append(types.Part(function_response=types.FunctionResponse(
                                 name="set_timer", 
-                                response={"status": "success", "message": f"Timer for {secs}s started."}
-                            ))
+                                response={"status": "success", "message": f"Timer for {secs}s started."},
+                                id=fc.id
+                            )))
                         elif fc.name == "send_detailed_email":
                             subject = fc.args["subject"]
                             body = fc.args["body"]
                             logger.info(f"Executing Tool: send_detailed_email - {subject}")
                             _send_email_async(subject, body)
-                            fn_responses.append(types.Part.from_function_response(
+                            fn_responses.append(types.Part(function_response=types.FunctionResponse(
                                 name="send_detailed_email",
-                                response={"status": "success", "message": "Email sent."}
-                            ))
+                                response={"status": "success", "message": "Email sent."},
+                                id=fc.id
+                            )))
                         elif fc.name == "get_weather":
                             logger.info("Executing Tool: get_weather")
                             w_data = get_weather()
                             logger.info(f"Tool Result: {w_data}")
-                            fn_responses.append(types.Part.from_function_response(
+                            fn_responses.append(types.Part(function_response=types.FunctionResponse(
                                 name="get_weather",
-                                response={"status": "success", "data": w_data}
-                            ))
+                                response={"status": "success", "data": w_data},
+                                id=fc.id
+                            )))
+                        else:
+                            # Built-in server-side tool (google_search).
+                            # The API executes it internally; we get the grounded answer
+                            # by replaying the conversation with model_parts in stream2.
+                            logger.info(f"Server-side tool: {fc.name}")
+                            has_server_call[0] = True
 
                     if getattr(part, 'text', None):
                         yield part.text
@@ -1343,6 +1375,35 @@ def process_llm(audio_array):
                             yield part.text
 
             _, full_text = _speak_text_iter(_follow_iter())
+
+        elif has_server_call[0]:
+            # google_search fired — replay conversation so Gemini generates the grounded answer.
+            logger.info("google_search fired — follow-up stream for grounded response.")
+            stream2 = client.models.generate_content_stream(
+                model=config.LLM_MODEL,
+                contents=[
+                    audio_part, user_msg,
+                    types.Content(role="model", parts=model_parts),
+                ],
+                config=gen_cfg,
+            )
+
+            def _search_follow_iter():
+                for chunk in stream2:
+                    if not chunk.candidates:
+                        continue
+                    candidate = chunk.candidates[0]
+                    if not candidate.content or not candidate.content.parts:
+                        continue
+                    for part in candidate.content.parts:
+                        if getattr(part, 'text', None):
+                            yield part.text
+
+            _, full_text = _speak_text_iter(_search_follow_iter())
+            if not full_text:
+                logger.warning("google_search follow-up returned no text.")
+                full_text = first_text
+
         else:
             full_text = first_text
 
@@ -1354,7 +1415,8 @@ def process_llm(audio_array):
         if full_text:
             # Strip the [TRANSCRIPT] tag and any internal conversation headers from the UI text
             display_text = _TRANS_PATTERN.sub('', full_text).strip()
-            
+            _last_assistant_response = display_text
+
             logger.info(f"LLM answer: {display_text}")
             send_uart_command(f"TXT|{display_text.replace(chr(10), ' ')}")
             
@@ -1852,18 +1914,43 @@ def audio_processor():
 # ─── Encoder ──────────────────────────────────────────────────────────────────
 
 def on_encoder_event(event, direction, value):
-    logger.info(f"Encoder: {event} {direction}")
+    with state_lock:
+        mode = assistant_state.get("current_app", "RADAR")
+    
+    logger.info(f"Encoder: {event} {direction if direction else ''} (Mode: {mode})")
+    
     if event == "rotate":
-        if direction == "CW":
-            with state_lock:
-                assistant_state["zoom"] = max(5, assistant_state["zoom"] - 1)
-                assistant_state["last_event"] = f"{event}_{direction}"
-            send_uart_command("Z+")
+        if mode in ("RADAR", "GLOBE"):
+            # Zoom Logic
+            if direction == "CW":
+                with state_lock:
+                    assistant_state["zoom"] = max(5, assistant_state["zoom"] - 1)
+                send_uart_command("Z+")
+            else:
+                with state_lock:
+                    assistant_state["zoom"] = min(250, assistant_state["zoom"] + 1)
+                send_uart_command("Z-")
+        elif mode in ("ASSISTANT", "SPEAKING", "CONTINUITY"):
+            # Style Toggle Logic
+            send_uart_command("STYLE:TOGGLE")
         else:
+            # Default to Zoom for other screens
+            if direction == "CW": send_uart_command("Z+")
+            else: send_uart_command("Z-")
+            
+    elif event == "press":
+        if mode == "RADAR":
+            # Reset Zoom
             with state_lock:
-                assistant_state["zoom"] = min(250, assistant_state["zoom"] + 1)
-                assistant_state["last_event"] = f"{event}_{direction}"
-            send_uart_command("Z-")
+                assistant_state["zoom"] = 15
+            send_uart_command("Z:15")
+            logger.info("Encoder Button: Zoom reset to 15nm")
+        elif mode == "CLOCK":
+            # Jump to Assistant
+            send_uart_command("APP:ASSISTANT")
+        else:
+            # Default press action: Back to Radar
+            send_uart_command("APP:RADAR")
 
 # ─── Hardware Init ────────────────────────────────────────────────────────────
 
