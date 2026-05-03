@@ -408,7 +408,8 @@ void fetch_task(void *pv) {
                 HTTPClient http;
                 String url = String("http://") + ADSB_HOST + ":" + ADSB_PORT + ADSB_PATH + 
                              "?lat=" + String(settings.home_lat, 4) + 
-                             "&lon=" + String(settings.home_lon, 4);
+                             "&lon=" + String(settings.home_lon, 4) +
+                             "&range=" + String(range_nm, 1);
                 http.begin(url);
                 http.setTimeout(2500);
                 int code = http.GET();

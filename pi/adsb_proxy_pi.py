@@ -50,20 +50,28 @@ box_lock       = threading.Lock()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def make_box(lat, lon, radius_deg_lat=0.3, radius_deg_lon=0.4):
-    """Return a minLat,maxLat,minLon,maxLon string centered on (lat, lon)."""
+import math
+
+def make_box(lat, lon, range_nm=20.0):
+    """Return a minLat,maxLat,minLon,maxLon string centered on (lat, lon) with given range in NM."""
+    # Conversion: 1 deg lat = 60nm. 1 deg lon = 60nm * cos(lat)
+    radius_deg_lat = range_nm / 60.0
+    # Use a slightly larger lon radius to ensure we cover a "square" in NM
+    cos_lat = math.cos(math.radians(lat))
+    radius_deg_lon = range_nm / (60.0 * cos_lat) if cos_lat > 0.1 else radius_deg_lat
+
     return (f"{lat - radius_deg_lat:.4f},"
             f"{lat + radius_deg_lat:.4f},"
             f"{lon - radius_deg_lon:.4f},"
             f"{lon + radius_deg_lon:.4f}")
 
-def update_location(lat, lon):
+def update_location(lat, lon, range_nm=20.0):
     global current_box
-    new_box = make_box(lat, lon)
+    new_box = make_box(lat, lon, range_nm)
     with box_lock:
         if new_box != current_box:
             current_box = new_box
-            logger.info(f"Bounding box updated for ({lat:.4f}, {lon:.4f}) → {new_box}")
+            logger.info(f"Bounding box updated for ({lat:.4f}, {lon:.4f}) range={range_nm}nm → {new_box}")
 
 # ── Background ADS-B Fetcher ──────────────────────────────────────────────────
 #
@@ -191,14 +199,15 @@ def fetch_adsb():
 
 @app.route('/data/aircraft.json')
 def get_aircraft():
-    """Serve aircraft data. Accepts optional ?lat=&lon= from the ESP32 to center the search area."""
+    """Serve aircraft data. Accepts optional ?lat=&lon=&range= from the ESP32 to center the search area."""
     try:
-        lat = request.args.get('lat')
-        lon = request.args.get('lon')
+        lat   = request.args.get('lat')
+        lon   = request.args.get('lon')
+        r_nm  = request.args.get('range')
         if lat and lon:
-            update_location(float(lat), float(lon))
+            update_location(float(lat), float(lon), float(r_nm) if r_nm else 20.0)
     except Exception as e:
-        logger.warning(f"Bad location params: {e}")
+        logger.warning(f"Bad params: {e}")
 
     return jsonify(latest_flights)
 
