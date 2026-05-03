@@ -1928,7 +1928,14 @@ def audio_processor():
 def on_encoder_event(event, direction, value):
     with state_lock:
         mode = assistant_state.get("current_app", "RADAR")
+        is_sleeping = assistant_state.get("is_sleeping", False)
     
+    # Wake on interaction
+    if is_sleeping and event in ("rotate", "press"):
+        logger.info(f"Wake trigger detected ({event})! Exiting sleep mode.")
+        _set_sleep_mode(False)
+        return
+
     logger.info(f"Encoder: {event} {direction if direction else ''} (Mode: {mode})")
     
     if event == "rotate":
