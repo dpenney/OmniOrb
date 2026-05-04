@@ -740,20 +740,30 @@ static void draw_radar_timer_ring() {
     const float STEP = 0.008f;
     const float FULL = 2.0f * M_PI;
     const float start_rad = -M_PI / 2.0f;
+    static float last_pct = -1.0f;
 
     if (!AssistantView::is_timer_active()) {
-        // Erase any leftover ring
-        for (float a = start_rad; a <= start_rad + FULL; a += STEP) {
-            float cs = cosf(a), sn = sinf(a);
-            for (int tt = 0; tt < 10; tt++)
-                gfx->drawPixel(CX + (int)((238 - tt) * cs), CY + (int)((238 - tt) * sn), C_BG);
+        if (last_pct >= 0) {
+            full_redraw(); // Clear the ring cleanly once
+            last_pct = -1.0f;
         }
         return;
     }
 
-    float pct      = AssistantView::get_timer_vis_pct();
+    float pct = AssistantView::get_timer_vis_pct();
     float span_rad = (pct / 100.0f) * FULL;
     float end_rad  = start_rad + span_rad;
+
+    // Shrinking logic: Erase the gap between old and new
+    if (last_pct > pct) {
+        float old_span = (last_pct / 100.0f) * FULL;
+        for (float a = start_rad + (pct/100.0f)*FULL; a <= start_rad + old_span; a += STEP) {
+            float cs = cosf(a), sn = sinf(a);
+            for (int tt = 0; tt < 10; tt++)
+                gfx->drawPixel(CX + (int)((238 - tt) * cs), CY + (int)((238 - tt) * sn), C_BG);
+        }
+    }
+    last_pct = pct;
 
     // Green → yellow → red colour
     uint16_t col;
@@ -1238,6 +1248,8 @@ void loop() {
             ESP.restart();
         } else if (rx == "TIMER:CANCEL") {
             AssistantView::clear_timer();
+            if (current_app == APP_CLOCK) ClockView::set_timer_pct(-1);
+            if (current_app == APP_RADAR) full_redraw();
         } else if (rx.startsWith("WAKE|")) {
             if (current_app != APP_ASSISTANT) {
                 if (current_app == APP_CLOCK) {
