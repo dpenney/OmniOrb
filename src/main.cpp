@@ -585,7 +585,7 @@ void erase_sweep(float a_deg) {
         if (line_near(CX, CY, ex, ey, DETAIL_BX,            DETAIL_BY,            10.0f) ||
             line_near(CX, CY, ex, ey, DETAIL_BX+DETAIL_BW,  DETAIL_BY,            10.0f) ||
             line_near(CX, CY, ex, ey, DETAIL_BX,            DETAIL_BY+DETAIL_BH,  10.0f) ||
-            line_near(CX, CY, ex, ey, DETAIL_BX+DETAIL_BW,  DETAIL_BY+DETAIL_BH,  10.0f) ||
+            line_near(CX, CY, ex, ey, DETAIL_BX+DETAIL_BW+DETAIL_BW,  DETAIL_BY+DETAIL_BH,  10.0f) ||
             line_near(CX, CY, ex, ey, DETAIL_BX+DETAIL_BW/2, DETAIL_BY+DETAIL_BH/2, 10.0f)) {
             detail_clobbered = true;
         }
@@ -754,6 +754,15 @@ static void draw_radar_timer_ring() {
             col = (31 << 11) | (g << 5);
         }
 
+        // Smart Redraw: Only redraw if the percentage has actually moved enough to be visible.
+        // This eliminates flickering and saves massive CPU/SPI bandwidth.
+        static float last_draw_pct = -1.0f;
+        if (fabs(draw_pct - last_draw_pct) < 0.2f) return; 
+        last_draw_pct = draw_pct;
+
+        // Wait for VSYNC to eliminate flickering on direct direct-to-FB draws
+        if (vsync_sem) xSemaphoreTake(vsync_sem, pdMS_TO_TICKS(50));
+
         int ring_r = 239, thickness = 10;
         // 1. Erase (Full 360 with 1-degree steps for absolute precision)
         for (int deg = 0; deg < 360; deg++) {
@@ -775,6 +784,7 @@ static void draw_radar_timer_ring() {
 }
 
 void full_redraw() {
+    if (current_app != APP_RADAR) return; // Hard-gate: Never draw radar elements on other screens
     // Invalidate all paint state so aircraft repaint on next sweep pass
     if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         for (int i = 0; i < aircraft_count; i++) aircraft[i].paint_valid = false;
@@ -783,8 +793,6 @@ void full_redraw() {
         Serial.println("Warning: ac_mutex held during full_redraw!");
     }
     draw_static_bg();
-    draw_radar_timer_ring();   // drawn after bg, outside sweep radius — will persist
-    draw_sweep(sweep_angle);
     draw_range_label();
     if (detail_visible) draw_detail_box();
     prev_sweep = sweep_angle;
@@ -971,6 +979,27 @@ void setup() {
     notify_pi_app_mode(current_app);
 }
 
+void update_radar_sweep() {
+    if (current_app != APP_RADAR) return; // Hard-gate: Never sweep on other screens
+    uint32_t now = millis();
+    static unsigned long last_sweep_ms = 0;
+    if (now - last_sweep_ms >= SWEEP_INTERVAL_MS) {
+        float new_angle = fmodf(sweep_angle + SWEEP_STEP_DEG, 360.0f);
+        if (prev_sweep >= 0) erase_sweep(prev_sweep);
+        sweep_paint_aircraft(sweep_angle, new_angle);
+        draw_sweep(new_angle);
+        if (detail_visible && detail_clobbered) draw_detail_box();
+        prev_sweep  = sweep_angle;
+        sweep_angle = new_angle;
+        last_sweep_ms = now;
+    }
+    static unsigned long last_fetch_ms = 0;
+    if (now - last_fetch_ms >= FETCH_INTERVAL_MS && !fetch_busy) {
+        fetch_requested = true;
+        last_fetch_ms = now;
+    }
+}
+
 void loop() {
     uint32_t now = millis();
     
@@ -1104,37 +1133,17 @@ void loop() {
         Serial.println(msg);
         AssistantView::clear_timer();
         if (current_app == APP_CLOCK) ClockView::set_timer_pct(-1);
-        if (current_app == APP_RADAR) full_redraw();  // redraw to erase ring
+        if (current_app == APP_RADAR) full_redraw();
     }
 
     if (current_app == APP_RADAR) {
-        // Don't run lv_timer_handler in radar mode -- it would flush LVGL's white screen over us
-
-        // Sweep — smooth single-arm rotation
-        static unsigned long last_sweep_ms = 0;
-        if (now - last_sweep_ms >= SWEEP_INTERVAL_MS) {
-            float new_angle = fmodf(sweep_angle + SWEEP_STEP_DEG, 360.0f);
-            if (prev_sweep >= 0) erase_sweep(prev_sweep);
-            sweep_paint_aircraft(sweep_angle, new_angle);
-            draw_sweep(new_angle);
-            draw_radar_timer_ring();  // redraws ring if active (persists outside sweep radius)
-            if (detail_visible && detail_clobbered) draw_detail_box();
-            prev_sweep  = sweep_angle;
-            sweep_angle = new_angle;
-            last_sweep_ms = now;
-        }
-
-        // Trigger background fetch every FETCH_INTERVAL_MS
-        static unsigned long last_fetch_ms = 0;
-        if (now - last_fetch_ms >= FETCH_INTERVAL_MS && !fetch_busy) {
-            fetch_requested = true;
-            last_fetch_ms = now;
+        if (!touch_active) {
+            update_radar_sweep();
         }
     } else if (current_app == APP_ASSISTANT) {
         AssistantView::update();
     } else if (current_app == APP_CLOCK) {
         if (!touch_active) {
-            // Update timer arc at ~10 Hz — fast enough to look smooth, won't flood LVGL
             static unsigned long last_timer_arc_ms = 0;
             if (now - last_timer_arc_ms >= 100) {
                 if (AssistantView::is_timer_active()) {
@@ -1143,15 +1152,10 @@ void loop() {
                 last_timer_arc_ms = now;
             }
             ClockView::update_time();
-            // VSYNC waiting is now handled inside my_disp_flush to ensure it happens
-            // immediately before the DMA transfer, not before the rendering.
             lv_timer_handler();
         }
     } else if (current_app == APP_GLOBE) {
-        if (!touch_active) {
-            GlobeView::update();
-            draw_radar_timer_ring();
-        }
+        GlobeView::update();
     } else if (current_app == APP_SETTINGS || current_app == APP_DIAGNOSTICS) {
         if (!touch_active) {
             static uint32_t last_diag_req = 0;
@@ -1271,6 +1275,8 @@ void loop() {
         } else if (rx.startsWith("A")) {
             int intensity = rx.substring(1).toInt();
             AssistantView::set_audio_intensity(intensity);
+        } else if (rx == "GLOBE:TOGGLE") {
+            GlobeView::toggle_rotation();
         } else if (rx.startsWith("S")) {
             int pipe_idx = rx.indexOf('|');
             String s_data;

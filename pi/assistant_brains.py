@@ -1946,7 +1946,7 @@ def on_encoder_event(event, direction, value):
     logger.info(f"Encoder: {event} {direction if direction else ''} (Mode: {mode})")
     
     if event == "rotate":
-        if mode in ("RADAR", "GLOBE"):
+        if mode == "RADAR":
             # Zoom Logic
             if direction == "CW":
                 with state_lock:
@@ -1956,6 +1956,9 @@ def on_encoder_event(event, direction, value):
                 with state_lock:
                     assistant_state["zoom"] = min(250, assistant_state["zoom"] + 1)
                 send_uart_command("Z-")
+        elif mode == "GLOBE":
+            # Tell the ESP32 to toggle the globe's rotation state
+            send_uart_command("GLOBE:TOGGLE")
         elif mode in ("ASSISTANT", "SPEAKING", "CONTINUITY"):
             # Style Toggle Logic
             send_uart_command("STYLE:TOGGLE")

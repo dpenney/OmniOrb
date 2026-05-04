@@ -6,4 +6,5 @@ public:
     static void show();
     static void update();
     static void add_tilt(float dt);
+    static void toggle_rotation();
 };

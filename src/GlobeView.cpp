@@ -45,12 +45,18 @@ const float BARK_LON = -92.858774f;
 
 static float rot_y = 0.0f;
 static float tilt_x = -0.41f; // Current globe tilt
+static bool is_rotating = true;
 static unsigned long last_frame_time = 0;
 
 void GlobeView::add_tilt(float dt) {
     tilt_x += dt;
     if (tilt_x > M_PI / 2.0f) tilt_x = M_PI / 2.0f;
     if (tilt_x < -M_PI / 2.0f) tilt_x = -M_PI / 2.0f;
+}
+
+void GlobeView::toggle_rotation() {
+    is_rotating = !is_rotating;
+    Serial.printf("[DEBUG] Globe Rotation: %s\n", is_rotating ? "ON" : "OFF");
 }
 
 void GlobeView::init() {
@@ -105,8 +111,10 @@ void GlobeView::update() {
     last_frame_time = now;
 
     // Spin speed
-    rot_y += 0.012f;
-    if (rot_y > M_PI * 2) rot_y -= M_PI * 2;
+    if (is_rotating) {
+        rot_y += 0.012f;
+        if (rot_y > M_PI * 2) rot_y -= M_PI * 2;
+    }
 
     float cos_y = cosf(rot_y);
     float sin_y = sinf(rot_y);
