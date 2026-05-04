@@ -28,6 +28,11 @@ static float audio_scale = 0.0f;
 int AssistantView::freq_bins[16] = {0};
 static float visual_bins[16] = {0.0f};
 
+// Trig LUT for the 288 spectrum bar lines (16 bins * 2 mirrors * 9 steps)
+static float lut_cs[288];
+static float lut_sn[288];
+static bool  lut_init = false;
+
 // Iris incremental erase: tracks glow radius from last frame so we only erase
 // the shrinking annulus instead of the full 460KB fillScreen.
 static int av_prev_glow_r = -1;
@@ -95,6 +100,8 @@ void AssistantView::toggle_style() {
     if (av_gfx) {
         if (av_vsync_sem) { xSemaphoreTake(av_vsync_sem, 0); xSemaphoreTake(av_vsync_sem, pdMS_TO_TICKS(50)); }
         av_gfx->fillScreen(C_BG);
+        // Force a FULL flush to clear the physical display memory
+        if (canvas && output_gfx) canvas->flush(); 
     }
 }
 
@@ -110,6 +117,26 @@ void AssistantView::set_vsync_sem(SemaphoreHandle_t sem) { av_vsync_sem = sem; }
 void AssistantView::init() {
     start_ms = millis();
     next_blink_ms = start_ms + 2000;
+
+    // Initialize the Spectrum Trig LUT
+    if (!lut_init) {
+        int bin_count = 16;
+        int idx = 0;
+        for (int i = 0; i < bin_count; i++) {
+            for (int mirror = 0; mirror < 2; mirror++) {
+                float angle_deg = (i * (180.0f / bin_count)) + (mirror * 180.0f);
+                float bar_width_deg = 4.0f;
+                for (float off = -bar_width_deg/2.0f; off <= bar_width_deg/2.0f; off += 0.5f) {
+                    float rad = (angle_deg + off) * (M_PI / 180.0f);
+                    lut_cs[idx] = cosf(rad);
+                    lut_sn[idx] = sinf(rad);
+                    idx++;
+                    if (idx >= 288) break;
+                }
+            }
+        }
+        lut_init = true;
+    }
 }
 
 void AssistantView::show() {
@@ -217,7 +244,7 @@ void AssistantView::_draw_iris(float t) {
 
     int new_glow_r = iris_r + 15 + (int)(audio_scale * 30);
 
-    // Erase only the annulus that shrank (avoids full fillScreen)
+    // 1. Center Iris Glow Annulus Erase
     if (av_prev_glow_r > new_glow_r) {
         for (int r = new_glow_r + 1; r <= av_prev_glow_r; r++)
             av_gfx->drawCircle(CX, CY, r, C_BG);
@@ -230,26 +257,44 @@ void AssistantView::_draw_iris(float t) {
     av_gfx->fillCircle(CX, CY, iris_r - 30, C_BG);
     av_gfx->fillCircle(CX, CY, 15 + (int)(breath * 10) + (int)(audio_scale * 40), eff_high);
 
-    // Spectrum rings
+    // 2. Spectrum rings - Synchronized Differential Erase using LUT
     int bin_count = 16;
     float start_r = 238.0f;
     float max_len = 90.0f;
+    int lut_idx = 0;
+
     for (int i = 0; i < bin_count; i++) {
+        float old_mag = visual_bins[i] * max_len;
+        
         float target = freq_bins[i] / 100.0f;
         if (target > visual_bins[i]) visual_bins[i] = target;
         else visual_bins[i] *= SPECTRUM_DECAY;
-        float mag = visual_bins[i] * max_len;
+        float new_mag = visual_bins[i] * max_len;
+
         for (int mirror = 0; mirror < 2; mirror++) {
-            float angle_deg = (i * (180.0f / bin_count)) + (mirror * 180.0f);
             float bar_width_deg = 4.0f;
             for (float off = -bar_width_deg/2.0f; off <= bar_width_deg/2.0f; off += 0.5f) {
-                float rad = (angle_deg + off) * (M_PI / 180.0f);
-                int x0 = CX + (int)(cosf(rad) * start_r);
-                int y0 = CY + (int)(sinf(rad) * start_r);
-                int x1 = CX + (int)(cosf(rad) * (start_r - mag));
-                int y1 = CY + (int)(sinf(rad) * (start_r - mag));
-                uint16_t c = (fabsf(off) > (bar_width_deg/2.0f - 1.0f)) ? C_SECONDARY : eff_accent;
-                av_gfx->drawLine(x0, y0, x1, y1, c);
+                float cs = lut_cs[lut_idx];
+                float sn = lut_sn[lut_idx];
+                lut_idx++;
+
+                int x0 = CX + (int)(cs * start_r);
+                int y0 = CY + (int)(sn * start_r);
+
+                // Erase OLD (exact same math as draw ensures 100% overlap)
+                if (old_mag > 0.5f) {
+                    int x1_old = CX + (int)(cs * (start_r - old_mag));
+                    int y1_old = CY + (int)(sn * (start_r - old_mag));
+                    av_gfx->drawLine(x0, y0, x1_old, y1_old, C_BG);
+                }
+
+                // Draw NEW
+                if (new_mag > 0.5f) {
+                    int x1_new = CX + (int)(cs * (start_r - new_mag));
+                    int y1_new = CY + (int)(sn * (start_r - new_mag));
+                    uint16_t c = (fabsf(off) > (bar_width_deg/2.0f - 1.0f)) ? C_SECONDARY : eff_accent;
+                    av_gfx->drawLine(x0, y0, x1_new, y1_new, c);
+                }
             }
         }
     }
