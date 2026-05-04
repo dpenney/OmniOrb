@@ -148,8 +148,8 @@ int      aircraft_count = 0;
 SemaphoreHandle_t ac_mutex;
 
 // ─── Gesture Detection ───────────────────────────────────────────────────────
-#define GESTURE_THRESHOLD 50
-#define TAP_THRESHOLD     50   ///< Max dx+dy to treat as a tap (matches GESTURE_THRESHOLD)
+#define GESTURE_THRESHOLD 10
+#define TAP_THRESHOLD     20   ///< Max dx+dy to treat as a tap
 
 // ─── Detail Box Layout ────────────────────────────────────────────────────────
 #define DETAIL_BX  160
@@ -197,6 +197,7 @@ void enter_settings() {
         lv_scr_load(blank);
     }
     current_app = APP_SETTINGS;
+    SettingsView::show();
     SettingsView::update();   // draw immediately on entry
 }
 
@@ -206,16 +207,30 @@ void exit_settings() {
     Serial0.println(vmsg);
     Serial.printf("[UART→Pi] %s\n", vmsg.c_str());
 
+    // Safety: If prev_app is a menu, default to Radar
+    if (prev_app == APP_SETTINGS || prev_app == APP_DIAGNOSTICS) {
+        prev_app = APP_RADAR;
+    }
+
+    Serial0.printf("Exiting Settings: Returning to prev_app ID %d\n", (int)prev_app);
     current_app = prev_app;
-    if (prev_app == APP_CLOCK) {
+    Serial0.printf("Exiting Settings: current_app is now ID %d\n", (int)current_app);
+
+    if (current_app == APP_CLOCK) {
         lvgl_active = true;
         ClockView::show();
-    } else if (prev_app == APP_ASSISTANT) {
+    } else if (current_app == APP_ASSISTANT) {
         AssistantView::show();
-        full_redraw();
+    } else if (current_app == APP_GLOBE) {
+        GlobeView::show();
+    } else if (current_app == APP_DIAGNOSTICS) {
+        DiagnosticsView::init();
     } else {
+        // Default: APP_RADAR
+        current_app = APP_RADAR;
         full_redraw();
     }
+    notify_pi_app_mode(current_app);
 }
 
 void process_swipe(int x1, int y1, int x2, int y2) {
@@ -237,20 +252,22 @@ void process_swipe(int x1, int y1, int x2, int y2) {
     }
 
     if (abs(dx) < TAP_THRESHOLD && abs(dy) < TAP_THRESHOLD) {
-        // Gesture too small, treat as a TAP
-        int hit = find_nearest(x2, y2);
+        if (current_app == APP_RADAR) {
+            int hit = find_nearest(x2, y2);
         if (hit >= 0 && hit < aircraft_count) {
             selected_idx = hit;
-            xSemaphoreTake(ac_mutex, portMAX_DELAY);
-            Aircraft &ac = aircraft[hit];
-            if (ac.paint_valid)
-                draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, C_SEL);
-            xSemaphoreGive(ac_mutex);
+            if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                Aircraft &ac = aircraft[hit];
+                if (ac.paint_valid)
+                    draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, C_SEL);
+                xSemaphoreGive(ac_mutex);
+            }
             draw_detail_box();
         } else if (detail_visible) {
             selected_idx = -1;
             erase_detail_box();
         }
+    }
         return;
     }
 
@@ -292,6 +309,11 @@ void process_swipe(int x1, int y1, int x2, int y2) {
                 notify_pi_app_mode(current_app);
                 lvgl_active = true;  // Enable LVGL flush before showing clock screen
                 ClockView::show();
+            } else if (current_app == APP_CLOCK) {
+                current_app = APP_RADAR;
+                notify_pi_app_mode(current_app);
+                lvgl_active = false;
+                full_redraw();
             }
         } else if (dx > GESTURE_THRESHOLD) {
             Serial.println("Gesture: SWIPE RIGHT (Clock -> Assistant -> Globe -> Radar)");
@@ -376,7 +398,7 @@ void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *c
         // into the middle of the display's active scanout.
         if (vsync_sem) {
             xSemaphoreTake(vsync_sem, 0); // Drain stale token
-            xSemaphoreTake(vsync_sem, portMAX_DELAY);
+            xSemaphoreTake(vsync_sem, pdMS_TO_TICKS(100));
         }
         
         gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
@@ -411,6 +433,7 @@ void fetch_task(void *pv) {
                              "&lon=" + String(settings.home_lon, 4) +
                              "&range=" + String(range_nm, 1);
                 http.begin(url);
+                Serial0.printf("Fetching: %s\n", url.c_str());
                 http.setTimeout(2500);
                 int code = http.GET();
                 if (code == 200) {
@@ -529,7 +552,7 @@ void erase_sweep(float a_deg) {
     restore_rings_and_cross();
 
     // Restore any painted blips the sweep line crossed through
-    xSemaphoreTake(ac_mutex, portMAX_DELAY);
+    if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     for (int i = 0; i < aircraft_count; i++) {
         Aircraft &ac = aircraft[i];
         if (!ac.paint_valid) continue;
@@ -551,7 +574,8 @@ void erase_sweep(float a_deg) {
         gfx->setCursor(lx+8, ly-4);
         gfx->print(ac.paint_cs);
     }
-    xSemaphoreGive(ac_mutex);
+        xSemaphoreGive(ac_mutex);
+    }
 
     // If detail box is visible, check if the sweep line clobbers it
     if (detail_visible) {
@@ -606,7 +630,7 @@ void paint_blip(Aircraft &ac, int sx, int sy, uint16_t color) {
  * from prev_angle to new_angle: erase old painted position, repaint new.
  */
 void sweep_paint_aircraft(float prev_angle, float new_angle) {
-    xSemaphoreTake(ac_mutex, portMAX_DELAY);
+    if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
 
     for (int i = 0; i < aircraft_count; i++) {
         Aircraft &ac = aircraft[i];
@@ -659,11 +683,11 @@ void sweep_paint_aircraft(float prev_angle, float new_angle) {
         }
     }
 
-    xSemaphoreGive(ac_mutex);
+        xSemaphoreGive(ac_mutex);
 }
 
 void draw_detail_box() {
-    xSemaphoreTake(ac_mutex, portMAX_DELAY);
+    if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
     if (selected_idx < 0 || selected_idx >= aircraft_count) {
         xSemaphoreGive(ac_mutex); return;
     }
@@ -680,6 +704,7 @@ void draw_detail_box() {
     gfx->setCursor(DETAIL_BX+6, DETAIL_BY+50); gfx->printf("Hdg: %d deg", ac.heading);
     detail_visible = true;
     detail_clobbered = false;
+    xSemaphoreGive(ac_mutex);
 }
 
 void erase_detail_box() {
@@ -699,7 +724,7 @@ void draw_range_label() {
 
 int find_nearest(int tx, int ty) {
     int best = -1; float best_d = 18.0f;
-    xSemaphoreTake(ac_mutex, portMAX_DELAY);
+    if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) != pdTRUE) return -1;
     for (int i = 0; i < aircraft_count; i++) {
         if (!aircraft[i].paint_valid) continue;
         float d = sqrtf((float)((tx-aircraft[i].paint_x)*(tx-aircraft[i].paint_x)+
@@ -754,9 +779,12 @@ static void draw_radar_timer_ring() {
 
 void full_redraw() {
     // Invalidate all paint state so aircraft repaint on next sweep pass
-    xSemaphoreTake(ac_mutex, portMAX_DELAY);
-    for (int i = 0; i < aircraft_count; i++) aircraft[i].paint_valid = false;
-    xSemaphoreGive(ac_mutex);
+    if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        for (int i = 0; i < aircraft_count; i++) aircraft[i].paint_valid = false;
+        xSemaphoreGive(ac_mutex);
+    } else {
+        Serial.println("Warning: ac_mutex held during full_redraw!");
+    }
     draw_static_bg();
     draw_radar_timer_ring();   // drawn after bg, outside sweep radius — will persist
     draw_sweep(sweep_angle);
@@ -854,6 +882,7 @@ void setup() {
     Serial.printf("Connecting to %s...\n", settings.wifi_ssid);
 
     WiFi.begin(settings.wifi_ssid, settings.wifi_password);
+    WiFi.setSleep(false);
     
     unsigned long start_wifi = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start_wifi < 10000) {
@@ -866,7 +895,7 @@ void setup() {
         ProvisioningManager::startPortal(settings);
     }
 
-    Serial.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
+    Serial0.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
     ArduinoOTA.setHostname("esp32-radar");
     ArduinoOTA.begin();
 
@@ -946,7 +975,13 @@ void setup() {
 }
 
 void loop() {
-    unsigned long now = millis();
+    uint32_t now = millis();
+    
+    static uint32_t last_wifi_print = 0;
+    if (now - last_wifi_print > 10000) {
+        last_wifi_print = now;
+        Serial0.printf("WIFI_STATUS:%d,RSSI:%d,IP:%s\n", (int)WiFi.status(), (int)WiFi.RSSI(), WiFi.localIP().toString().c_str());
+    }
 
     // Touch processing
     touch_active = read_touch();
@@ -1108,28 +1143,32 @@ void loop() {
     } else if (current_app == APP_ASSISTANT) {
         AssistantView::update();
     } else if (current_app == APP_CLOCK) {
-        // Update timer arc at ~10 Hz — fast enough to look smooth, won't flood LVGL
-        static unsigned long last_timer_arc_ms = 0;
-        if (now - last_timer_arc_ms >= 100) {
-            if (AssistantView::is_timer_active()) {
-                ClockView::set_timer_pct((int)AssistantView::get_timer_vis_pct());
+        if (!touch_active) {
+            // Update timer arc at ~10 Hz — fast enough to look smooth, won't flood LVGL
+            static unsigned long last_timer_arc_ms = 0;
+            if (now - last_timer_arc_ms >= 100) {
+                if (AssistantView::is_timer_active()) {
+                    ClockView::set_timer_pct((int)AssistantView::get_timer_vis_pct());
+                }
+                last_timer_arc_ms = now;
             }
-            last_timer_arc_ms = now;
+            ClockView::update_time();
+            // VSYNC waiting is now handled inside my_disp_flush to ensure it happens
+            // immediately before the DMA transfer, not before the rendering.
+            lv_timer_handler();
         }
-        ClockView::update_time();
-        // VSYNC waiting is now handled inside my_disp_flush to ensure it happens
-        // immediately before the DMA transfer, not before the rendering.
-        lv_timer_handler();
     } else if (current_app == APP_GLOBE) {
-        GlobeView::update();
+        if (!touch_active) GlobeView::update();
     } else if (current_app == APP_SETTINGS || current_app == APP_DIAGNOSTICS) {
-        static uint32_t last_diag_req = 0;
-        if (now - last_diag_req > 200) { // 5Hz requests
-            Serial0.println("DIAG?");
-            last_diag_req = now;
-        }
-        if (current_app == APP_DIAGNOSTICS) {
-            DiagnosticsView::update();
+        if (!touch_active) {
+            static uint32_t last_diag_req = 0;
+            if (now - last_diag_req > 200) { // 5Hz requests
+                Serial0.println("DIAG?");
+                last_diag_req = now;
+            }
+            if (current_app == APP_DIAGNOSTICS) {
+                DiagnosticsView::update();
+            }
         }
     }
 
@@ -1149,6 +1188,10 @@ void loop() {
         last_pi_msg_ms = millis();
         if (rx == "HB:ACK") {
             return;
+        } else if (rx.startsWith("SLEEP:")) {
+            int mode = rx.substring(6).toInt();
+            // Bypassing AssistantView::set_state to prevent task deadlock during animation
+            set_display_power(mode == 0); // 1 = Sleep (Off), 0 = Wake (On)
         } else if (rx == "SYNC?") {
 
 
@@ -1189,6 +1232,10 @@ void loop() {
         } else if (rx == "STYLE:TOGGLE") {
             AssistantView::toggle_style();
             Serial.println("Remote Style Toggle");
+        } else if (rx == "REBOOT" || rx == "!") {
+            Serial.println("Rebooting via UART command...");
+            delay(500);
+            ESP.restart();
         } else if (rx == "TIMER:CANCEL") {
             AssistantView::clear_timer();
         } else if (rx.startsWith("WAKE|")) {
@@ -1277,10 +1324,6 @@ void loop() {
                 if (comma == -1) break;
                 start = comma + 1;
             }
-        } else if (rx.startsWith("SLEEP:")) {
-            int mode = rx.substring(6).toInt();
-            // Bypassing AssistantView::set_state to prevent task deadlock during animation
-            set_display_power(mode == 0); // 1 = Sleep (Off), 0 = Wake (On)
         }
     };
 
@@ -1291,7 +1334,9 @@ void loop() {
     }
     while (Serial0.available()) {
         char c = Serial0.read();
-        if (c == '\n') { handle_cmd(rx_buf_uart); rx_buf_uart = ""; }
+        if (c == '\n' || c == '!') { // Support '!' as a hard-terminator for emergency reboots
+            handle_cmd(rx_buf_uart); rx_buf_uart = ""; 
+        }
         else if (c != '\r') rx_buf_uart += c;
     }
 
