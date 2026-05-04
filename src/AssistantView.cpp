@@ -162,6 +162,7 @@ void AssistantView::tick_timer() {
         timer_pct_vis = 0.0f;
         if (!timer_done_flag) timer_done_flag = true;
     }
+
 }
 
 bool AssistantView::is_timer_done()     { return timer_done_flag; }
@@ -478,20 +479,31 @@ void AssistantView::update() {
         _draw_iris(t);
     }
 
-    // Timer ring — drawn at r=238-248, outside sweep radius, small PSRAM writes
+    // Timer ring — Two-phase draw to ensure clean shrinking on the canvas
     static float draw_pct = 100.0f;
-    if (timer_active && timer_pct_vis >= 0.0f) {
+    if (timer_active) {
         draw_pct += (timer_pct_vis - draw_pct) * 0.12f;
-        float span_deg  = (draw_pct / 100.0f) * 360.0f;
-        float start_rad = -M_PI / 2.0f;
-        float end_rad   = start_rad + span_deg * (M_PI / 180.0f);
-        uint16_t col    = timer_ring_color((int)draw_pct);
-        int ring_r = 240, thickness = 10;
-        for (float a = start_rad; a <= end_rad; a += 0.008f) {
-            float cs = cosf(a), sn = sinf(a);
+        int limit_deg = (int)(draw_pct * 3.6f);
+        uint16_t col = timer_ring_color((int)draw_pct);
+        int ring_r = 239, thickness = 10;
+
+        // 1. Erase (Full 360 with 1-degree steps for absolute precision)
+        for (int deg = 0; deg < 360; deg++) {
+            float rad = (deg - 90) * M_PI / 180.0f;
+            float cs = cosf(rad), sn = sinf(rad);
+            for (int tt = -1; tt < thickness + 1; tt++) // -1 to +1 safety margin
+                av_gfx->drawPixel(CX + (int)((ring_r - tt) * cs), CY + (int)((ring_r - tt) * sn), C_BG);
+        }
+
+        // 2. Draw
+        for (int deg = 0; deg <= limit_deg; deg++) {
+            float rad = (deg - 90) * M_PI / 180.0f;
+            float cs = cosf(rad), sn = sinf(rad);
             for (int tt = 0; tt < thickness; tt++)
                 av_gfx->drawPixel(CX + (int)((ring_r - tt) * cs), CY + (int)((ring_r - tt) * sn), col);
         }
+    } else {
+        draw_pct = 100.0f;
     }
 
     // ── Flush Region Selection ────────

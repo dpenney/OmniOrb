@@ -734,56 +734,43 @@ int find_nearest(int tx, int ty) {
     xSemaphoreGive(ac_mutex);
     return best;
 }
-
 // Draw timer ring on the radar/gfx canvas — safe at r=231-240 since sweep only reaches r=230
 static void draw_radar_timer_ring() {
-    const float STEP = 0.008f;
-    const float FULL = 2.0f * M_PI;
-    const float start_rad = -M_PI / 2.0f;
-    static float last_pct = -1.0f;
-
-    if (!AssistantView::is_timer_active()) {
-        if (last_pct >= 0) {
-            full_redraw(); // Clear the ring cleanly once
-            last_pct = -1.0f;
+    static float draw_pct = 100.0f;
+    if (AssistantView::is_timer_active()) {
+        float timer_pct_vis = AssistantView::get_timer_vis_pct();
+        draw_pct += (timer_pct_vis - draw_pct) * 0.12f;
+        int limit_deg = (int)(draw_pct * 3.6f);
+        
+        uint16_t col;
+        int ipct = (int)draw_pct;
+        if (ipct >= 50) {
+            float t  = (ipct - 50) / 50.0f;
+            uint8_t r = (uint8_t)(31 * (1.0f - t));
+            col = (r << 11) | (63 << 5);
+        } else {
+            float t  = ipct / 50.0f;
+            uint8_t g = (uint8_t)(63 * t);
+            col = (31 << 11) | (g << 5);
         }
-        return;
-    }
 
-    float pct = AssistantView::get_timer_vis_pct();
-    float span_rad = (pct / 100.0f) * FULL;
-    float end_rad  = start_rad + span_rad;
-
-    // Shrinking logic: Erase the gap between old and new
-    if (last_pct > pct) {
-        float old_span = (last_pct / 100.0f) * FULL;
-        for (float a = start_rad + (pct/100.0f)*FULL; a <= start_rad + old_span; a += STEP) {
-            float cs = cosf(a), sn = sinf(a);
-            for (int tt = 0; tt < 10; tt++)
-                gfx->drawPixel(CX + (int)((238 - tt) * cs), CY + (int)((238 - tt) * sn), C_BG);
+        int ring_r = 239, thickness = 10;
+        // 1. Erase (Full 360 with 1-degree steps for absolute precision)
+        for (int deg = 0; deg < 360; deg++) {
+            float rad = (deg - 90) * M_PI / 180.0f;
+            float cs = cosf(rad), sn = sinf(rad);
+            for (int tt = -1; tt < thickness + 1; tt++) // -1 to +1 safety margin
+                gfx->drawPixel(CX + (int)((ring_r - tt) * cs), CY + (int)((ring_r - tt) * sn), C_BG);
         }
-    }
-    last_pct = pct;
-
-    // Green → yellow → red colour
-    uint16_t col;
-    int ipct = (int)pct;
-    if (ipct >= 50) {
-        float t  = (ipct - 50) / 50.0f;
-        uint8_t r = (uint8_t)(31 * (1.0f - t));
-        col = (r << 11) | (63 << 5);
+        // 2. Draw
+        for (int deg = 0; deg <= limit_deg; deg++) {
+            float rad = (deg - 90) * M_PI / 180.0f;
+            float cs = cosf(rad), sn = sinf(rad);
+            for (int tt = 0; tt < thickness; tt++)
+                gfx->drawPixel(CX + (int)((ring_r - tt) * cs), CY + (int)((ring_r - tt) * sn), col);
+        }
     } else {
-        float t  = ipct / 50.0f;
-        uint8_t g = (uint8_t)(63 * t);
-        col = (31 << 11) | (g << 5);
-    }
-
-    // Draw full ring: coloured arc then background for the remainder
-    for (float a = start_rad; a <= start_rad + FULL; a += STEP) {
-        uint16_t px_col = (a <= end_rad) ? col : C_BG;
-        float cs = cosf(a), sn = sinf(a);
-        for (int tt = 0; tt < 10; tt++)
-            gfx->drawPixel(CX + (int)((238 - tt) * cs), CY + (int)((238 - tt) * sn), px_col);
+        draw_pct = 100.0f;
     }
 }
 
@@ -1101,14 +1088,7 @@ void loop() {
     last_was_touching = touch_active;
     if (touch_active) prev_touch_y = touch_y;
 
-    // ─── Serial0 Heartbeat (troubleshooting only) ─────────────────────────────
-    static unsigned long last_hb_ms = 0;
-    if (now - last_hb_ms >= 5000) {
-        Serial0.println("HB:OK");
-        Serial.println("[UART→Pi] HB:OK");
-        last_hb_ms = now;
-    }
-
+    // ─── Serial0 Heartbeat 
     if (now - last_pi_msg_ms > 15000) {
         pi_connected = false;
     }
@@ -1168,7 +1148,10 @@ void loop() {
             lv_timer_handler();
         }
     } else if (current_app == APP_GLOBE) {
-        if (!touch_active) GlobeView::update();
+        if (!touch_active) {
+            GlobeView::update();
+            draw_radar_timer_ring();
+        }
     } else if (current_app == APP_SETTINGS || current_app == APP_DIAGNOSTICS) {
         if (!touch_active) {
             static uint32_t last_diag_req = 0;
@@ -1238,7 +1221,9 @@ void loop() {
                 secs = (uint32_t)rest.toInt();
                 lbl  = "";
             }
-            AssistantView::start_timer(secs, lbl);
+            if (!AssistantView::is_timer_active() || AssistantView::timer_label() != lbl) {
+                AssistantView::start_timer(secs, lbl);
+            }
         } else if (rx == "STYLE:TOGGLE") {
             AssistantView::toggle_style();
             Serial.println("Remote Style Toggle");
