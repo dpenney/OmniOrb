@@ -201,7 +201,7 @@ void SettingsView::update() {
         // the 1.5ms blanking window), but starting at the edge minimises mid-scan tearing.
         if (sv_vsync_sem) {
             xSemaphoreTake(sv_vsync_sem, 0);
-            xSemaphoreTake(sv_vsync_sem, portMAX_DELAY);
+            xSemaphoreTake(sv_vsync_sem, pdMS_TO_TICKS(100));
         }
         sv_canvas->flush();
         sv_needs_full_draw = false;

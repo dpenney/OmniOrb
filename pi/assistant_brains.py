@@ -411,8 +411,15 @@ def serial_reader():
                         if is_proc: ww_stat = "PROC"
                         
                         # WiFi RSSI (approximate or placeholder if not easily reachable in this thread)
-                        # We can send it from the Pi's perspective or just a placeholder
-                        rssi = -50 
+                        try:
+                            with open("/proc/net/wireless", "r") as f:
+                                lines = f.readlines()
+                                if len(lines) > 2:
+                                    rssi = int(float(lines[2].split()[3]))
+                                else:
+                                    rssi = -50
+                        except Exception:
+                            rssi = -50
                         
                         # Throttle diag updates to 1Hz
                         now = time.time()

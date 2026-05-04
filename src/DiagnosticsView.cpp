@@ -111,6 +111,6 @@ void DiagnosticsView::update() {
     canvas->setCursor(CX - 84, 445);
     canvas->print("SWIPE RIGHT TO EXIT");
 
-    if (vsync_sem) xSemaphoreTake(vsync_sem, portMAX_DELAY);
+    if (vsync_sem) xSemaphoreTake(vsync_sem, pdMS_TO_TICKS(100));
     canvas->flush();
 }

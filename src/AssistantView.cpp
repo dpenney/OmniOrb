@@ -93,7 +93,7 @@ void AssistantView::toggle_style() {
     face_text_emotion = (AssistantView::Emotion)-1;
     mouth_prev_n = 0;
     if (av_gfx) {
-        if (av_vsync_sem) { xSemaphoreTake(av_vsync_sem, 0); xSemaphoreTake(av_vsync_sem, portMAX_DELAY); }
+        if (av_vsync_sem) { xSemaphoreTake(av_vsync_sem, 0); xSemaphoreTake(av_vsync_sem, pdMS_TO_TICKS(50)); }
         av_gfx->fillScreen(C_BG);
     }
 }
@@ -128,7 +128,7 @@ void AssistantView::show() {
     // VSYNC-sync the one-time full clear to minimise tearing on entry
     if (av_vsync_sem) {
         xSemaphoreTake(av_vsync_sem, 0);
-        xSemaphoreTake(av_vsync_sem, portMAX_DELAY);
+        xSemaphoreTake(av_vsync_sem, pdMS_TO_TICKS(50));
     }
     av_gfx->fillScreen(C_BG);
     if (canvas && output_gfx) canvas->flush(); // One-time FULL flush to clear previous screen
@@ -500,8 +500,8 @@ void AssistantView::update() {
     if (canvas && output_gfx) {
         uint16_t* buf = canvas->getFramebuffer();
         if (buf) {
-            if (timer_active) {
-                canvas->flush(); // Full flush for timer ring
+            if (timer_active || current_style == STYLE_IRIS) {
+                canvas->flush(); // Full flush for timer ring or full-screen IRIS
             } else {
                 output_gfx->draw16bitRGBBitmap(0, 100, &buf[100 * 480], 480, 360);
             }

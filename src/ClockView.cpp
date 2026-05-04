@@ -491,6 +491,7 @@ void ClockView::init() {
     meter = lv_meter_create(clock_screen);
     lv_obj_set_size(meter, 480, 480);
     lv_obj_center(meter);
+    lv_obj_clear_flag(meter, LV_OBJ_FLAG_CLICKABLE); // Pass touch through to system
     lv_obj_set_style_bg_opa(meter, LV_OPA_TRANSP, 0); // Transparent so labels behind are visible
     lv_obj_set_style_border_width(meter, 0, 0);
 
@@ -576,6 +577,11 @@ void ClockView::set_timer_pct(int pct) {
 
 void ClockView::update_time() {
     if (!clock_screen) return;
+
+    static unsigned long last_clock_update = 0;
+    unsigned long now_ms = millis();
+    if (now_ms - last_clock_update < 33) return; // Cap at 30 FPS to save CPU for touch
+    last_clock_update = now_ms;
 
     // Reset the sync flag so the next draw round takes a fresh time snapshot.
     time_synced = false;
