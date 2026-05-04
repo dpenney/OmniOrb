@@ -243,11 +243,21 @@ void AssistantView::_draw_iris(float t) {
     }
 
     int new_glow_r = iris_r + 15 + (int)(audio_scale * 30);
+    
+    // One-time Super-Wipe on state change to prevent artifacts from the previous state
+    static AssistantView::AssistantState last_rendered_state = (AssistantView::AssistantState)-1;
+    if (current_state != last_rendered_state) {
+        // Full, solid wipe of the entire iris/spectrum area (radius 240)
+        av_gfx->fillCircle(CX, CY, 240, C_BG);
+        last_rendered_state = current_state;
+        av_prev_glow_r = -1; // Force fresh glow draw
+    }
 
-    // 1. Center Iris Glow Annulus Erase
-    if (av_prev_glow_r > new_glow_r) {
-        for (int r = new_glow_r + 1; r <= av_prev_glow_r; r++)
-            av_gfx->drawCircle(CX, CY, r, C_BG);
+    // 1. Center Iris Glow Erase - Algorithm Matched (Solid Disc Erase)
+    // We use fillCircle to erase because it matches the algorithm used to draw.
+    // This eliminates Moire patterns caused by drawCircle/fillCircle divergence.
+    if (av_prev_glow_r > 0) {
+        av_gfx->fillCircle(CX, CY, av_prev_glow_r + 2, C_BG);
     }
     av_prev_glow_r = new_glow_r;
 
