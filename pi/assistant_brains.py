@@ -1156,22 +1156,20 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-def _send_email_async(subject, body):
-    threading.Thread(target=_send_email_task, args=(subject, body), daemon=True).start()
-
 from email.utils import formatdate, make_msgid
 
 def _send_email_task(subject, body):
+    """Send email synchronously. Returns (success: bool, message: str)."""
     sender    = getattr(config, 'EMAIL_SENDER', None)
     user      = getattr(config, 'EMAIL_USERNAME', sender)
     pw        = getattr(config, 'EMAIL_PASSWORD', None)
     recipient = getattr(config, 'EMAIL_RECIPIENT', None)
     server_addr = getattr(config, 'EMAIL_SMTP_SERVER', 'smtp.gmail.com')
     server_port = getattr(config, 'EMAIL_SMTP_PORT', 587)
-    
+
     if not sender or not pw or not recipient:
         logger.error("Email not sent: Configuration missing in config.py")
-        return
+        return False, "Email configuration is missing."
 
     try:
         msg = MIMEMultipart()
@@ -1180,19 +1178,20 @@ def _send_email_task(subject, body):
         msg['Subject'] = subject
         msg['Date'] = formatdate(localtime=True)
         msg['Message-ID'] = make_msgid()
-        
+
         footer = "\n\n--\nSent by your Omnihub Assistant"
         msg.attach(MIMEText(body + footer, 'plain'))
 
-        server = smtplib.SMTP(server_addr, server_port)
+        server = smtplib.SMTP(server_addr, server_port, timeout=10)
         server.starttls()
         server.login(user, pw)
         server.sendmail(sender, recipient, msg.as_string())
         server.quit()
         logger.info(f"Email sent successfully to {recipient} via {server_addr} (user: {user})")
+        return True, "Email sent successfully."
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
-        speak_text("Sorry, I was unable to send that email.")
+        return False, f"Failed: {e}"
 
 
 # ─── Sleep Mode ───────────────────────────────────────────────────────────────
@@ -1366,10 +1365,17 @@ def process_llm(audio_array):
                             subject = fc.args["subject"]
                             body = fc.args["body"]
                             logger.info(f"Executing Tool: send_detailed_email - {subject}")
-                            _send_email_async(subject, body)
+                            result_holder = [False, "Timed out"]
+                            def _run_email():
+                                result_holder[0], result_holder[1] = _send_email_task(subject, body)
+                            t = threading.Thread(target=_run_email, daemon=True)
+                            t.start()
+                            t.join(timeout=15)
+                            email_ok  = result_holder[0]
+                            email_msg = result_holder[1]
                             fn_responses.append(types.Part(function_response=types.FunctionResponse(
                                 name="send_detailed_email",
-                                response={"status": "success", "message": "Email sent."},
+                                response={"status": "success" if email_ok else "error", "message": email_msg},
                                 id=fc.id
                             )))
                         elif fc.name == "get_weather":
