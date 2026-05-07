@@ -1252,6 +1252,14 @@ void loop() {
             range_nm = min((float)MAX_RANGE_NM, range_nm * 1.15f);
             Serial.printf("Remote Zoom OUT: %.1f nm\n", range_nm);
             full_redraw();
+        } else if (rx == "T+") {
+            if (current_app == APP_GLOBE) {
+                GlobeView::add_tilt(5);
+            }
+        } else if (rx == "T-") {
+            if (current_app == APP_GLOBE) {
+                GlobeView::add_tilt(-5);
+            }
         } else if (rx == "V+") {
             if (current_app == APP_SETTINGS) {
                 SettingsView::adjust_volume(5);

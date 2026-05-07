@@ -1986,8 +1986,8 @@ def on_encoder_event(event, direction, value):
                 send_uart_command("Z-")
         elif m == "GLOBE":
             # Tell the ESP32 to adjust the globe's tilt
-            if direction == "CW": send_uart_command("Z+")
-            else: send_uart_command("Z-")
+            if direction == "CW": send_uart_command("T+")
+            else: send_uart_command("T-")
         elif m in ("ASSISTANT", "SPEAKING", "CONTINUITY"):
             # Style Toggle Logic
             send_uart_command("STYLE:TOGGLE")
