@@ -22,7 +22,12 @@ if [ ! -f "espota.py" ]; then
 fi
 
 echo "Flashing $FW_FILE to $ESP_IP via OTA..."
-python3 espota.py -i "$ESP_IP" -p 3232 -f "$FW_FILE"
+HOST_ARG=""
+if [ -n "$OTA_HOST_IP" ]; then
+    HOST_ARG="-I $OTA_HOST_IP"
+fi
+
+python3 espota.py -i "$ESP_IP" -p 3232 $HOST_ARG -f "$FW_FILE"
 
 if [ $? -eq 0 ]; then
     echo "OTA Flash Successful!"

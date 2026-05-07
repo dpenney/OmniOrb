@@ -63,7 +63,7 @@ function setTZ(sel) {
 <label style="display:block; text-align:left; font-size:12px; margin-top:10px;">HOME POSITION:</label>
 <select onchange="setLocation(this)">
     <option value="manual" selected>-- SELECT PRESET --</option>
-    <option value="33.771524,-92.858774,-6,America/Chicago">Barksdale AFB, LA</option>
+    <option value="32.4960,-93.6728,-6,America/Chicago">Barksdale AFB, LA</option>
     <option value="51.681442,-1.802442,0,Europe/London">RAF Fairford</option>
     <option value="37.849993,-122.115747,-7,America/Los_Angeles">Bruno's Lair</option>
 </select>

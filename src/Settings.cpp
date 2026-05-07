@@ -42,9 +42,9 @@ bool SettingsManager::load(ProjectSettings &s) {
 
     strlcpy(s.wifi_ssid, doc["wifi_ssid"] | "", sizeof(s.wifi_ssid));
     strlcpy(s.wifi_password, doc["wifi_password"] | "", sizeof(s.wifi_password));
-    s.home_lat = doc["home_lat"] | 0.0f;
-    s.home_lon = doc["home_lon"] | 0.0f;
-    s.range_nm = doc["range_nm"] | 15.0f;
+    s.home_lat = doc["home_lat"] | HOME_LAT;
+    s.home_lon = doc["home_lon"] | HOME_LON;
+    s.range_nm = doc["range_nm"] | DEFAULT_RANGE_NM;
     s.gmt_offset = doc["gmt_offset"] | 0.0f;
     strlcpy(s.timezone, doc["timezone"] | DEFAULT_TIMEZONE, sizeof(s.timezone));
     s.volume = doc["volume"] | 75;

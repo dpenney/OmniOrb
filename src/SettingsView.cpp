@@ -97,14 +97,18 @@ static void sv_draw_dynamic(Arduino_GFX *tgt, int vol, int prev_vol = -1) {
                         CY + (int)(sinf(old_rad) * d_r), 7, SV_BG);
     }
 
-    // Arc track — 0.2° step ensures gap-free pixel coverage at the outer radius
-    // (228px × 0.2° × π/180 ≈ 0.8px between lines, < 1px so no pixel is skipped).
-    for (float a = ARC_START; a <= arc_end + 0.1f; a += 0.2f) {
-        float rad = a * (M_PI / 180.0f);
-        float cs = cosf(rad), sn = sinf(rad);
-        tgt->drawLine(CX + (int)(cs * ARC_R_IN),  CY + (int)(sn * ARC_R_IN),
-                      CX + (int)(cs * ARC_R_OUT), CY + (int)(sn * ARC_R_OUT),
-                      (a <= lit_end) ? SV_BRASS : SV_DIM);
+    // Arc track — 2.0° step with 1.0° thick segments for a 'slotted' look.
+    // This eliminates Moire artifacts and creates a more distinct visual style.
+    for (float a = ARC_START; a <= arc_end + 0.1f; a += 2.0f) {
+        uint16_t color = (a <= lit_end) ? SV_BRASS : SV_DIM;
+        // Draw 3 lines per segment to give it thickness (~1 degree wide)
+        for (float off = -0.4f; off <= 0.4f; off += 0.4f) {
+            float rad = (a + off) * (M_PI / 180.0f);
+            float cs = cosf(rad), sn = sinf(rad);
+            tgt->drawLine(CX + (int)(cs * ARC_R_IN),  CY + (int)(sn * ARC_R_IN),
+                          CX + (int)(cs * ARC_R_OUT), CY + (int)(sn * ARC_R_OUT),
+                          color);
+        }
     }
 
     // Tick marks at every 10% (11 marks)
@@ -185,13 +189,8 @@ void SettingsView::update() {
         sv_canvas->setCursor(CX - 36, 158);
         sv_canvas->print("VOLUME");
 
-        sv_canvas->drawRoundRect(CX - 100, 275, 200, 45, 6, SV_DIM);
-        sv_canvas->setTextColor(SV_MINT);
-        sv_canvas->setTextSize(1);
-        sv_canvas->setCursor(CX - 54, 292);
-        sv_canvas->print("AUDIO DIAGNOSTICS");
 
-        sv_canvas->setTextColor(SV_HINT);
+        sv_canvas->setTextColor(SV_MINT);
         sv_canvas->setTextSize(1);
         sv_canvas->setCursor(CX - 54, 395);
         sv_canvas->print("SWIPE RIGHT TO EXIT");

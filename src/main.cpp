@@ -62,13 +62,13 @@ static Arduino_Canvas *assistant_canvas = nullptr;
 
 // ─── Colours (RGB565: RRRRR GGGGGG BBBBB) ────────────────────────────────────
 static const uint16_t C_BG       = 0x0000;  // black
-static const uint16_t C_RING     = 0x0120;  // dark green ring
-static const uint16_t C_GRID     = 0x00A0;  // dim green crosshair
+static const uint16_t C_RING     = 0x0280;  // balanced dark-mid green ring
+static const uint16_t C_GRID     = 0x0180;  // balanced dim green crosshair
 static const uint16_t C_SWEEP    = 0x07E0;  // bright green sweep arm
 static const uint16_t C_BLIP     = 0x07E0;  // blip colour
 static const uint16_t C_DIM_BLIP = 0x02E0;  // dimmed blip (dark green)
 static const uint16_t C_SEL      = 0xFFFF;  // selected aircraft (white)
-static const uint16_t C_LBL      = 0x03E0;  // callsign label
+static const uint16_t C_LBL      = 0x07E0;  // callsign label
 static const uint16_t C_BOX_BG   = 0x0020;  // detail box background
 static const uint16_t C_BOX_BORD = 0x03E0;  // detail box border
 
@@ -199,6 +199,7 @@ void enter_settings() {
     current_app = APP_SETTINGS;
     SettingsView::show();
     SettingsView::update();   // draw immediately on entry
+    notify_pi_app_mode(current_app);
 }
 
 void exit_settings() {
@@ -206,6 +207,8 @@ void exit_settings() {
     String vmsg = String("VOL:") + String(settings.volume);
     Serial0.println(vmsg);
     Serial.printf("[UART→Pi] %s\n", vmsg.c_str());
+    SettingsManager::save(settings);
+
 
     // Safety: If prev_app is a menu, default to Radar
     if (prev_app == APP_SETTINGS || prev_app == APP_DIAGNOSTICS) {
@@ -240,7 +243,7 @@ void process_swipe(int x1, int y1, int x2, int y2) {
     // ── Settings view: swipe right exits; arc drag handled in loop() ─────────
     // ── Settings/Diagnostics view: swipe right exits; arc drag handled in loop() ──
     if (current_app == APP_SETTINGS || current_app == APP_DIAGNOSTICS) {
-        if (abs(dx) > abs(dy) && dx > GESTURE_THRESHOLD) {
+        if (abs(dx) > abs(dy) && dx > 5) {
             if (current_app == APP_DIAGNOSTICS) {
                 current_app = APP_SETTINGS;
                 // SettingsView update happens in next frame
@@ -255,17 +258,49 @@ void process_swipe(int x1, int y1, int x2, int y2) {
         if (current_app == APP_RADAR) {
             int hit = find_nearest(x2, y2);
         if (hit >= 0 && hit < aircraft_count) {
-            selected_idx = hit;
-            if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                Aircraft &ac = aircraft[hit];
-                if (ac.paint_valid)
-                    draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, C_SEL);
-                xSemaphoreGive(ac_mutex);
+            if (hit == selected_idx) {
+                // Tapping the same plane -> Toggle OFF
+                int old_idx = selected_idx;
+                selected_idx = -1;
+                erase_detail_box();
+                if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    Aircraft &ac = aircraft[old_idx];
+                    if (ac.paint_valid)
+                        draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, ac.is_dimmed ? C_DIM_BLIP : C_BLIP);
+                    xSemaphoreGive(ac_mutex);
+                }
+            } else {
+                // Tapping a new plane -> Select IT
+                int old_idx = selected_idx;
+                selected_idx = hit;
+                if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    // Restore old blip if one was selected
+                    if (old_idx >= 0 && old_idx < aircraft_count) {
+                        Aircraft &old_ac = aircraft[old_idx];
+                        if (old_ac.paint_valid)
+                            draw_blip_shape(old_ac.paint_x, old_ac.paint_y, old_ac.heading, old_ac.is_dimmed ? C_DIM_BLIP : C_BLIP);
+                    }
+                    // Highlight new blip
+                    Aircraft &ac = aircraft[hit];
+                    if (ac.paint_valid)
+                        draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, C_SEL);
+                    xSemaphoreGive(ac_mutex);
+                }
+                draw_detail_box();
             }
-            draw_detail_box();
-        } else if (detail_visible) {
+        } else if (selected_idx >= 0) {
+            // Tapping empty space -> Deselect
+            int old_idx = selected_idx;
             selected_idx = -1;
             erase_detail_box();
+            if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (old_idx >= 0 && old_idx < aircraft_count) {
+                    Aircraft &ac = aircraft[old_idx];
+                    if (ac.paint_valid)
+                        draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, ac.is_dimmed ? C_DIM_BLIP : C_BLIP);
+                }
+                xSemaphoreGive(ac_mutex);
+            }
         }
     }
         return;
@@ -334,6 +369,11 @@ void process_swipe(int x1, int y1, int x2, int y2) {
                 current_app = APP_RADAR;
                 notify_pi_app_mode(current_app);
                 full_redraw();
+            } else if (current_app == APP_RADAR) {
+                current_app = APP_CLOCK;
+                notify_pi_app_mode(current_app);
+                lvgl_active = true;
+                ClockView::show();
             }
         }
 
@@ -1033,7 +1073,7 @@ void loop() {
                                (float)(touch_y - CY) * (touch_y - CY));
             arc_dragging = (dist >= 160.0f && dist <= 240.0f);
             if (arc_dragging) {
-                gesture_consumed = true;
+                // gesture_consumed = true; // Allow swipes to be processed even if they start in arc zone
             } else {
                 // Not dragging the arc? Check for Diagnostic Button (Instant Switch)
                 // Expanded hit box: Y > 240 (bottom half) and not near edge
@@ -1086,8 +1126,8 @@ void loop() {
         GlobeView::add_tilt(delta_tilt);
     }
 
-    // ── Long-press detection (800ms still hold — only outside arc zone) ───────
-    if (touch_active && !long_press_fired && !arc_dragging && !touch_has_moved) {
+    // ── Long-press detection (800ms still hold) ───────
+    if (touch_active && !long_press_fired && !touch_has_moved) {
         int hold_dx = abs(touch_x - touch_start_x);
         int hold_dy = abs(touch_y - touch_start_y);
         if ((hold_dx + hold_dy) < TAP_THRESHOLD && (now - last_touch_time) >= LONG_PRESS_MS) {
@@ -1119,7 +1159,11 @@ void loop() {
 
     // ─── Serial0 Heartbeat 
     if (now - last_pi_msg_ms > 15000) {
-        pi_connected = false;
+        if (pi_connected) {
+            pi_connected = false;
+            if (current_app == APP_ASSISTANT) AssistantView::set_state(AssistantView::STATE_IDLE);
+            Serial.println("Pi Connection Lost (Timeout)");
+        }
     }
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1159,7 +1203,7 @@ void loop() {
     } else if (current_app == APP_SETTINGS || current_app == APP_DIAGNOSTICS) {
         if (!touch_active) {
             static uint32_t last_diag_req = 0;
-            if (now - last_diag_req > 200) { // 5Hz requests
+            if (now - last_diag_req > 1000) { // 1Hz requests
                 Serial0.println("DIAG?");
                 last_diag_req = now;
             }
@@ -1206,6 +1250,20 @@ void loop() {
             range_nm = min((float)MAX_RANGE_NM, range_nm * 1.15f);
             Serial.printf("Remote Zoom OUT: %.1f nm\n", range_nm);
             full_redraw();
+        } else if (rx == "V+") {
+            if (current_app == APP_SETTINGS) {
+                SettingsView::adjust_volume(5);
+                SettingsView::update();
+                settings.volume = SettingsView::get_volume();
+                Serial0.println(String("VOL:") + String(settings.volume));
+            }
+        } else if (rx == "V-") {
+            if (current_app == APP_SETTINGS) {
+                SettingsView::adjust_volume(-5);
+                SettingsView::update();
+                settings.volume = SettingsView::get_volume();
+                Serial0.println(String("VOL:") + String(settings.volume));
+            }
         } else if (rx.startsWith("Z:")) {
             float val = rx.substring(2).toFloat();
             if (val >= MIN_RANGE_NM && val <= MAX_RANGE_NM) {
@@ -1231,6 +1289,10 @@ void loop() {
         } else if (rx == "STYLE:TOGGLE") {
             AssistantView::toggle_style();
             Serial.println("Remote Style Toggle");
+        } else if (rx == "EXIT_SETTINGS") {
+            if (current_app == APP_SETTINGS) {
+                exit_settings();
+            }
         } else if (rx == "REBOOT" || rx == "!") {
             Serial.println("Rebooting via UART command...");
             delay(500);
@@ -1335,12 +1397,12 @@ void loop() {
         if (c == '\n') { handle_cmd(rx_buf_usb); rx_buf_usb = ""; }
         else if (c != '\r') rx_buf_usb += c;
     }
-    while (Serial0.available()) {
-        char c = Serial0.read();
-        if (c == '\n' || c == '!') { // Support '!' as a hard-terminator for emergency reboots
-            handle_cmd(rx_buf_uart); rx_buf_uart = ""; 
+    if (Serial0.available()) {
+        String rx = Serial0.readStringUntil('\n');
+        rx.trim();
+        if (rx.length() > 0) {
+            handle_cmd(rx);
         }
-        else if (c != '\r') rx_buf_uart += c;
     }
 
     

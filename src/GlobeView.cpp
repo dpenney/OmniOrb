@@ -39,9 +39,12 @@ static int num_nodes = 0;
 // Store old home marker position to erase it cleanly
 static int old_home_x = -1, old_home_y = -1;
 static int old_bark_x = -1, old_bark_y = -1;
+static int old_bruno_x = -1, old_bruno_y = -1;
 
-const float BARK_LAT = 33.771524f;
-const float BARK_LON = -92.858774f;
+const float BARK_LAT = 32.4960f;
+const float BARK_LON = -93.6728f;
+const float BRUNO_LAT = 37.8499f;
+const float BRUNO_LON = -122.1157f;
 
 static float rot_y = 0.0f;
 static float tilt_x = -0.41f; // Current globe tilt
@@ -102,6 +105,7 @@ void GlobeView::show() {
     }
     old_home_x = -1; old_home_y = -1;
     old_bark_x = -1; old_bark_y = -1;
+    old_bruno_x = -1; old_bruno_y = -1;
     last_frame_time = millis();
 }
 
@@ -162,39 +166,14 @@ void GlobeView::update() {
     if (old_bark_x >= 0) {
         gfx->fillCircle(old_bark_x, old_bark_y, 3, C_BG);
     }
+    if (old_bruno_x >= 0) {
+        gfx->fillCircle(old_bruno_x, old_bruno_y, 3, C_BG);
+    }
     old_home_x = -1;
     old_bark_x = -1;
+    old_bruno_x = -1;
 
-    // 3. Process and draw current home marker
-    float r_lat = settings.home_lat * M_PI / 180.0f;
-    float r_lon = settings.home_lon * M_PI / 180.0f;
-    
-    // Spherical to Cartesian (matches continent map logic)
-    float ax = cosf(r_lat) * sinf(r_lon);
-    float ay = sinf(r_lat);
-    float az = cosf(r_lat) * cosf(r_lon);
-
-    // Apply Y spin rotation
-    float rx = ax * cos_y - az * sin_y;
-    float rz = ax * sin_y + az * cos_y;
-    float ry = ay;
-    
-    // Apply X tilt rotation
-    float fz = rz * cos_x - ry * sin_x;
-    float fy = rz * sin_x + ry * cos_x;
-
-    if (fz >= 0) {
-        int sx = CX + (int)(rx * RADIUS);
-        int sy = CY - (int)(fy * RADIUS);
-        
-        // Draw home marker (Cross + Circle for prominence)
-        gfx->fillCircle(sx, sy, 3, C_HOME);
-        gfx->drawFastHLine(sx - 5, sy, 11, C_HOME);
-        gfx->drawFastVLine(sx, sy - 5, 11, C_HOME);
-        
-        old_home_x = sx;
-        old_home_y = sy;
-    }
+    // 3. (Dynamic Home marker removed to favor fixed POIs)
 
     // 4. Process and draw Barksdale AFB (Blue Dot)
     float b_lat = BARK_LAT * M_PI / 180.0f;
@@ -216,6 +195,28 @@ void GlobeView::update() {
         gfx->fillCircle(sx, sy, 3, C_POI);
         old_bark_x = sx;
         old_bark_y = sy;
+    }
+    
+    // 5. Process and draw Bruno's Lair (Blue Dot)
+    float bruno_lat = BRUNO_LAT * M_PI / 180.0f;
+    float bruno_lon = BRUNO_LON * M_PI / 180.0f;
+    float brax = cosf(bruno_lat) * sinf(bruno_lon);
+    float bray = sinf(bruno_lat);
+    float braz = cosf(bruno_lat) * cosf(bruno_lon);
+
+    float brrx = brax * cos_y - braz * sin_y;
+    float brrz = brax * sin_y + braz * cos_y;
+    float brry = bray;
+
+    float brfz = brrz * cos_x - brry * sin_x;
+    float brfy = brrz * sin_x + brry * cos_x;
+
+    if (brfz >= 0) {
+        int sx = CX + (int)(brrx * RADIUS);
+        int sy = CY - (int)(brfy * RADIUS);
+        gfx->fillCircle(sx, sy, 3, C_HOME);
+        old_bruno_x = sx;
+        old_bruno_y = sy;
     }
     
     // Draw crosshair at the center

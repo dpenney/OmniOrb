@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import sys
+import select
 import wave
 from collections import deque
 
@@ -350,6 +351,8 @@ def send_uart_command(cmd):
                     return
 
                 ser.write(f"{cmd}\n".encode())
+                global _last_uart_send_at
+                _last_uart_send_at = time.time()
                 if not (cmd.startswith("S") and "," in cmd) and not (cmd.startswith("A") and cmd[1:2].isdigit()) and not cmd.startswith("DIAG:"):
                     logger.info(f"Sent UART: {cmd}")
     except Exception as e:
@@ -449,16 +452,19 @@ def serial_reader():
                         app_mode = line.split("APP:", 1)[1].split()[0]
                         with state_lock:
                             assistant_state["current_app"] = app_mode
-                            assistant_state["mic_active"] = (app_mode == "ASSISTANT" or app_mode == "SPEAKING")
+                            assistant_state["mic_active"] = (app_mode == "ASSISTANT" or app_mode == "SPEAKING" or app_mode == "CONTINUITY")
                             assistant_state["radar_active"] = (app_mode == "RADAR")
                         logger.info(f"[ESP32] {line} → app={app_mode}, mic_active={assistant_state['mic_active']}")
                     elif line == "HB:OK":
                         send_uart_command("HB:ACK")
+                    elif line == "HB:ACK":
+                        # ESP32 acknowledged our heartbeat
+                        pass
                     
                     # Log ALL traffic to the raw UART log
                     uart_logger.debug(line)
 
-                    if line not in ("HB:OK",) and not line.startswith("DIAG:"):
+                    if line not in ("HB:OK", "DIAG?") and not line.startswith("DIAG:"):
                         logger.info(f"[ESP32] {line}")
         except Exception as e:
             logger.error(f"Serial read error: {e}")
@@ -762,7 +768,6 @@ def _forward_piper_audio(piper):
     """Forward piper stdout → aplay. Signals TTS active state.
     Uses select() so inter-sentence gaps are filled with silence rather than
     letting the aplay buffer drain (which causes audible clicks)."""
-    import select as _select
     from collections import deque as _deque
     try:
         first         = True
@@ -782,7 +787,7 @@ def _forward_piper_audio(piper):
                     send_uart_command(f"S{','.join(map(str, bins))}|A{intensity}")
 
         while True:
-            ready, _, _ = _select.select([piper.stdout], [], [], 0.010)  # 10ms timeout
+            ready, _, _ = select.select([piper.stdout], [], [], 0.010)  # 10ms timeout
 
             _flush_queue()  # drain scheduled dispatches on every tick
 
@@ -809,9 +814,15 @@ def _forward_piper_audio(piper):
                     chunk_out = chunk
 
                 # Write audio immediately — no sleep, never block the audio path.
+                # Write audio — use select to avoid blocking indefinitely if aplay hangs
                 with _audio_lock:
-                    _aplay_stdin.write(chunk_out)
-                    _aplay_stdin.flush()
+                    if _aplay_stdin:
+                        _, writable, _ = select.select([], [_aplay_stdin], [], 1.0)
+                        if writable:
+                            _aplay_stdin.write(chunk_out)
+                            _aplay_stdin.flush()
+                        else:
+                            logger.error("Audio output blocked (aplay pipe full). Skipping chunk.")
                 # Push reference audio for AEC (use scaled output for correctness)
                 ref_samples = np.frombuffer(chunk_out, dtype=np.int16)
                 with _aec_ref_lock:
@@ -839,9 +850,13 @@ def _forward_piper_audio(piper):
 
             elif not first:
                 # Inter-sentence gap — keep aplay buffer fed to prevent underrun clicks
+                # Inter-sentence gap — keep aplay buffer fed to prevent underrun clicks
                 with _audio_lock:
-                    _aplay_stdin.write(_GAP_SILENCE)
-                    _aplay_stdin.flush()
+                    if _aplay_stdin:
+                        _, writable, _ = select.select([], [_aplay_stdin], [], 0.1)
+                        if writable:
+                            _aplay_stdin.write(_GAP_SILENCE)
+                            _aplay_stdin.flush()
     except Exception:
         pass
     finally:
@@ -891,6 +906,7 @@ def _speak_text_iter(text_iter):
     piper_a   = None
     piper_b   = None
     fwd_a     = None
+    fwd_b     = None
     buf       = ""
     parts     = []
     a_fed     = False  # True once piper_a has its text and stdin is closed
@@ -910,11 +926,15 @@ def _speak_text_iter(text_iter):
         """Write text to piper_b immediately — one line per sentence.
         B starts ONNX inference as each sentence arrives so its audio is
         buffered in the pipe by the time A finishes playing."""
-        nonlocal piper_b
+        nonlocal piper_b, fwd_b
         if not text:
             return
         if piper_b is None:
             piper_b = _get_piper()
+            # Start forwarding audio from B immediately so it can buffer/play 
+            # while we are still feeding it sentences via stdin.
+            fwd_b = threading.Thread(target=_forward_piper_audio, args=(piper_b,), daemon=True)
+            fwd_b.start()
         try:
             piper_b.stdin.write(text.encode() + b'\n')
             piper_b.stdin.flush()
@@ -1021,7 +1041,9 @@ def _speak_text_iter(text_iter):
         except Exception:
             pass
         if fwd_a:
-            fwd_a.join()
+            fwd_a.join(timeout=30)
+            if fwd_a.is_alive():
+                logger.warning("Forwarder A timed out! Audio path may be stuck.")
         try:
             piper_a.wait(timeout=2)
         except Exception:
@@ -1033,14 +1055,16 @@ def _speak_text_iter(text_iter):
             if _active_piper_proc is piper_a:
                 _active_piper_proc = None
 
-    # ── Play Piper B (already computed during A's playback) ──────────────────
+    # ── Play Piper B (already computed or streaming) ──────────────────────────
     if piper_b:
         if not _tts_abort.is_set():
             with _active_piper_lock:
                 _active_piper_proc = piper_b
-            fwd_b = threading.Thread(target=_forward_piper_audio, args=(piper_b,), daemon=True)
-            fwd_b.start()
-            fwd_b.join()
+            # fwd_b was already started in _flush_to_b; now just wait for it to finish.
+            if fwd_b:
+                fwd_b.join(timeout=45)
+                if fwd_b.is_alive():
+                    logger.warning("Forwarder B timed out! Audio path may be stuck.")
             with _active_piper_lock:
                 if _active_piper_proc is piper_b:
                     _active_piper_proc = None
@@ -1914,7 +1938,10 @@ def audio_processor():
 
             now = time.time()
             is_speaking = _tts_active.is_set()
-            if mic_active and not is_speaking and now - last_send_time > (1.0 / config.AUDIO_UPDATE_HZ):
+            # Send spectrum if mic is active (ESP32 on Assistant screen) OR if Pi is in a mode that needs the face active
+            should_send = mic_active or status in ("LISTENING", "THINKING", "SPEAKING", "CONTINUITY")
+            
+            if should_send and not is_speaking and now - last_send_time > (1.0 / config.AUDIO_UPDATE_HZ):
                 # FFT only at send rate (10Hz) if not speaking (speech synthesis sends its own data)
                 gain = max(0.5, min(8.0, 1.0 / avg_rms))
                 bins = calculate_spectrum_bins(norm_samples, mic_idx_bounds, gain=gain)
@@ -1946,7 +1973,8 @@ def on_encoder_event(event, direction, value):
     logger.info(f"Encoder: {event} {direction if direction else ''} (Mode: {mode})")
     
     if event == "rotate":
-        if mode == "RADAR":
+        m = mode.strip().upper()
+        if m == "RADAR":
             # Zoom Logic
             if direction == "CW":
                 with state_lock:
@@ -1956,12 +1984,16 @@ def on_encoder_event(event, direction, value):
                 with state_lock:
                     assistant_state["zoom"] = min(250, assistant_state["zoom"] + 1)
                 send_uart_command("Z-")
-        elif mode == "GLOBE":
+        elif m == "GLOBE":
             # Tell the ESP32 to toggle the globe's rotation state
             send_uart_command("GLOBE:TOGGLE")
-        elif mode in ("ASSISTANT", "SPEAKING", "CONTINUITY"):
+        elif m in ("ASSISTANT", "SPEAKING", "CONTINUITY"):
             # Style Toggle Logic
             send_uart_command("STYLE:TOGGLE")
+        elif m == "SETTINGS":
+            # Volume Adjustment in Settings
+            if direction == "CW": send_uart_command("V+")
+            else: send_uart_command("V-")
         else:
             # Default to Zoom for other screens
             if direction == "CW": send_uart_command("Z+")
@@ -1977,6 +2009,9 @@ def on_encoder_event(event, direction, value):
         elif mode == "CLOCK":
             # Jump to Assistant
             send_uart_command("APP:ASSISTANT")
+        elif mode == "SETTINGS":
+            # Exit Settings
+            send_uart_command("EXIT_SETTINGS")
         else:
             # Default press action: Back to Radar
             send_uart_command("APP:RADAR")
@@ -2067,5 +2102,20 @@ if __name__ == "__main__":
     audio_thread = threading.Thread(target=audio_processor, daemon=True)
     audio_thread.start()
     logger.info("Audio processor thread started")
+
+    def heartbeat_worker():
+        """Proactive heartbeat to keep the ESP32 connection alive."""
+        while True:
+            try:
+                # Any message from the Pi resets the ESP32's 15s timeout.
+                # HB:ACK is safe and low-bandwidth.
+                send_uart_command("HB:ACK")
+            except Exception:
+                pass
+            time.sleep(5.0)
+
+    heartbeat_thread = threading.Thread(target=heartbeat_worker, daemon=True)
+    heartbeat_thread.start()
+    logger.info("Proactive heartbeat thread started (5s interval)")
 
     app.run(host=config.FLASK_HOST, port=config.FLASK_PORT)

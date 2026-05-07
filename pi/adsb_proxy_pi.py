@@ -52,6 +52,17 @@ box_lock       = threading.Lock()
 
 import math
 
+# ── Barksdale Legacy Fix ──────────────────────────────────────────────────────
+# Old incorrect coordinates saved in some ESP32 configs
+LEGACY_BARK_LAT = 33.7715
+LEGACY_BARK_LON = -92.8588
+# Correct coordinates
+ACTUAL_BARK_LAT = 32.4960
+ACTUAL_BARK_LON = -93.6728
+
+# Track if we are currently overriding for the legacy ESP32
+is_legacy_mode = False
+
 def make_box(lat, lon, range_nm=20.0):
     """Return a minLat,maxLat,minLon,maxLon string centered on (lat, lon) with given range in NM."""
     # Conversion: 1 deg lat = 60nm. 1 deg lon = 60nm * cos(lat)
@@ -66,7 +77,20 @@ def make_box(lat, lon, range_nm=20.0):
             f"{lon + radius_deg_lon:.4f}")
 
 def update_location(lat, lon, range_nm=20.0):
-    global current_box
+    global current_box, is_legacy_mode
+    
+    # Check for legacy Barksdale coordinates
+    if abs(lat - LEGACY_BARK_LAT) < 0.01 and abs(lon - LEGACY_BARK_LON) < 0.01:
+        if not is_legacy_mode:
+            logger.info("Intercepted legacy Barksdale coordinates. Enabling coordinate shift.")
+        is_legacy_mode = True
+        lat = ACTUAL_BARK_LAT
+        lon = ACTUAL_BARK_LON
+    else:
+        if is_legacy_mode:
+            logger.info("New coordinates received. Disabling legacy shift.")
+        is_legacy_mode = False
+
     new_box = make_box(lat, lon, range_nm)
     with box_lock:
         if new_box != current_box:
@@ -103,15 +127,23 @@ def fetch_adsb():
 
     while True:
         try:
-            # 1. Poll main assistant service for radar_active state
+            # 1. Poll main assistant service for radar_active and is_sleeping state
             try:
                 resp = requests.get(STATUS_URL, timeout=2)
                 if resp.status_code == 200:
-                    radar_active = resp.json().get("radar_active", radar_active)
+                    data = resp.json()
+                    radar_active = data.get("radar_active", radar_active)
+                    is_sleeping  = data.get("is_sleeping", False)
+                else:
+                    is_sleeping = False
             except Exception:
-                pass  # keep current radar_active value — don't flip to False on transient errors
+                is_sleeping = False # keep current radar_active value — don't flip to False on transient errors
 
-            if not radar_active:
+            if not radar_active or is_sleeping:
+                if not radar_active:
+                    logger.debug("Fetch paused: Radar not active")
+                else:
+                    logger.debug("Fetch paused: Device is sleeping")
                 time.sleep(5)
                 continue
 
@@ -186,6 +218,14 @@ def fetch_adsb():
                         "track":    track,
                         "type":     ac_type,
                     })
+
+                # ── Barksdale Legacy Shift ──
+                if is_legacy_mode:
+                    lat_shift = LEGACY_BARK_LAT - ACTUAL_BARK_LAT
+                    lon_shift = LEGACY_BARK_LON - ACTUAL_BARK_LON
+                    for ac in aircraft_list:
+                        ac["lat"] += lat_shift
+                        ac["lon"] += lon_shift
 
                 latest_flights = {"now": time.time(), "aircraft": aircraft_list}
                 logger.info(f"Updated {len(aircraft_list)} aircraft (box={fetch_box})")
