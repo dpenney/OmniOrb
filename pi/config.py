@@ -56,7 +56,7 @@ LOG_BACKUP_COUNT = 3
 # Wake Word
 # Set to an absolute path for a custom .onnx model, or a built-in like "hey_jarvis_v0.1"
 WAKEWORD_MODEL     = os.path.join(_DIR, "HeyRobot.onnx")
-WAKEWORD_THRESHOLD           = 0.80   # lower for easier wake at conversational volume
+WAKEWORD_THRESHOLD           = 0.70   # lower for easier wake at conversational volume
 WAKEWORD_THRESHOLD_BARGE_IN  = 0.95   # much higher threshold during TTS (since AEC is off)
 WAKEWORD_TTS_MUTE_MS         = max(1500, APLAY_SYNC_DELAY_MS + 1000)
                                       # Must cover APLAY_SYNC_DELAY_MS (audio still in buffer)
