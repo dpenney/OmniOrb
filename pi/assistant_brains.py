@@ -28,9 +28,8 @@ import config
 # Load secret environment variables from .env
 load_dotenv()
 
-# Map GEMINI_API_KEY to GOOGLE_API_KEY for libraries that expect it (like Mem0 and GenAI SDK)
-if os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
-    os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
+# Google GenAI SDK automatically picks up GEMINI_API_KEY or GOOGLE_API_KEY from environment.
+# No manual mapping needed.
 
 # Force Google AI API version to v1 to ensure embedding models are found correctly
 os.environ["GOOGLE_API_VERSION"] = "v1"
@@ -215,8 +214,6 @@ def _init_mem0():
                 }
             }
         }
-        if "GOOGLE_API_KEY" not in os.environ:
-            os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "")
         _memory = Memory.from_config(_mem_config)
         logger.info("Mem0 long-term memory initialized with Local Chroma store.")
     except Exception as e:
