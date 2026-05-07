@@ -1985,8 +1985,9 @@ def on_encoder_event(event, direction, value):
                     assistant_state["zoom"] = min(250, assistant_state["zoom"] + 1)
                 send_uart_command("Z-")
         elif m == "GLOBE":
-            # Tell the ESP32 to toggle the globe's rotation state
-            send_uart_command("GLOBE:TOGGLE")
+            # Tell the ESP32 to adjust the globe's tilt
+            if direction == "CW": send_uart_command("Z+")
+            else: send_uart_command("Z-")
         elif m in ("ASSISTANT", "SPEAKING", "CONTINUITY"):
             # Style Toggle Logic
             send_uart_command("STYLE:TOGGLE")
@@ -2013,6 +2014,9 @@ def on_encoder_event(event, direction, value):
         elif m == "SETTINGS":
             # Exit Settings
             send_uart_command("EXIT_SETTINGS")
+        elif m == "GLOBE":
+            # Toggle Globe Rotation
+            send_uart_command("GLOBE:TOGGLE")
         else:
             # Default press action: Back to Radar
             send_uart_command("APP:RADAR")
