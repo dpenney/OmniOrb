@@ -1127,10 +1127,12 @@ void loop() {
     }
 
     // ── Long-press detection (800ms still hold) ───────
-    if (touch_active && !long_press_fired && !touch_has_moved) {
+    bool allow_long = !touch_has_moved || (current_app == APP_SETTINGS && (abs(touch_x - touch_start_x) + abs(touch_y - touch_start_y)) < 60);
+    if (touch_active && !long_press_fired && allow_long) {
         int hold_dx = abs(touch_x - touch_start_x);
         int hold_dy = abs(touch_y - touch_start_y);
-        if ((hold_dx + hold_dy) < TAP_THRESHOLD && (now - last_touch_time) >= LONG_PRESS_MS) {
+        int limit = (current_app == APP_SETTINGS) ? 60 : TAP_THRESHOLD;
+        if ((hold_dx + hold_dy) < limit && (now - last_touch_time) >= LONG_PRESS_MS) {
             long_press_fired = true;
             gesture_consumed = true;
             if (current_app != APP_SETTINGS) enter_settings();

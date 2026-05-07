@@ -2000,16 +2000,17 @@ def on_encoder_event(event, direction, value):
             else: send_uart_command("Z-")
             
     elif event == "press":
-        if mode == "RADAR":
+        m = mode.strip().upper()
+        if m == "RADAR":
             # Reset Zoom
             with state_lock:
                 assistant_state["zoom"] = 15
             send_uart_command("Z:15")
             logger.info("Encoder Button: Zoom reset to 15nm")
-        elif mode == "CLOCK":
+        elif m == "CLOCK":
             # Jump to Assistant
             send_uart_command("APP:ASSISTANT")
-        elif mode == "SETTINGS":
+        elif m == "SETTINGS":
             # Exit Settings
             send_uart_command("EXIT_SETTINGS")
         else:
