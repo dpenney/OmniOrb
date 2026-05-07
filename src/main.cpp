@@ -1254,11 +1254,11 @@ void loop() {
             full_redraw();
         } else if (rx == "T+") {
             if (current_app == APP_GLOBE) {
-                GlobeView::add_tilt(5);
+                GlobeView::add_tilt(0.05f);
             }
         } else if (rx == "T-") {
             if (current_app == APP_GLOBE) {
-                GlobeView::add_tilt(-5);
+                GlobeView::add_tilt(-0.05f);
             }
         } else if (rx == "V+") {
             if (current_app == APP_SETTINGS) {
