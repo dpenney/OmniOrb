@@ -37,9 +37,9 @@ AUDIO_CHUNK        = 1024
 
 # Audio Playback
 APLAY_DEVICE = "plughw:CARD=sndrpigooglevoi,DEV=0"
-APLAY_SYNC_DELAY_MS = 55   # ms delay between writing audio and dispatching spectrum/SPEAKING.
+APLAY_SYNC_DELAY_MS = 105  # ms delay between writing audio and dispatching spectrum/SPEAKING.
                            # With silence feeder at 1:1 real-time, pipe backlog is near zero;
-                           # only the aplay ring buffer (100ms) contributes, giving ~50ms average
+                           # only the aplay ring buffer (200ms) contributes, giving ~100ms average
                            # write-to-playback latency. Tune ±10ms if animation still leads/lags.
 
 # TTS (Piper)

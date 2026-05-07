@@ -481,6 +481,7 @@ _aplay_stdin  = None          # stdin of the persistent aplay process
 _audio_lock   = threading.Lock()
 _tts_active   = threading.Event()
 _tts_abort    = threading.Event()   # set to kill TTS mid-playback (barge-in)
+_tts_finished_at = 0.0             # monotonic timestamp of last TTS completion
 _active_piper_proc  = None
 _active_piper_lock  = threading.Lock()
 
@@ -504,18 +505,18 @@ def _start_persistent_output():
         ['aplay', '-D', config.APLAY_DEVICE,
          '-t', 'raw', '-f', 'S16_LE',
          '-r', str(config.PIPER_SAMPLE_RATE), '-c', '1', '-q',
-         '--buffer-time=100000'],  # 100ms — tight sync between digital mouth and audio
+         '--buffer-time=200000'],  # 200ms — headroom for GIL/scheduling jitter
         stdin=subprocess.PIPE,
         stderr=subprocess.DEVNULL
     )
     _aplay_stdin = aplay.stdin
 
-    # Cap the stdin pipe at the Linux minimum (4096 bytes = 128ms at 16kHz 16-bit).
-    # Without this, even a slightly-fast feeder re-fills the default 64KB pipe
-    # within seconds, giving ~1s of write-ahead latency before TTS audio is heard.
+    # Cap the stdin pipe to limit write-ahead latency while still providing enough
+    # buffer that scheduling jitter doesn't cause underruns. 16384 bytes = 256ms at
+    # 16kHz 16-bit mono, giving comfortable headroom over the 200ms ring buffer.
     try:
         import fcntl as _fcntl
-        _fcntl.fcntl(_aplay_stdin.fileno(), 1031, 4096)  # F_SETPIPE_SZ
+        _fcntl.fcntl(_aplay_stdin.fileno(), 1031, 16384)  # F_SETPIPE_SZ
     except Exception:
         pass  # non-Linux or permission denied — latency capping unavailable
 
@@ -528,9 +529,13 @@ def _start_persistent_output():
         while True:
             if not _tts_active.is_set():
                 try:
-                    with _audio_lock:
-                        _aplay_stdin.write(silence_chunk)
-                        _aplay_stdin.flush()
+                    # Writability check outside the lock so we never block the
+                    # audio forwarder threads while waiting for pipe space.
+                    _, writable, _ = select.select([], [_aplay_stdin], [], 0.02)
+                    if writable:
+                        with _audio_lock:
+                            _aplay_stdin.write(silence_chunk)
+                            _aplay_stdin.flush()
                 except Exception:
                     break
             next_write += interval
@@ -764,10 +769,10 @@ _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
 _GAP_SILENCE = bytes(int(16000 * 0.010) * 2)   # 10ms of silence at 16kHz — fills aplay during inter-sentence gaps
 
-def _forward_piper_audio(piper):
+def _forward_piper_audio(piper, wait_event=None):
     """Forward piper stdout → aplay. Signals TTS active state.
-    Uses select() so inter-sentence gaps are filled with silence rather than
-    letting the aplay buffer drain (which causes audible clicks)."""
+    wait_event: if set, blocks before writing the first audio chunk until the
+    event fires — used by Piper B to avoid overlapping Piper A's playback."""
     from collections import deque as _deque
     try:
         first         = True
@@ -797,6 +802,12 @@ def _forward_piper_audio(piper):
                 chunk = piper.stdout.read(4096)
                 if not chunk:
                     break   # piper stdout closed — done
+                # Gate B: wait for A to finish before writing any audio.
+                # Placed after the read (not before) so Piper B's stdout pipe
+                # stays drained during the wait — avoids pipe-buffer stall.
+                if wait_event is not None:
+                    wait_event.wait()
+                    wait_event = None  # only gate the first chunk; clear for subsequent
                 if first:
                     _tts_active.set()
                     first = False
@@ -813,16 +824,16 @@ def _forward_piper_audio(piper):
                 else:
                     chunk_out = chunk
 
-                # Write audio immediately — no sleep, never block the audio path.
-                # Write audio — use select to avoid blocking indefinitely if aplay hangs
-                with _audio_lock:
-                    if _aplay_stdin:
-                        _, writable, _ = select.select([], [_aplay_stdin], [], 1.0)
-                        if writable:
+                # Writability check outside the lock — holding the lock during
+                # select() would starve the silence feeder for up to 1s per chunk.
+                if _aplay_stdin:
+                    _, writable, _ = select.select([], [_aplay_stdin], [], 0.3)
+                    if writable:
+                        with _audio_lock:
                             _aplay_stdin.write(chunk_out)
                             _aplay_stdin.flush()
-                        else:
-                            logger.error("Audio output blocked (aplay pipe full). Skipping chunk.")
+                    else:
+                        logger.error("Audio output blocked (aplay pipe full). Skipping chunk.")
                 # Push reference audio for AEC (use scaled output for correctness)
                 ref_samples = np.frombuffer(chunk_out, dtype=np.int16)
                 with _aec_ref_lock:
@@ -850,11 +861,10 @@ def _forward_piper_audio(piper):
 
             elif not first:
                 # Inter-sentence gap — keep aplay buffer fed to prevent underrun clicks
-                # Inter-sentence gap — keep aplay buffer fed to prevent underrun clicks
-                with _audio_lock:
-                    if _aplay_stdin:
-                        _, writable, _ = select.select([], [_aplay_stdin], [], 0.1)
-                        if writable:
+                if _aplay_stdin:
+                    _, writable, _ = select.select([], [_aplay_stdin], [], 0.1)
+                    if writable:
+                        with _audio_lock:
                             _aplay_stdin.write(_GAP_SILENCE)
                             _aplay_stdin.flush()
     except Exception:
@@ -866,6 +876,8 @@ def _forward_piper_audio(piper):
             if item[3]:  # fire_speaking flag
                 send_uart_command("APP: SPEAKING")
                 break
+        global _tts_finished_at
+        _tts_finished_at = time.time()
         _tts_active.clear()
 
 _MD_STRIP = re.compile(r'(\*{1,3}|_{1,3}|`+)')
@@ -903,13 +915,14 @@ def _speak_text_iter(text_iter):
     #   piper_a — plays the first chunk immediately for fast TTS start
     #   piper_b — receives all remaining chunks and runs ONNX inference
     #             concurrently while piper_a's audio is being heard
-    piper_a   = None
-    piper_b   = None
-    fwd_a     = None
-    fwd_b     = None
-    buf       = ""
-    parts     = []
-    a_fed     = False  # True once piper_a has its text and stdin is closed
+    piper_a      = None
+    piper_b      = None
+    fwd_a        = None
+    fwd_b        = None
+    buf          = ""
+    parts        = []
+    a_fed        = False  # True once piper_a has its text and stdin is closed
+    piper_a_done = threading.Event()  # set after fwd_a finishes; gates fwd_b writes
 
     def _ensure_piper_a():
         nonlocal piper_a, fwd_a
@@ -931,9 +944,7 @@ def _speak_text_iter(text_iter):
             return
         if piper_b is None:
             piper_b = _get_piper()
-            # Start forwarding audio from B immediately so it can buffer/play 
-            # while we are still feeding it sentences via stdin.
-            fwd_b = threading.Thread(target=_forward_piper_audio, args=(piper_b,), daemon=True)
+            fwd_b = threading.Thread(target=_forward_piper_audio, args=(piper_b, piper_a_done), daemon=True)
             fwd_b.start()
         try:
             piper_b.stdin.write(text.encode() + b'\n')
@@ -1035,6 +1046,8 @@ def _speak_text_iter(text_iter):
             pass
 
     # ── Drain Piper A ────────────────────────────────────────────────────────
+    if not piper_a:
+        piper_a_done.set()  # A never ran (abort/single-chunk-B path) — ungate fwd_b immediately
     if piper_a:
         try:
             piper_a.stdin.close()  # no-op if already closed above
@@ -1044,6 +1057,7 @@ def _speak_text_iter(text_iter):
             fwd_a.join(timeout=30)
             if fwd_a.is_alive():
                 logger.warning("Forwarder A timed out! Audio path may be stuck.")
+        piper_a_done.set()  # ungate fwd_b — A has finished writing to aplay
         try:
             piper_a.wait(timeout=2)
         except Exception:
@@ -1853,18 +1867,24 @@ def audio_processor():
                             continue
 
                         if continuity_speech_frames >= 5: # ~150ms of solid speech
-                            logger.info(f"CONTINUITY: Speech detected via VAD ({continuity_speech_frames} frames). Bypassing wake word.")
-                            with state_lock:
-                                assistant_state["status"] = "LISTENING"
-                            recording          = True
-                            recording_end_time = time.time() + config.LLM_RECORD_SECONDS
-                            query_buffer       = list(np.concatenate(list(pre_record_buffer)) if pre_record_buffer else [])
-                            vad_speech_frames  = continuity_speech_frames
-                            vad_silence_frames = 0
-                            continuity_silence_frames = 0
-                            vad_frame_buf      = np.array([], dtype=np.int16)
-                            continuity_speech_frames = 0
-                            continue
+                            tts_mute_s = config.WAKEWORD_TTS_MUTE_MS / 1000.0
+                            if (time.time() - _tts_finished_at) < tts_mute_s:
+                                # Speaker echo — still within post-TTS mute window. Discard.
+                                logger.debug(f"CONTINUITY: VAD fired within TTS mute window ({tts_mute_s:.1f}s). Ignoring echo.")
+                                continuity_speech_frames = 0
+                            else:
+                                logger.info(f"CONTINUITY: Speech detected via VAD ({continuity_speech_frames} frames). Bypassing wake word.")
+                                with state_lock:
+                                    assistant_state["status"] = "LISTENING"
+                                recording          = True
+                                recording_end_time = time.time() + config.LLM_RECORD_SECONDS
+                                query_buffer       = list(np.concatenate(list(pre_record_buffer)) if pre_record_buffer else [])
+                                vad_speech_frames  = continuity_speech_frames
+                                vad_silence_frames = 0
+                                continuity_silence_frames = 0
+                                vad_frame_buf      = np.array([], dtype=np.int16)
+                                continuity_speech_frames = 0
+                                continue
 
                 # ── IDLE MODE: Standard Wake Word Detection ──
                 if oww_model and status == "IDLE":
