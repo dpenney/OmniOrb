@@ -28,8 +28,9 @@ import config
 # Load secret environment variables from .env
 load_dotenv()
 
-# Google GenAI SDK automatically picks up GEMINI_API_KEY or GOOGLE_API_KEY from environment.
-# No manual mapping needed.
+# Map GEMINI_API_KEY to GOOGLE_API_KEY for libraries that expect it (like Mem0 and GenAI SDK)
+if os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
 
 # Force Google AI API version to v1 to ensure embedding models are found correctly
 os.environ["GOOGLE_API_VERSION"] = "v1"
@@ -214,6 +215,8 @@ def _init_mem0():
                 }
             }
         }
+        if "GOOGLE_API_KEY" not in os.environ:
+            os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "")
         _memory = Memory.from_config(_mem_config)
         logger.info("Mem0 long-term memory initialized with Local Chroma store.")
     except Exception as e:
@@ -1982,9 +1985,8 @@ def on_encoder_event(event, direction, value):
                     assistant_state["zoom"] = min(250, assistant_state["zoom"] + 1)
                 send_uart_command("Z-")
         elif m == "GLOBE":
-            # Tell the ESP32 to adjust the globe's tilt
-            if direction == "CW": send_uart_command("T+")
-            else: send_uart_command("T-")
+            # Tell the ESP32 to toggle the globe's rotation state
+            send_uart_command("GLOBE:TOGGLE")
         elif m in ("ASSISTANT", "SPEAKING", "CONTINUITY"):
             # Style Toggle Logic
             send_uart_command("STYLE:TOGGLE")
@@ -1998,22 +2000,18 @@ def on_encoder_event(event, direction, value):
             else: send_uart_command("Z-")
             
     elif event == "press":
-        m = mode.strip().upper()
-        if m == "RADAR":
+        if mode == "RADAR":
             # Reset Zoom
             with state_lock:
                 assistant_state["zoom"] = 15
             send_uart_command("Z:15")
             logger.info("Encoder Button: Zoom reset to 15nm")
-        elif m == "CLOCK":
+        elif mode == "CLOCK":
             # Jump to Assistant
             send_uart_command("APP:ASSISTANT")
-        elif m == "SETTINGS":
+        elif mode == "SETTINGS":
             # Exit Settings
             send_uart_command("EXIT_SETTINGS")
-        elif m == "GLOBE":
-            # Toggle Globe Rotation
-            send_uart_command("GLOBE:TOGGLE")
         else:
             # Default press action: Back to Radar
             send_uart_command("APP:RADAR")
