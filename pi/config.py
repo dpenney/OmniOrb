@@ -37,6 +37,7 @@ AUDIO_CHUNK        = 1024
 
 # Audio Playback
 APLAY_DEVICE = "plughw:CARD=sndrpigooglevoi,DEV=0"
+VOLUME_MAX   = 50   # MAX98357 clips/buzzes above ~50% — cap here to protect amp
 APLAY_SYNC_DELAY_MS = 105  # ms delay between writing audio and dispatching spectrum/SPEAKING.
                            # With silence feeder at 1:1 real-time, pipe backlog is near zero;
                            # only the aplay ring buffer (200ms) contributes, giving ~100ms average

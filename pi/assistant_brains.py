@@ -434,8 +434,9 @@ def serial_reader():
                         try:
                             global _volume
                             val = int(line[4:])
+                            vol_max = getattr(config, 'VOLUME_MAX', 100)
                             with _volume_lock:
-                                _volume = max(0, min(100, val))
+                                _volume = max(0, min(vol_max, val))
                             logger.info(f"[ESP32] Volume → {_volume}")
                         except ValueError:
                             logger.warning(f"Bad VOL message: {line}")
