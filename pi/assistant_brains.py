@@ -1369,6 +1369,12 @@ def process_llm(audio_array, is_continuity=False):
                                 result_holder[0], result_holder[1] = _send_email_task(subject, body)
                             t = threading.Thread(target=_run_email, daemon=True)
                             t.start()
+                            speak_text(random.choice([
+                                "Routing that to your inbox.",
+                                "Dispatching to your email now.",
+                                "Transmitting to your inbox.",
+                                "Sending that to your email.",
+                            ]))
                             t.join(timeout=15)
                             email_ok  = result_holder[0]
                             email_msg = result_holder[1]
