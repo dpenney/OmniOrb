@@ -213,7 +213,16 @@ def _init_mem0():
                     "collection_name": "omniorb_memory",
                     "path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_store"),
                 }
-            }
+            },
+            "custom_fact_extraction_prompt": (
+                "You are extracting ONLY persistent personal facts about the user that are worth "
+                "remembering across future conversations. Store facts like: name, family members, "
+                "location, job, hobbies, preferences, recurring interests, personal background. "
+                "Do NOT store: one-time actions (setting timers, sending emails, web searches), "
+                "session-specific requests, questions about current events, or anything that would "
+                "not be useful context in a completely separate future conversation. "
+                "If there are no persistent personal facts in the input, return an empty list."
+            ),
         }
         if "GOOGLE_API_KEY" not in os.environ:
             os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "")
