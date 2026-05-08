@@ -1226,7 +1226,7 @@ def _set_sleep_mode(enabled):
 
 
 
-def process_llm(audio_array):
+def process_llm(audio_array, is_continuity=False):
     global _current_transcript, _last_assistant_response
     """
     LLM pipeline with streaming and Gemini function calling for timers:
@@ -1255,12 +1255,11 @@ def process_llm(audio_array):
 
         # Valid audio detected — now start the "thinking" UX
         with state_lock:
-            prev_status = assistant_state.get("status")
             assistant_state["processing"] = True
             assistant_state["status"]     = "THINKING"
-        
+
         send_uart_command("APP:THINKING")
-        speak_filler(is_continuity=(prev_status == "CONTINUITY"))
+        speak_filler(is_continuity=is_continuity)
 
         logger.info(f"LLM query: {len(audio_array)} samples, peak={peak_amplitude:.5f}")
 
@@ -1290,7 +1289,7 @@ def process_llm(audio_array):
         interaction_transcript = ""
         
         user_msg = f"[Current Context: {get_context()}]"
-        if prev_status == "CONTINUITY" and _last_assistant_response:
+        if is_continuity and _last_assistant_response:
             user_msg += f"\n[Your previous response was: \"{_last_assistant_response}\". The user is now following up.]"
 
 
@@ -1708,6 +1707,7 @@ def audio_processor():
     # ── Recording state ──
     recording            = False
     recording_end_time   = 0
+    from_continuity      = False   # True when recording triggered by continuity VAD bypass
     query_buffer         = []
     vad_speech_frames    = 0
     vad_silence_frames   = 0
@@ -1804,7 +1804,8 @@ def audio_processor():
                         # We don't have the text yet, process_llm will call add_interaction later
                         pass
 
-                    threading.Thread(target=process_llm, args=(audio_array,), daemon=True).start()
+                    threading.Thread(target=process_llm, args=(audio_array, from_continuity), daemon=True).start()
+                    from_continuity    = False
                     last_wakeword_time = time.time()
 
             # ── Wake Word Detection / Continuity Bypass ──
@@ -1883,6 +1884,7 @@ def audio_processor():
                                 with state_lock:
                                     assistant_state["status"] = "LISTENING"
                                 recording          = True
+                                from_continuity    = True
                                 recording_end_time = time.time() + config.LLM_RECORD_SECONDS
                                 query_buffer       = list(np.concatenate(list(pre_record_buffer)) if pre_record_buffer else [])
                                 vad_speech_frames  = continuity_speech_frames
@@ -1933,6 +1935,7 @@ def audio_processor():
                                 with state_lock:
                                     assistant_state["last_wakeword_at"] = time.time()
                                 recording          = True
+                                from_continuity    = False
                                 recording_end_time = time.time() + config.LLM_RECORD_SECONDS
                                 query_buffer       = list(np.concatenate(list(pre_record_buffer)) if pre_record_buffer else [])
                                 vad_speech_frames  = 0
