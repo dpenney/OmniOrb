@@ -4,7 +4,7 @@ import json
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Serial Configuration
-SERIAL_PORTS = ['/dev/serial0', '/dev/ttyS0', '/dev/ttyAMA0']
+SERIAL_PORTS = ['/dev/ttyAMA0', '/dev/serial0', '/dev/ttyS0', '/dev/ttyAMA10', '/dev/ttyHS2']
 SERIAL_BAUD = 115200
 
 # GPIO Pins (BCM numbering)
@@ -29,14 +29,101 @@ PIN_AMP_MUTE  = 13   # SD pin on amp — HIGH = enabled, LOW = shutdown/muted
 PIN_UART_TX = 14
 PIN_UART_RX = 15
 
-# Audio Input Configuration
-AUDIO_DEVICE_INDEX = 1
-AUDIO_CHANNELS     = 2        # Stereo (INMP441 outputs on one channel, other is silent)
-AUDIO_RATE         = 48000    # Hardware locked rate
-AUDIO_CHUNK        = 1024
+# ── Audio Input Configuration ────────────────────────────────────────────
+# Switchable capture front-end. The two supported boards capture differently:
+#   "inmp441"       Raspberry Pi I2S MEMS mic — raw 32-bit I2S, one live channel,
+#                   clean at LF, needs a digital boost.
+#   "tachyon_codec" Particle Tachyon Audio Adapter (Qualcomm QCM6490 codec) —
+#                   native 16-bit PCM on hw:0,0 (MultiMedia1 / PRI_MI2S_TX route),
+#                   needs ALSA mixer routing applied first and benefits from a
+#                   high-pass to kill ~39 Hz analog rumble (+ optional notch for
+#                   the 1.92 kHz codec whine documented in audio_analysis.md).
+# Override at runtime with the AUDIO_SOURCE env var (e.g. in the systemd unit).
+AUDIO_SOURCE = os.getenv("AUDIO_SOURCE", "inmp441")
 
-# Audio Playback
-APLAY_DEVICE = "plughw:CARD=sndrpigooglevoi,DEV=0"
+AUDIO_PROFILES = {
+    "inmp441": {
+        # Pi 4 + googlevoicehat-soundcard overlay defaults.
+        "device_index": 1,
+        "channels":     2,
+        "rate":         48000,     # hardware-locked
+        "chunk":        1024,
+        "sample_format": "int32",  # 24-bit data in 32-bit I2S slots
+        "gain":         2.0,
+        "oww_gain":     5.0,       # tune upward if wake word misses; downward for false triggers
+        "highpass_hz":  80,        # kill INMP441 DC bias
+        "notch_hz":     0,
+        "channel_select": "right", # Pi 4: signal on right channel
+        "routing":      [],
+        "aplay_device": "plughw:CARD=sndrpigooglevoi,DEV=0",
+    },
+    "inmp441_pi5": {
+        # Pi 5 — INMP441 is much quieter; right channel is I2S RP1 clock noise.
+        "device_index": 1,
+        "channels":     2,
+        "rate":         48000,
+        "chunk":        1024,
+        "sample_format": "int32",
+        "gain":         20.0,      # Pi 5 INMP441 needs 10× more gain than Pi 4
+        "oww_gain":     40.0,      # OWW needs ~40× to reach -20dBFS on Pi 5
+        "highpass_hz":  80,
+        "notch_hz":     0,
+        "channel_select": "left",  # right channel is I2S clock coupling noise on Pi 5
+        "routing":      [],
+        "aplay_device": "plughw:CARD=sndrpigooglevoi,DEV=0",
+    },
+    "tachyon_codec": {
+        "device_index": 0,         # hw:0,0 = MultiMedia1 capture
+        # Mono: the codec routes the left ADC to both channels, and under the
+        # bare systemd environment the MI2S backend comes up 1-channel, so a
+        # 2-channel open is rejected with PortAudio -9998. Capture mono directly.
+        "channels":     1,
+        "rate":         48000,
+        "chunk":        1024,
+        "sample_format": "int16",  # QCM6490 codec delivers native 16-bit PCM
+        "gain":         1.0,
+        "oww_gain":     10.0,      # codec output is ~0.4% FS at idle; boost so OWW sees usable levels
+        "highpass_hz":  120,       # remove the ~39 Hz preamp rumble
+        "notch_hz":     1920,      # codec/clock crosstalk whine (0 to disable)
+        # tinymix routes applied once before the capture stream opens. Analog
+        # capture gain kept low (6) because preamp self-noise scales with it;
+        # loudness is recovered with the largely noise-free digital volume.
+        # PRI_MI2S_RX route enables playback via MAX98357A on the 40-pin header.
+        "routing": [
+            ("MultiMedia1 Mixer PRI_MI2S_TX", "1"),
+            ("PRI_MI2S_RX Audio Mixer MultiMedia1", "1"),
+            ("Left PGA Mux", "Line 1L"),
+            ("Right PGA Mux", "Line 1R"),
+            ("ADC Source Mux", "left data = left ADC, right data = left ADC"),
+            ("Capture Digital Volume", "168"),
+            ("Left Channel Capture Volume", "6"),
+            ("Right Channel Capture Volume", "6"),
+            ("Capture Mute", "0"),
+        ],
+        "aplay_device": "hw:0,0",  # MultiMedia1 → PRI_MI2S_RX → MAX98357A on header
+    },
+}
+
+if AUDIO_SOURCE not in AUDIO_PROFILES:
+    raise ValueError(
+        f"Unknown AUDIO_SOURCE {AUDIO_SOURCE!r}; expected one of {list(AUDIO_PROFILES)}"
+    )
+
+_AUDIO = AUDIO_PROFILES[AUDIO_SOURCE]
+
+# Flat aliases kept for backward compatibility with existing call sites.
+AUDIO_DEVICE_INDEX = _AUDIO["device_index"]
+AUDIO_CHANNELS     = _AUDIO["channels"]
+AUDIO_RATE         = _AUDIO["rate"]
+AUDIO_CHUNK        = _AUDIO["chunk"]
+AUDIO_SAMPLE_FORMAT = _AUDIO["sample_format"]
+AUDIO_GAIN         = _AUDIO["gain"]
+AUDIO_OWW_GAIN     = _AUDIO.get("oww_gain", 1.0)
+AUDIO_HIGHPASS_HZ  = _AUDIO["highpass_hz"]
+AUDIO_NOTCH_HZ     = _AUDIO["notch_hz"]
+AUDIO_CHANNEL_SELECT = _AUDIO.get("channel_select", "auto")
+AUDIO_ROUTING      = _AUDIO["routing"]
+APLAY_DEVICE       = _AUDIO["aplay_device"]
 VOLUME_MAX   = 50   # MAX98357 clips/buzzes above ~50% — cap here to protect amp
 APLAY_SYNC_DELAY_MS = 105  # ms delay between writing audio and dispatching spectrum/SPEAKING.
                            # With silence feeder at 1:1 real-time, pipe backlog is near zero;
@@ -57,7 +144,7 @@ LOG_BACKUP_COUNT = 3
 # Wake Word
 # Set to an absolute path for a custom .onnx model, or a built-in like "hey_jarvis_v0.1"
 WAKEWORD_MODEL     = os.path.join(_DIR, "HeyRobot.onnx")
-WAKEWORD_THRESHOLD           = 0.70   # lower for easier wake at conversational volume
+WAKEWORD_THRESHOLD           = 0.85
 WAKEWORD_THRESHOLD_BARGE_IN  = 0.95   # much higher threshold during TTS (since AEC is off)
 WAKEWORD_TTS_MUTE_MS         = max(1500, APLAY_SYNC_DELAY_MS + 1000)
                                       # Must cover APLAY_SYNC_DELAY_MS (audio still in buffer)
@@ -93,7 +180,7 @@ ENCODER_POLL_SLEEP  = 0.001
 
 # Flask Configuration
 FLASK_HOST = '0.0.0.0'
-FLASK_PORT = 5000
+FLASK_PORT = 5005
 
 # Home Location — fallback defaults used until ESP32 sends GEO: over UART.
 # Set via the provisioning portal on first boot; persisted to device_settings.json.
@@ -102,7 +189,7 @@ HOME_LON  = -74.0060
 HOME_TZ   = "America/New_York"
 
 # ADS-B Configuration (Virtual Receiver)
-# Default BOX around New York City (matches HOME_LAT/HOME_LON in config.h)
+# Default BOX around New York City (matches example HOME_LAT/HOME_LON)
 ADSB_BOX             = "40.3,41.1,-74.4,-73.6"
 ADSB_UPDATE_INTERVAL = 10.0  # Seconds
 ADSB_LOG_FILE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adsb.log")
@@ -141,6 +228,7 @@ CONTINUITY_SILENCE_TIMEOUT = 6.0 # Early exit if room is silent for this long
 
 # TTS Pronunciation Map
 # A dictionary of {word/pattern: replacement} used to fix Piper's mispronunciations.
+# Dynamically loaded from environment variable to protect PII.
 TTS_PRONUNCIATION_MAP = json.loads(os.getenv('TTS_PRONUNCIATION_MAP', '{}'))
 
 # Email Configuration
