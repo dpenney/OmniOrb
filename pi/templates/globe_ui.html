@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OmniOrb | Globe Manager</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0a0a0c;
+            --card-bg: #16161a;
+            --accent: #00f2ff;
+            --accent-dim: #00a2aa;
+            --text: #e0e0e6;
+            --text-dim: #a0a0a6;
+            --border: #2a2a30;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            max-width: 900px;
+            width: 100%;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            font-weight: 600;
+            letter-spacing: 2px;
+            margin: 0;
+            color: var(--accent);
+            text-transform: uppercase;
+        }
+
+        p.subtitle {
+            color: var(--text-dim);
+            margin-top: 5px;
+        }
+
+        .glass-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+            margin-bottom: 24px;
+        }
+
+        #map {
+            height: 400px;
+            width: 100%;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            margin-bottom: 20px;
+            background: #0a0a0c;
+        }
+
+        /* Lift the dark base slightly and nudge it toward the cyan tactical palette */
+        .leaflet-tile-pane {
+            filter: brightness(1.12) contrast(1.06) saturate(0.9);
+        }
+
+        .grid-label {
+            color: var(--accent);
+            opacity: 0.65;
+            font-family: 'Outfit', monospace;
+            font-size: 10px;
+            letter-spacing: 0.5px;
+            white-space: nowrap;
+            text-shadow: 0 0 3px #000, 0 0 3px #000;
+            transform: translate(3px, 2px);
+            pointer-events: none;
+        }
+
+        .search-bar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .search-bar input {
+            flex: 1;
+        }
+
+        .search-results {
+            display: none;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 16px;
+            max-height: 220px;
+            overflow-y: auto;
+        }
+
+        .search-result {
+            padding: 10px 14px;
+            background: #202026;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+        }
+
+        .search-result:hover {
+            border-color: var(--accent);
+            background: #26262e;
+        }
+
+        .search-result .sr-name {
+            font-weight: 600;
+        }
+
+        .search-result .sr-detail {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+
+        .controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr auto;
+            gap: 15px;
+            align-items: flex-end;
+        }
+
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        label {
+            font-size: 0.85rem;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        input {
+            background: #202026;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px;
+            color: var(--text);
+            font-family: inherit;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        button {
+            background: var(--accent);
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 20px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            height: 42px;
+        }
+
+        button:hover {
+            background: #fff;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 242, 255, 0.3);
+        }
+
+        .poi-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .poi-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 16px;
+            background: #202026;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            transition: border-color 0.2s;
+        }
+
+        .poi-item:hover {
+            border-color: var(--accent-dim);
+        }
+
+        .poi-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .color-preview {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            border: 2px solid rgba(255,255,255,0.2);
+        }
+
+        .poi-text {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .poi-name {
+            font-weight: 600;
+            font-size: 1rem;
+        }
+
+        .poi-coords {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+
+        .btn-delete {
+            background: transparent;
+            color: #ff4d4d;
+            border: 1px solid #ff4d4d33;
+            padding: 5px 10px;
+            font-size: 0.8rem;
+        }
+
+        .btn-delete:hover {
+            background: #ff4d4d;
+            color: #fff;
+            box-shadow: 0 4px 12px rgba(255, 77, 77, 0.3);
+        }
+
+        #status {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 12px 24px;
+            border-radius: 8px;
+            background: var(--accent);
+            color: #000;
+            font-weight: 600;
+            display: none;
+            animation: slideUp 0.3s ease-out;
+        }
+
+        @keyframes slideUp {
+            from { transform: translateY(100px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Globe Manager</h1>
+            <p class="subtitle">Customize Points of Interest on your OmniOrb</p>
+        </header>
+
+        <div class="glass-card">
+            <div class="search-bar">
+                <input type="text" id="search-input" placeholder="Search a place, e.g. Yosemite National Park" onkeydown="if(event.key==='Enter')runSearch()">
+                <button onclick="runSearch()">Search</button>
+            </div>
+            <div id="search-results" class="search-results"></div>
+            <div id="map"></div>
+            <div class="controls">
+                <div class="input-group">
+                    <label>Name</label>
+                    <input type="text" id="poi-name" placeholder="e.g. Home">
+                </div>
+                <div class="input-group">
+                    <label>Color</label>
+                    <input type="color" id="poi-color" value="#00f2ff">
+                </div>
+                <button onclick="addPOI()">Add POI</button>
+            </div>
+            <div style="margin-top: 10px;">
+                <span id="coord-display" style="font-size: 0.8rem; color: var(--text-dim);">Click map to select location</span>
+            </div>
+        </div>
+
+        <div class="glass-card">
+            <h2 style="font-size: 1.2rem; margin-top: 0; color: var(--text-dim);">Stored Locations</h2>
+            <div id="poi-list" class="poi-list">
+                <!-- POIs will be loaded here -->
+            </div>
+            <div style="margin-top: 24px; display: flex; justify-content: flex-end;">
+                <button style="background: #fff;" onclick="saveAll()">Save to Device</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="status">Changes Saved!</div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        let map;
+        let marker;
+        let selectedCoords = null;
+        let pois = [];
+        let graticuleLayer = null;
+
+        function initMap() {
+            map = L.map('map', {
+                center: [20, 0],
+                zoom: 2,
+                backgroundColor: '#0a0a0c'
+            });
+
+            // Tactical dark-gray base: lighter landmasses + readable coastlines/borders
+            L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+                attribution: 'Tiles &copy; Esri',
+                maxZoom: 16
+            }).addTo(map);
+            // Reference overlay: country names + emphasized admin borders
+            L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {
+                maxZoom: 16
+            }).addTo(map);
+
+            drawGraticule();
+            map.on('moveend zoomend', drawGraticule);
+
+            map.on('click', function(e) {
+                selectLocation(e.latlng.lat, e.latlng.lng);
+            });
+        }
+
+        // Grid spacing in degrees, tightening as you zoom in.
+        function gridStep(zoom) {
+            if (zoom <= 2)  return 20;
+            if (zoom <= 4)  return 10;
+            if (zoom <= 5)  return 5;
+            if (zoom <= 7)  return 2;
+            if (zoom <= 9)  return 1;
+            if (zoom <= 11) return 0.5;
+            if (zoom <= 13) return 0.2;
+            return 0.1;
+        }
+
+        // Format a gridline value as a chart label, e.g. 40 -> "40°N", -120 -> "120°W".
+        function fmtDeg(v, posHemi, negHemi) {
+            if (Math.abs(v) < 1e-6) return '0°';
+            const mag = Math.round(Math.abs(v) * 1000) / 1000;  // trim float noise
+            return mag + '°' + (v > 0 ? posHemi : negHemi);
+        }
+
+        function gridLabel(lat, lon, text) {
+            return L.marker([lat, lon], {
+                interactive: false,
+                keyboard: false,
+                icon: L.divIcon({ className: 'grid-label', html: text, iconSize: [0, 0] })
+            });
+        }
+
+        // Aeronautical-chart lat/lon grid in dim accent cyan.
+        // Redrawn on every move/zoom: only spans the visible bounds and uses a
+        // zoom-dependent step, so it densifies as you zoom in without ever
+        // drawing more than a screenful of lines. Labels ride the top/left edges.
+        function drawGraticule() {
+            if (!graticuleLayer) graticuleLayer = L.layerGroup().addTo(map);
+            else graticuleLayer.clearLayers();
+
+            const style     = { color: '#00f2ff', weight: 0.6, opacity: 0.22, interactive: false };
+            const axisStyle = { color: '#00f2ff', weight: 1.0, opacity: 0.40, interactive: false };
+
+            const step  = gridStep(map.getZoom());
+            const b     = map.getBounds().pad(0.2);
+            const south = Math.max(-85, b.getSouth());
+            const north = Math.min(85,  b.getNorth());
+            const west  = Math.max(-180, b.getWest());
+            const east  = Math.min(180,  b.getEast());
+            const snap  = (v) => Math.floor(v / step) * step;
+            const round = (v) => Math.round(v / step) * step;  // kill float drift for the 0-axis test
+
+            // Anchor labels to the actual (unpadded) visible edges so they stay on-screen.
+            const view  = map.getBounds();
+            const top   = Math.min(85,  view.getNorth());
+            const left  = Math.max(-180, view.getWest());
+
+            // Meridians (constant longitude)
+            for (let lon = snap(west); lon <= east + 1e-9; lon += step) {
+                const v = round(lon);
+                L.polyline([[south, v], [north, v]], Math.abs(v) < 1e-6 ? axisStyle : style).addTo(graticuleLayer);
+                gridLabel(top, v, fmtDeg(v, 'E', 'W')).addTo(graticuleLayer);
+            }
+            // Parallels (constant latitude)
+            for (let lat = snap(south); lat <= north + 1e-9; lat += step) {
+                const v = round(lat);
+                L.polyline([[v, west], [v, east]], Math.abs(v) < 1e-6 ? axisStyle : style).addTo(graticuleLayer);
+                gridLabel(v, left, fmtDeg(v, 'N', 'S')).addTo(graticuleLayer);
+            }
+        }
+
+        function selectLocation(lat, lon) {
+            selectedCoords = { lat: lat.toFixed(4), lon: lon.toFixed(4) };
+            const latlng = L.latLng(lat, lon);
+            if (marker) {
+                marker.setLatLng(latlng);
+            } else {
+                marker = L.marker(latlng).addTo(map);
+            }
+            document.getElementById('coord-display').innerText = `Selected: ${selectedCoords.lat}, ${selectedCoords.lon}`;
+        }
+
+        async function runSearch() {
+            const q = document.getElementById('search-input').value.trim();
+            const box = document.getElementById('search-results');
+            if (!q) return;
+            box.style.display = 'flex';
+            box.innerHTML = '<div class="search-result">Searching…</div>';
+            try {
+                const res = await fetch('/api/globe/search?q=' + encodeURIComponent(q));
+                const data = await res.json();
+                if (!Array.isArray(data) || data.length === 0) {
+                    box.innerHTML = '<div class="search-result">No results found.</div>';
+                    return;
+                }
+                box.innerHTML = '';
+                data.forEach(r => {
+                    const item = document.createElement('div');
+                    item.className = 'search-result';
+                    item.innerHTML = `<div class="sr-name">${r.name}</div><div class="sr-detail">${r.display_name}</div>`;
+                    item.onclick = () => {
+                        selectLocation(r.lat, r.lon);
+                        map.setView([r.lat, r.lon], 6);
+                        document.getElementById('poi-name').value = r.name;
+                        box.style.display = 'none';
+                    };
+                    box.appendChild(item);
+                });
+            } catch (e) {
+                box.innerHTML = '<div class="search-result">Search failed. Try again.</div>';
+            }
+        }
+
+        async function loadPOIs() {
+            const res = await fetch('/api/globe/pois');
+            pois = await res.json();
+            renderPOIs();
+        }
+
+        function renderPOIs() {
+            const list = document.getElementById('poi-list');
+            list.innerHTML = '';
+            
+            pois.forEach((poi, index) => {
+                const item = document.createElement('div');
+                item.className = 'poi-item';
+                item.innerHTML = `
+                    <div class="poi-info">
+                        <div class="color-preview" style="background: ${poi.color}"></div>
+                        <div class="poi-text">
+                            <span class="poi-name">${poi.name}</span>
+                            <span class="poi-coords">${poi.lat}, ${poi.lon}</span>
+                        </div>
+                    </div>
+                    <button class="btn-delete" onclick="deletePOI(${index})">Remove</button>
+                `;
+                list.appendChild(item);
+            });
+        }
+
+        function addPOI() {
+            const name = document.getElementById('poi-name').value || 'Unnamed';
+            const color = document.getElementById('poi-color').value;
+            
+            if (!selectedCoords) {
+                alert('Please click on the map to select a location.');
+                return;
+            }
+
+            pois.push({
+                name,
+                color,
+                lat: parseFloat(selectedCoords.lat),
+                lon: parseFloat(selectedCoords.lon)
+            });
+
+            renderPOIs();
+            document.getElementById('poi-name').value = '';
+        }
+
+        function deletePOI(index) {
+            pois.splice(index, 1);
+            renderPOIs();
+        }
+
+        async function saveAll() {
+            const res = await fetch('/api/globe/pois', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(pois)
+            });
+            
+            if (res.ok) {
+                showStatus();
+            }
+        }
+
+        function showStatus() {
+            const status = document.getElementById('status');
+            status.style.display = 'block';
+            setTimeout(() => {
+                status.style.display = 'none';
+            }, 2000);
+        }
+
+        window.onload = () => {
+            initMap();
+            loadPOIs();
+        };
+    </script>
+</body>
+</html>

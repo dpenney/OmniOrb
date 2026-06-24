@@ -62,13 +62,13 @@ static Arduino_Canvas *assistant_canvas = nullptr;
 
 // ─── Colours (RGB565: RRRRR GGGGGG BBBBB) ────────────────────────────────────
 static const uint16_t C_BG       = 0x0000;  // black
-static const uint16_t C_RING     = 0x0120;  // dark green ring
-static const uint16_t C_GRID     = 0x00A0;  // dim green crosshair
+static const uint16_t C_RING     = 0x0280;  // balanced dark-mid green ring
+static const uint16_t C_GRID     = 0x0180;  // balanced dim green crosshair
 static const uint16_t C_SWEEP    = 0x07E0;  // bright green sweep arm
 static const uint16_t C_BLIP     = 0x07E0;  // blip colour
 static const uint16_t C_DIM_BLIP = 0x02E0;  // dimmed blip (dark green)
 static const uint16_t C_SEL      = 0xFFFF;  // selected aircraft (white)
-static const uint16_t C_LBL      = 0x03E0;  // callsign label
+static const uint16_t C_LBL      = 0x07E0;  // callsign label
 static const uint16_t C_BOX_BG   = 0x0020;  // detail box background
 static const uint16_t C_BOX_BORD = 0x03E0;  // detail box border
 
@@ -199,6 +199,7 @@ void enter_settings() {
     current_app = APP_SETTINGS;
     SettingsView::show();
     SettingsView::update();   // draw immediately on entry
+    notify_pi_app_mode(current_app);
 }
 
 void exit_settings() {
@@ -206,15 +207,17 @@ void exit_settings() {
     String vmsg = String("VOL:") + String(settings.volume);
     Serial0.println(vmsg);
     Serial.printf("[UART→Pi] %s\n", vmsg.c_str());
+    SettingsManager::save(settings);
+
 
     // Safety: If prev_app is a menu, default to Radar
     if (prev_app == APP_SETTINGS || prev_app == APP_DIAGNOSTICS) {
         prev_app = APP_RADAR;
     }
 
-    Serial0.printf("Exiting Settings: Returning to prev_app ID %d\n", (int)prev_app);
+    Serial.printf("Exiting Settings: Returning to prev_app ID %d\n", (int)prev_app);
     current_app = prev_app;
-    Serial0.printf("Exiting Settings: current_app is now ID %d\n", (int)current_app);
+    Serial.printf("Exiting Settings: current_app is now ID %d\n", (int)current_app);
 
     if (current_app == APP_CLOCK) {
         lvgl_active = true;
@@ -240,7 +243,7 @@ void process_swipe(int x1, int y1, int x2, int y2) {
     // ── Settings view: swipe right exits; arc drag handled in loop() ─────────
     // ── Settings/Diagnostics view: swipe right exits; arc drag handled in loop() ──
     if (current_app == APP_SETTINGS || current_app == APP_DIAGNOSTICS) {
-        if (abs(dx) > abs(dy) && dx > GESTURE_THRESHOLD) {
+        if (abs(dx) > abs(dy) && dx > 5) {
             if (current_app == APP_DIAGNOSTICS) {
                 current_app = APP_SETTINGS;
                 // SettingsView update happens in next frame
@@ -255,17 +258,49 @@ void process_swipe(int x1, int y1, int x2, int y2) {
         if (current_app == APP_RADAR) {
             int hit = find_nearest(x2, y2);
         if (hit >= 0 && hit < aircraft_count) {
-            selected_idx = hit;
-            if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                Aircraft &ac = aircraft[hit];
-                if (ac.paint_valid)
-                    draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, C_SEL);
-                xSemaphoreGive(ac_mutex);
+            if (hit == selected_idx) {
+                // Tapping the same plane -> Toggle OFF
+                int old_idx = selected_idx;
+                selected_idx = -1;
+                erase_detail_box();
+                if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    Aircraft &ac = aircraft[old_idx];
+                    if (ac.paint_valid)
+                        draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, ac.is_dimmed ? C_DIM_BLIP : C_BLIP);
+                    xSemaphoreGive(ac_mutex);
+                }
+            } else {
+                // Tapping a new plane -> Select IT
+                int old_idx = selected_idx;
+                selected_idx = hit;
+                if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    // Restore old blip if one was selected
+                    if (old_idx >= 0 && old_idx < aircraft_count) {
+                        Aircraft &old_ac = aircraft[old_idx];
+                        if (old_ac.paint_valid)
+                            draw_blip_shape(old_ac.paint_x, old_ac.paint_y, old_ac.heading, old_ac.is_dimmed ? C_DIM_BLIP : C_BLIP);
+                    }
+                    // Highlight new blip
+                    Aircraft &ac = aircraft[hit];
+                    if (ac.paint_valid)
+                        draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, C_SEL);
+                    xSemaphoreGive(ac_mutex);
+                }
+                draw_detail_box();
             }
-            draw_detail_box();
-        } else if (detail_visible) {
+        } else if (selected_idx >= 0) {
+            // Tapping empty space -> Deselect
+            int old_idx = selected_idx;
             selected_idx = -1;
             erase_detail_box();
+            if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (old_idx >= 0 && old_idx < aircraft_count) {
+                    Aircraft &ac = aircraft[old_idx];
+                    if (ac.paint_valid)
+                        draw_blip_shape(ac.paint_x, ac.paint_y, ac.heading, ac.is_dimmed ? C_DIM_BLIP : C_BLIP);
+                }
+                xSemaphoreGive(ac_mutex);
+            }
         }
     }
         return;
@@ -334,6 +369,11 @@ void process_swipe(int x1, int y1, int x2, int y2) {
                 current_app = APP_RADAR;
                 notify_pi_app_mode(current_app);
                 full_redraw();
+            } else if (current_app == APP_RADAR) {
+                current_app = APP_CLOCK;
+                notify_pi_app_mode(current_app);
+                lvgl_active = true;
+                ClockView::show();
             }
         }
 
@@ -428,7 +468,7 @@ void fetch_task(void *pv) {
 
             if (WiFi.status() == WL_CONNECTED) {
                 HTTPClient http;
-                String url = String("http://") + ADSB_HOST + ":" + ADSB_PORT + ADSB_PATH + 
+                String url = String("http://") + settings.adsb_host + ":" + ADSB_PORT + ADSB_PATH + 
                              "?lat=" + String(settings.home_lat, 4) + 
                              "&lon=" + String(settings.home_lon, 4) +
                              "&range=" + String(range_nm, 1);
@@ -457,6 +497,22 @@ void fetch_task(void *pv) {
                             idx = aircraft_count++;
                             memset(&aircraft[idx], 0, sizeof(Aircraft));
                             strlcpy(aircraft[idx].hex, hex, sizeof(aircraft[idx].hex));
+                        }
+                        if (idx == -1) {
+                            // Array full: reclaim a slot whose aircraft has expired and
+                            // whose blip the sweep has already erased (paint_valid false),
+                            // so reuse can't leave orphaned pixels on screen. Without this
+                            // the array fills with dead entries and new traffic is dropped.
+                            for (int i = 0; i < aircraft_count; i++) {
+                                if (!aircraft[i].paint_valid &&
+                                    millis() - aircraft[i].seen_ms > (uint32_t)(AIRCRAFT_MAX_AGE_S * 1000)) {
+                                    idx = i;
+                                    if (selected_idx == i) selected_idx = -1;
+                                    memset(&aircraft[idx], 0, sizeof(Aircraft));
+                                    strlcpy(aircraft[idx].hex, hex, sizeof(aircraft[idx].hex));
+                                    break;
+                                }
+                            }
                         }
 
                         if (idx != -1) {
@@ -704,7 +760,6 @@ void draw_detail_box() {
     gfx->setCursor(DETAIL_BX+6, DETAIL_BY+50); gfx->printf("Hdg: %d deg", ac.heading);
     detail_visible = true;
     detail_clobbered = false;
-    xSemaphoreGive(ac_mutex);
 }
 
 void erase_detail_box() {
@@ -734,60 +789,57 @@ int find_nearest(int tx, int ty) {
     xSemaphoreGive(ac_mutex);
     return best;
 }
-
 // Draw timer ring on the radar/gfx canvas — safe at r=231-240 since sweep only reaches r=230
 static void draw_radar_timer_ring() {
-    const float STEP = 0.008f;
-    const float FULL = 2.0f * M_PI;
-    const float start_rad = -M_PI / 2.0f;
-    static float last_pct = -1.0f;
-
-    if (!AssistantView::is_timer_active()) {
-        if (last_pct >= 0) {
-            full_redraw(); // Clear the ring cleanly once
-            last_pct = -1.0f;
+    static float draw_pct = 100.0f;
+    if (AssistantView::is_timer_active()) {
+        float timer_pct_vis = AssistantView::get_timer_vis_pct();
+        draw_pct += (timer_pct_vis - draw_pct) * 0.12f;
+        int limit_deg = (int)(draw_pct * 3.6f);
+        
+        uint16_t col;
+        int ipct = (int)draw_pct;
+        if (ipct >= 50) {
+            float t  = (ipct - 50) / 50.0f;
+            uint8_t r = (uint8_t)(31 * (1.0f - t));
+            col = (r << 11) | (63 << 5);
+        } else {
+            float t  = ipct / 50.0f;
+            uint8_t g = (uint8_t)(63 * t);
+            col = (31 << 11) | (g << 5);
         }
-        return;
-    }
 
-    float pct = AssistantView::get_timer_vis_pct();
-    float span_rad = (pct / 100.0f) * FULL;
-    float end_rad  = start_rad + span_rad;
+        // Smart Redraw: Only redraw if the percentage has actually moved enough to be visible.
+        // This eliminates flickering and saves massive CPU/SPI bandwidth.
+        static float last_draw_pct = -1.0f;
+        if (fabs(draw_pct - last_draw_pct) < 0.2f) return; 
+        last_draw_pct = draw_pct;
 
-    // Shrinking logic: Erase the gap between old and new
-    if (last_pct > pct) {
-        float old_span = (last_pct / 100.0f) * FULL;
-        for (float a = start_rad + (pct/100.0f)*FULL; a <= start_rad + old_span; a += STEP) {
-            float cs = cosf(a), sn = sinf(a);
-            for (int tt = 0; tt < 10; tt++)
-                gfx->drawPixel(CX + (int)((238 - tt) * cs), CY + (int)((238 - tt) * sn), C_BG);
+        // Wait for VSYNC to eliminate flickering on direct direct-to-FB draws
+        if (vsync_sem) xSemaphoreTake(vsync_sem, pdMS_TO_TICKS(50));
+
+        int ring_r = 239, thickness = 10;
+        // 1. Erase (Full 360 with 1-degree steps for absolute precision)
+        for (int deg = 0; deg < 360; deg++) {
+            float rad = (deg - 90) * M_PI / 180.0f;
+            float cs = cosf(rad), sn = sinf(rad);
+            for (int tt = -1; tt < thickness + 1; tt++) // -1 to +1 safety margin
+                gfx->drawPixel(CX + (int)((ring_r - tt) * cs), CY + (int)((ring_r - tt) * sn), C_BG);
         }
-    }
-    last_pct = pct;
-
-    // Green → yellow → red colour
-    uint16_t col;
-    int ipct = (int)pct;
-    if (ipct >= 50) {
-        float t  = (ipct - 50) / 50.0f;
-        uint8_t r = (uint8_t)(31 * (1.0f - t));
-        col = (r << 11) | (63 << 5);
+        // 2. Draw
+        for (int deg = 0; deg <= limit_deg; deg++) {
+            float rad = (deg - 90) * M_PI / 180.0f;
+            float cs = cosf(rad), sn = sinf(rad);
+            for (int tt = 0; tt < thickness; tt++)
+                gfx->drawPixel(CX + (int)((ring_r - tt) * cs), CY + (int)((ring_r - tt) * sn), col);
+        }
     } else {
-        float t  = ipct / 50.0f;
-        uint8_t g = (uint8_t)(63 * t);
-        col = (31 << 11) | (g << 5);
-    }
-
-    // Draw full ring: coloured arc then background for the remainder
-    for (float a = start_rad; a <= start_rad + FULL; a += STEP) {
-        uint16_t px_col = (a <= end_rad) ? col : C_BG;
-        float cs = cosf(a), sn = sinf(a);
-        for (int tt = 0; tt < 10; tt++)
-            gfx->drawPixel(CX + (int)((238 - tt) * cs), CY + (int)((238 - tt) * sn), px_col);
+        draw_pct = 100.0f;
     }
 }
 
 void full_redraw() {
+    if (current_app != APP_RADAR) return; // Hard-gate: Never draw radar elements on other screens
     // Invalidate all paint state so aircraft repaint on next sweep pass
     if (xSemaphoreTake(ac_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         for (int i = 0; i < aircraft_count; i++) aircraft[i].paint_valid = false;
@@ -796,14 +848,38 @@ void full_redraw() {
         Serial.println("Warning: ac_mutex held during full_redraw!");
     }
     draw_static_bg();
-    draw_radar_timer_ring();   // drawn after bg, outside sweep radius — will persist
-    draw_sweep(sweep_angle);
     draw_range_label();
     if (detail_visible) draw_detail_box();
     prev_sweep = sweep_angle;
 }
 
+void apply_timezone(const char* tz_name, float manual_offset) {
+    String tz_posix = "";
+    
+    // Mapping Olson names to POSIX TZ strings for automatic DST
+    if (strcmp(tz_name, "America/Chicago") == 0)      tz_posix = "CST6CDT,M3.2.0,M11.1.0";
+    else if (strcmp(tz_name, "America/New_York") == 0) tz_posix = "EST5EDT,M3.2.0,M11.1.0";
+    else if (strcmp(tz_name, "America/Denver") == 0)   tz_posix = "MST7MDT,M3.2.0,M11.1.0";
+    else if (strcmp(tz_name, "America/Los_Angeles") == 0) tz_posix = "PST8PDT,M3.2.0,M11.1.0";
+    else if (strcmp(tz_name, "Europe/London") == 0)    tz_posix = "GMT0BST,M3.5.0/1,M10.5.0";
+    else if (strcmp(tz_name, "Europe/Paris") == 0)     tz_posix = "CET-1CEST,M3.5.0,M10.5.0/3";
+    else if (strcmp(tz_name, "America/Anchorage") == 0) tz_posix = "AKST9AKDT,M3.2.0,M11.1.0";
+    else if (strcmp(tz_name, "Pacific/Honolulu") == 0)  tz_posix = "HST10";
+    
+    if (tz_posix != "") {
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        setenv("TZ", tz_posix.c_str(), 1);
+        tzset();
+        Serial.printf("Timezone: %s -> POSIX: %s\n", tz_name, tz_posix.c_str());
+    } else {
+        // Fallback to manual offset if no mapping exists
+        configTime(manual_offset * 3600, 0, "pool.ntp.org", "time.nist.gov");
+        Serial.printf("Timezone Fallback: Static GMT Offset %.1f\n", manual_offset);
+    }
+}
+
 // ─── Arduino entry points ─────────────────────────────────────────────────────
+
 
 void setup() {
     Serial.begin(115200);
@@ -858,9 +934,9 @@ void setup() {
     // Splash screen while WiFi connects
     gfx->fillScreen(C_BG);
     gfx->setTextColor(C_SWEEP, C_BG);
+    gfx->setTextSize(3);
+    gfx->setCursor(45, 155); gfx->print("OmniHub booting...");
     gfx->setTextSize(2);
-    gfx->setCursor(45, 155); gfx->print("ADS-B Radar");
-    gfx->setTextSize(1);
     
     // Handshake: Check for touch to force provisioning mode
     gfx->setTextColor(0x0350, C_BG); // Dim green
@@ -900,18 +976,29 @@ void setup() {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+        // Remote-safety: never strand a configured device in AP mode — a transient
+        // router outage at boot would otherwise require physical access to recover.
+        // Keep retrying, rebooting every 2 minutes for a clean radio state. The
+        // touch-at-boot window remains the (physical) path to re-provisioning.
         gfx->fillRect(60, 180, 400, 20, C_BG);
-        gfx->setCursor(60, 180); gfx->print("WiFi failed! AP Mode...");
-        ProvisioningManager::startPortal(settings);
+        gfx->setCursor(60, 180); gfx->print("WiFi down - retrying...");
+        unsigned long retry_start = millis();
+        while (WiFi.status() != WL_CONNECTED) {
+            if (millis() - retry_start > 120000) {
+                Serial.println("WiFi retry window expired - rebooting");
+                ESP.restart();
+            }
+            delay(500);
+        }
     }
 
-    Serial0.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
     ArduinoOTA.setHostname("esp32-radar");
     ArduinoOTA.begin();
 
     // Initialize NTP
-    Serial.printf("Syncing NTP (GMT Offset: %.1f)...\n", settings.gmt_offset);
-    configTime(settings.gmt_offset * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    apply_timezone(settings.timezone, settings.gmt_offset);
+
 
     ac_mutex = xSemaphoreCreateMutex();
 
@@ -968,7 +1055,9 @@ void setup() {
     disp_drv.ver_res = SCREEN_HEIGHT;
     disp_drv.flush_cb = my_disp_flush;
     disp_drv.draw_buf = &draw_buf;
-    disp_drv.full_refresh = 1;      // Re-enabled: Fix tearing issue with ESP32 DMA
+    // Full refresh fixes tearing with ESP32 DMA, but LVGL requires full-screen
+    // buffers for it — in the 40-row SRAM fallback (buf2 == NULL) it must be off.
+    disp_drv.full_refresh = (buf2 != NULL) ? 1 : 0;
     disp_drv.antialiasing = 1;
     lv_disp_drv_register(&disp_drv);
 
@@ -982,6 +1071,27 @@ void setup() {
     GlobeView::init();
 
     notify_pi_app_mode(current_app);
+}
+
+void update_radar_sweep() {
+    if (current_app != APP_RADAR) return; // Hard-gate: Never sweep on other screens
+    uint32_t now = millis();
+    static unsigned long last_sweep_ms = 0;
+    if (now - last_sweep_ms >= SWEEP_INTERVAL_MS) {
+        float new_angle = fmodf(sweep_angle + SWEEP_STEP_DEG, 360.0f);
+        if (prev_sweep >= 0) erase_sweep(prev_sweep);
+        sweep_paint_aircraft(sweep_angle, new_angle);
+        draw_sweep(new_angle);
+        if (detail_visible && detail_clobbered) draw_detail_box();
+        prev_sweep  = sweep_angle;
+        sweep_angle = new_angle;
+        last_sweep_ms = now;
+    }
+    static unsigned long last_fetch_ms = 0;
+    if (now - last_fetch_ms >= FETCH_INTERVAL_MS && !fetch_busy) {
+        fetch_requested = true;
+        last_fetch_ms = now;
+    }
 }
 
 void loop() {
@@ -1017,7 +1127,7 @@ void loop() {
                                (float)(touch_y - CY) * (touch_y - CY));
             arc_dragging = (dist >= 160.0f && dist <= 240.0f);
             if (arc_dragging) {
-                gesture_consumed = true;
+                // gesture_consumed = true; // Allow swipes to be processed even if they start in arc zone
             } else {
                 // Not dragging the arc? Check for Diagnostic Button (Instant Switch)
                 // Expanded hit box: Y > 240 (bottom half) and not near edge
@@ -1070,11 +1180,13 @@ void loop() {
         GlobeView::add_tilt(delta_tilt);
     }
 
-    // ── Long-press detection (800ms still hold — only outside arc zone) ───────
-    if (touch_active && !long_press_fired && !arc_dragging && !touch_has_moved) {
+    // ── Long-press detection (800ms still hold) ───────
+    bool allow_long = !touch_has_moved || (current_app == APP_SETTINGS && (abs(touch_x - touch_start_x) + abs(touch_y - touch_start_y)) < 60);
+    if (touch_active && !long_press_fired && allow_long) {
         int hold_dx = abs(touch_x - touch_start_x);
         int hold_dy = abs(touch_y - touch_start_y);
-        if ((hold_dx + hold_dy) < TAP_THRESHOLD && (now - last_touch_time) >= LONG_PRESS_MS) {
+        int limit = (current_app == APP_SETTINGS) ? 60 : TAP_THRESHOLD;
+        if ((hold_dx + hold_dy) < limit && (now - last_touch_time) >= LONG_PRESS_MS) {
             long_press_fired = true;
             gesture_consumed = true;
             if (current_app != APP_SETTINGS) enter_settings();
@@ -1101,16 +1213,13 @@ void loop() {
     last_was_touching = touch_active;
     if (touch_active) prev_touch_y = touch_y;
 
-    // ─── Serial0 Heartbeat (troubleshooting only) ─────────────────────────────
-    static unsigned long last_hb_ms = 0;
-    if (now - last_hb_ms >= 5000) {
-        Serial0.println("HB:OK");
-        Serial.println("[UART→Pi] HB:OK");
-        last_hb_ms = now;
-    }
-
+    // ─── Serial0 Heartbeat 
     if (now - last_pi_msg_ms > 15000) {
-        pi_connected = false;
+        if (pi_connected) {
+            pi_connected = false;
+            if (current_app == APP_ASSISTANT) AssistantView::set_state(AssistantView::STATE_IDLE);
+            Serial.println("Pi Connection Lost (Timeout)");
+        }
     }
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1124,37 +1233,17 @@ void loop() {
         Serial.println(msg);
         AssistantView::clear_timer();
         if (current_app == APP_CLOCK) ClockView::set_timer_pct(-1);
-        if (current_app == APP_RADAR) full_redraw();  // redraw to erase ring
+        if (current_app == APP_RADAR) full_redraw();
     }
 
     if (current_app == APP_RADAR) {
-        // Don't run lv_timer_handler in radar mode -- it would flush LVGL's white screen over us
-
-        // Sweep — smooth single-arm rotation
-        static unsigned long last_sweep_ms = 0;
-        if (now - last_sweep_ms >= SWEEP_INTERVAL_MS) {
-            float new_angle = fmodf(sweep_angle + SWEEP_STEP_DEG, 360.0f);
-            if (prev_sweep >= 0) erase_sweep(prev_sweep);
-            sweep_paint_aircraft(sweep_angle, new_angle);
-            draw_sweep(new_angle);
-            draw_radar_timer_ring();  // redraws ring if active (persists outside sweep radius)
-            if (detail_visible && detail_clobbered) draw_detail_box();
-            prev_sweep  = sweep_angle;
-            sweep_angle = new_angle;
-            last_sweep_ms = now;
-        }
-
-        // Trigger background fetch every FETCH_INTERVAL_MS
-        static unsigned long last_fetch_ms = 0;
-        if (now - last_fetch_ms >= FETCH_INTERVAL_MS && !fetch_busy) {
-            fetch_requested = true;
-            last_fetch_ms = now;
+        if (!touch_active) {
+            update_radar_sweep();
         }
     } else if (current_app == APP_ASSISTANT) {
         AssistantView::update();
     } else if (current_app == APP_CLOCK) {
         if (!touch_active) {
-            // Update timer arc at ~10 Hz — fast enough to look smooth, won't flood LVGL
             static unsigned long last_timer_arc_ms = 0;
             if (now - last_timer_arc_ms >= 100) {
                 if (AssistantView::is_timer_active()) {
@@ -1163,16 +1252,14 @@ void loop() {
                 last_timer_arc_ms = now;
             }
             ClockView::update_time();
-            // VSYNC waiting is now handled inside my_disp_flush to ensure it happens
-            // immediately before the DMA transfer, not before the rendering.
             lv_timer_handler();
         }
     } else if (current_app == APP_GLOBE) {
-        if (!touch_active) GlobeView::update();
+        GlobeView::update();
     } else if (current_app == APP_SETTINGS || current_app == APP_DIAGNOSTICS) {
         if (!touch_active) {
             static uint32_t last_diag_req = 0;
-            if (now - last_diag_req > 200) { // 5Hz requests
+            if (now - last_diag_req > 1000) { // 1Hz requests
                 Serial0.println("DIAG?");
                 last_diag_req = now;
             }
@@ -1189,12 +1276,7 @@ void loop() {
     auto handle_cmd = [&](String rx) {
         rx.trim();
         if (rx.length() == 0) return;
-        if (!pi_connected) {
-            pi_connected = true;
-            if (strlen(settings.wifi_ssid) > 0) {
-                Serial0.printf("WIFI:%s|%s\n", settings.wifi_ssid, settings.wifi_password);
-            }
-        }
+        pi_connected = true;
         last_pi_msg_ms = millis();
         if (rx == "HB:ACK") {
             return;
@@ -1203,10 +1285,14 @@ void loop() {
             // Bypassing AssistantView::set_state to prevent task deadlock during animation
             set_display_power(mode == 0); // 1 = Sleep (Off), 0 = Wake (On)
         } else if (rx == "SYNC?") {
-
-
             notify_pi_settings();
             notify_pi_app_mode(current_app);
+        } else if (rx == "WIFI?") {
+            // Credentials are only sent when the Pi explicitly asks (boot-time sync),
+            // not broadcast on every reconnect.
+            if (strlen(settings.wifi_ssid) > 0) {
+                Serial0.printf("WIFI:%s|%s\n", settings.wifi_ssid, settings.wifi_password);
+            }
         } else if (rx == "DIAG") {
             current_app = APP_DIAGNOSTICS;
             DiagnosticsView::init();
@@ -1219,6 +1305,28 @@ void loop() {
             range_nm = min((float)MAX_RANGE_NM, range_nm * 1.15f);
             Serial.printf("Remote Zoom OUT: %.1f nm\n", range_nm);
             full_redraw();
+        } else if (rx == "T+") {
+            if (current_app == APP_GLOBE) {
+                GlobeView::add_tilt(0.05f);
+            }
+        } else if (rx == "T-") {
+            if (current_app == APP_GLOBE) {
+                GlobeView::add_tilt(-0.05f);
+            }
+        } else if (rx == "V+") {
+            if (current_app == APP_SETTINGS) {
+                SettingsView::adjust_volume(5);
+                SettingsView::update();
+                settings.volume = SettingsView::get_volume();
+                Serial0.println(String("VOL:") + String(settings.volume));
+            }
+        } else if (rx == "V-") {
+            if (current_app == APP_SETTINGS) {
+                SettingsView::adjust_volume(-5);
+                SettingsView::update();
+                settings.volume = SettingsView::get_volume();
+                Serial0.println(String("VOL:") + String(settings.volume));
+            }
         } else if (rx.startsWith("Z:")) {
             float val = rx.substring(2).toFloat();
             if (val >= MIN_RANGE_NM && val <= MAX_RANGE_NM) {
@@ -1238,10 +1346,16 @@ void loop() {
                 secs = (uint32_t)rest.toInt();
                 lbl  = "";
             }
-            AssistantView::start_timer(secs, lbl);
+            if (!AssistantView::is_timer_active() || AssistantView::timer_label() != lbl) {
+                AssistantView::start_timer(secs, lbl);
+            }
         } else if (rx == "STYLE:TOGGLE") {
             AssistantView::toggle_style();
             Serial.println("Remote Style Toggle");
+        } else if (rx == "EXIT_SETTINGS") {
+            if (current_app == APP_SETTINGS) {
+                exit_settings();
+            }
         } else if (rx == "REBOOT" || rx == "!") {
             Serial.println("Rebooting via UART command...");
             delay(500);
@@ -1286,6 +1400,8 @@ void loop() {
         } else if (rx.startsWith("A")) {
             int intensity = rx.substring(1).toInt();
             AssistantView::set_audio_intensity(intensity);
+        } else if (rx == "GLOBE:TOGGLE") {
+            GlobeView::toggle_rotation();
         } else if (rx.startsWith("S")) {
             int pipe_idx = rx.indexOf('|');
             String s_data;
@@ -1314,6 +1430,26 @@ void loop() {
                 AssistantView::set_audio_intensity(intensity);
                 DiagnosticsView::set_mic_intensity(intensity);
             }
+        } else if (rx.startsWith("GLOBE:POIS:")) {
+            String payload = rx.substring(11);
+            GlobeView::clear_pois();
+            int start = 0;
+            while (start < payload.length()) {
+                int pipe = payload.indexOf('|', start);
+                String item = (pipe == -1) ? payload.substring(start) : payload.substring(start, pipe);
+                
+                int c1 = item.indexOf(',');
+                int c2 = item.indexOf(',', c1 + 1);
+                if (c1 != -1 && c2 != -1) {
+                    float lat = item.substring(0, c1).toFloat();
+                    float lon = item.substring(c1 + 1, c2).toFloat();
+                    uint16_t color = (uint16_t)item.substring(c2 + 1).toInt();
+                    GlobeView::add_poi(lat, lon, color);
+                }
+                
+                if (pipe == -1) break;
+                start = pipe + 1;
+            }
         } else if (rx.startsWith("DIAG:")) {
             String data = rx.substring(5);
             int start = 0;
@@ -1336,6 +1472,15 @@ void loop() {
                 if (comma == -1) break;
                 start = comma + 1;
             }
+        } else if (rx.startsWith("TACHYON_IP:")) {
+            String new_ip = rx.substring(11);
+            new_ip.trim();
+            if (new_ip.length() > 0 && new_ip != settings.adsb_host) {
+                strncpy(settings.adsb_host, new_ip.c_str(), sizeof(settings.adsb_host) - 1);
+                settings.adsb_host[sizeof(settings.adsb_host) - 1] = '\0';
+                SettingsManager::save(settings);
+                Serial.printf("[Settings] Dynamic ADSB Host updated from Tachyon Serial: %s\n", settings.adsb_host);
+            }
         }
     };
 
@@ -1343,13 +1488,15 @@ void loop() {
         char c = Serial.read();
         if (c == '\n') { handle_cmd(rx_buf_usb); rx_buf_usb = ""; }
         else if (c != '\r') rx_buf_usb += c;
+        if (rx_buf_usb.length() > 512) rx_buf_usb = "";   // discard runaway line
     }
+    // Non-blocking accumulator — readStringUntil() would stall the render loop
+    // for up to 1s whenever a line arrives torn (no newline yet in the buffer).
     while (Serial0.available()) {
         char c = Serial0.read();
-        if (c == '\n' || c == '!') { // Support '!' as a hard-terminator for emergency reboots
-            handle_cmd(rx_buf_uart); rx_buf_uart = ""; 
-        }
+        if (c == '\n') { handle_cmd(rx_buf_uart); rx_buf_uart = ""; }
         else if (c != '\r') rx_buf_uart += c;
+        if (rx_buf_uart.length() > 512) rx_buf_uart = "";  // discard runaway line
     }
 
     

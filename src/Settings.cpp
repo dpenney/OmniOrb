@@ -5,6 +5,7 @@
 ProjectSettings::ProjectSettings() {
     strlcpy(wifi_ssid, WIFI_SSID, sizeof(wifi_ssid));
     strlcpy(wifi_password, WIFI_PASSWORD, sizeof(wifi_password));
+    strlcpy(adsb_host, ADSB_HOST, sizeof(adsb_host));
     home_lat = HOME_LAT;
     home_lon = HOME_LON;
     range_nm = DEFAULT_RANGE_NM;
@@ -49,6 +50,13 @@ bool SettingsManager::load(ProjectSettings &s) {
     strlcpy(s.timezone, doc["timezone"] | DEFAULT_TIMEZONE, sizeof(s.timezone));
     s.volume = doc["volume"] | 75;
 
+    // Migrate or load adsb_host
+    strlcpy(s.adsb_host, doc["adsb_host"] | "", sizeof(s.adsb_host));
+    if (strlen(s.adsb_host) == 0) {
+        strlcpy(s.adsb_host, ADSB_HOST, sizeof(s.adsb_host));
+        SettingsManager::save(s);
+    }
+
     // Migration: if GMT offset is 0 but we're in the Pacific US, it was never set.
     // Auto-correct to the compiled default and re-save so the fix persists.
     if (s.gmt_offset == 0.0f && s.home_lon < -100.0f) {
@@ -69,6 +77,7 @@ bool SettingsManager::save(const ProjectSettings &s) {
     JsonDocument doc;
     doc["wifi_ssid"] = s.wifi_ssid;
     doc["wifi_password"] = s.wifi_password;
+    doc["adsb_host"] = s.adsb_host;
     doc["home_lat"] = s.home_lat;
     doc["home_lon"] = s.home_lon;
     doc["range_nm"] = s.range_nm;

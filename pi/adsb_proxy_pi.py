@@ -34,11 +34,11 @@ except ImportError:
 app = Flask(__name__)
 
 # ── Settings ──────────────────────────────────────────────────────────────────
-STATUS_URL    = "http://localhost:5000/status"
+STATUS_URL    = "http://localhost:5005/status"
 POLL_INTERVAL = 10.0
 PORT          = 5050
 
-# Default bounding box — New York City (matches ESP32 HOME_LAT/HOME_LON)
+# Default bounding box — New York City (matches example HOME_LAT/HOME_LON)
 # This is only used until the ESP32 sends its actual coordinates via ?lat=&lon=
 DEFAULT_BOX   = "40.3,41.1,-74.4,-73.6"
 

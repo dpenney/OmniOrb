@@ -6,7 +6,6 @@
 
 static WebServer server(80);
 static DNSServer dnsServer;
-static bool portalDone = false;
 static ProjectSettings* currentSettings = nullptr;
 
 const char PORTAL_HTML[] = R"rawliteral(
@@ -60,6 +59,7 @@ function setTZ(sel) {
 <form action="/save" method="POST">
 <input type="text" name="ssid" placeholder="WIFI SSID" required>
 <input type="password" name="pass" placeholder="WIFI PASSWORD">
+<input type="text" name="adsb_host" placeholder="ADSB RECEIVER IP (e.g. 192.168.4.205)" required>
 <label style="display:block; text-align:left; font-size:12px; margin-top:10px;">HOME POSITION:</label>
 <select onchange="setLocation(this)">
     <option value="manual" selected>-- SELECT PRESET --</option>
@@ -115,6 +115,7 @@ void handleSave() {
     if (currentSettings) {
         strlcpy(currentSettings->wifi_ssid, server.arg("ssid").c_str(), sizeof(currentSettings->wifi_ssid));
         strlcpy(currentSettings->wifi_password, server.arg("pass").c_str(), sizeof(currentSettings->wifi_password));
+        strlcpy(currentSettings->adsb_host, server.arg("adsb_host").c_str(), sizeof(currentSettings->adsb_host));
         currentSettings->home_lat = server.arg("lat").toFloat();
         currentSettings->home_lon = server.arg("lon").toFloat();
         currentSettings->gmt_offset = server.arg("gmt").toFloat();
@@ -185,7 +186,8 @@ void ProvisioningManager::startPortal(ProjectSettings &s) {
     Serial.println("Provisioning AP started: RADAR-SETUP");
     drawPortalStatus();
     
-    while(!portalDone) {
+    // The portal only exits via ESP.restart() in handleSave()
+    for (;;) {
         dnsServer.processNextRequest();
         server.handleClient();
         delay(10);

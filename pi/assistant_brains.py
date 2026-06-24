@@ -6,8 +6,10 @@ import subprocess
 import threading
 import time
 import sys
+import select
 import wave
 from collections import deque
+from datetime import datetime
 
 import numpy as np
 import requests
@@ -17,12 +19,17 @@ from logging.handlers import RotatingFileHandler
 
 try:
     import RPi.GPIO as GPIO
-except (ImportError, RuntimeError):
+    if not hasattr(GPIO, 'setmode'):
+        # Pi 5 ships a stub RPi.GPIO that imports but has no functional attributes.
+        # Install rpi-lgpio (see install.sh) for a working drop-in replacement.
+        raise AttributeError("RPi.GPIO has no setmode")
+except (ImportError, RuntimeError, AttributeError):
     GPIO = None
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, render_template
 from rotary_encoder import RotaryEncoder
 from dotenv import load_dotenv
 import config
+import globe_manager
 
 # Load secret environment variables from .env
 load_dotenv()
@@ -53,6 +60,12 @@ except ImportError:
     VAD_AVAILABLE = False
 
 try:
+    import scipy.signal as _scipy_signal
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
+try:
     from google import genai
     from google.genai import types
     client = genai.Client()
@@ -73,8 +86,26 @@ except ImportError:
 from memory_manager import MemoryManager
 
 app = Flask(__name__)
+# Re-read templates from disk on change so a template-only deploy (scp of
+# globe_ui.html) takes effect without restarting the service. Default Jinja
+# behaviour with debug=False caches the compiled template for the process
+# lifetime, which silently serves stale UI after a sync.
+app.config['TEMPLATES_AUTO_RELOAD'] = True
+app.jinja_env.auto_reload = True
 
 # ─── Device Settings (location + timezone, pushed by ESP32 on boot) ───────────
+def get_local_ip():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('8.8.8.8', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
+
 _SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_settings.json")
 _device_settings = {
     "lat": config.HOME_LAT,
@@ -105,7 +136,9 @@ def calculate_spectrum_bins(norm_samples, idx_bounds, gain=1.0):
     return bins
 
 # ─── Volume ───────────────────────────────────────────────────────────────────
-_volume      = 75          # 0-100; set by VOL: messages from ESP32
+# Default respects VOLUME_MAX so the amp-protection cap holds even before the
+# ESP32 sends its first VOL: message.
+_volume      = min(75, getattr(config, 'VOLUME_MAX', 100))
 _volume_lock = threading.Lock()
 
 
@@ -212,7 +245,16 @@ def _init_mem0():
                     "collection_name": "omniorb_memory",
                     "path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_store"),
                 }
-            }
+            },
+            "custom_fact_extraction_prompt": (
+                "You are extracting ONLY persistent personal facts about the user that are worth "
+                "remembering across future conversations. Store facts like: name, family members, "
+                "location, job, hobbies, preferences, recurring interests, personal background. "
+                "Do NOT store: one-time actions (setting timers, sending emails, web searches), "
+                "session-specific requests, questions about current events, or anything that would "
+                "not be useful context in a completely separate future conversation. "
+                "If there are no persistent personal facts in the input, return an empty list."
+            ),
         }
         if "GOOGLE_API_KEY" not in os.environ:
             os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY", "")
@@ -223,42 +265,6 @@ def _init_mem0():
         _memory = None
 
 threading.Thread(target=_init_mem0, daemon=True).start()
-
-def _seed_private_memories():
-    """Load facts from private_memories.json and push them into Mem0 if not already present."""
-    if not _memory:
-        return
-    
-    private_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "private_memories.json")
-    if not os.path.exists(private_file):
-        logger.info("No private_memories.json found. Skipping memory seeding.")
-        return
-
-    try:
-        import json as _json
-        with open(private_file) as f:
-            memories = _json.load(f)
-        
-        # Search for any items to prevent duplicates
-        existing_raw = _memory.get_all(user_id="primary_user")
-        # Handle dict wrapper from some versions of mem0
-        existing = existing_raw.get("results", []) if isinstance(existing_raw, dict) else existing_raw
-        
-        # Handle cases where memory items might be objects or dicts
-        def get_text(m):
-            if isinstance(m, dict): return m.get("text", m.get("memory", ""))
-            return getattr(m, "text", getattr(m, "memory", ""))
-        
-        for mem in memories:
-            fact = mem.get("content", "")
-            if fact and not any(get_text(m) == fact for m in existing):
-                _memory.add(fact, user_id="primary_user")
-                logger.info(f"Seeded private memory: {fact[:50]}...")
-    except Exception as e:
-        logger.error(f"Error seeding private memories: {e}")
-
-# Deprecated: Seeding slowed down boot; now handled by context caching in MemoryManager
-# _seed_private_memories()
 
 # ─── Memory Manager & Context ────────────────────────────────────────────────
 def init_memory_manager():
@@ -342,14 +348,18 @@ def send_uart_command(cmd):
     try:
         with ser_lock:
             if ser and ser.is_open:
-                # Sleep Muzzle: Don't send anything to the ESP32 while sleeping EXCEPT the sleep/wake commands.
+                # Sleep Muzzle: Don't send anything to the ESP32 while sleeping EXCEPT
+                # sleep/wake commands and heartbeats (dropping HB: would make the ESP32
+                # declare the Pi lost after its 15s timeout).
                 with state_lock:
                     sleeping = assistant_state.get("is_sleeping", False)
-                if sleeping and not (cmd.startswith("SLEEP:") or cmd.startswith("WAKE|") or cmd.startswith("EMO:")):
+                if sleeping and not (cmd.startswith("SLEEP:") or cmd.startswith("WAKE|") or cmd.startswith("EMO:") or cmd.startswith("HB:")):
                     # Silencing the firehose: Don't log dropped spectrum/mouth data
                     return
 
                 ser.write(f"{cmd}\n".encode())
+                global _last_uart_send_at
+                _last_uart_send_at = time.time()
                 if not (cmd.startswith("S") and "," in cmd) and not (cmd.startswith("A") and cmd[1:2].isdigit()) and not cmd.startswith("DIAG:"):
                     logger.info(f"Sent UART: {cmd}")
     except Exception as e:
@@ -395,18 +405,13 @@ def serial_reader():
                     elif line == "DIAG?":
                         # Send diagnostic payload
                         with state_lock:
-                            mic_val = assistant_state.get("audio_intensity", 0)
-                            is_proc = assistant_state.get("processing", False)
-                        
-                        # Get last wake time string
-                        from datetime import datetime
-                        with state_lock:
+                            mic_val   = assistant_state.get("audio_intensity", 0)
+                            is_proc   = assistant_state.get("processing", False)
                             last_w_at = assistant_state.get("last_wakeword_at", 0)
+                            is_ready  = assistant_state.get("oww_ready", False)
+                            last_diag = assistant_state.get("last_diag_at", 0)
+
                         last_w = datetime.fromtimestamp(last_w_at).strftime('%I:%M:%S %p') if last_w_at > 0 else "NEVER"
-                        
-                        # Check OWW status
-                        with state_lock:
-                            is_ready = assistant_state.get("oww_ready", False)
                         ww_stat = "READY" if is_ready else "NOT LOADED"
                         if is_proc: ww_stat = "PROC"
                         
@@ -423,16 +428,18 @@ def serial_reader():
                         
                         # Throttle diag updates to 1Hz
                         now = time.time()
-                        if now - assistant_state.get("last_diag_at", 0) >= 1.0:
+                        if now - last_diag >= 1.0:
                             diag_msg = f"DIAG:mic={mic_val},ww={ww_stat},pi=OK,rssi={rssi},wake={last_w}"
                             send_uart_command(diag_msg)
-                            assistant_state["last_diag_at"] = now
+                            with state_lock:
+                                assistant_state["last_diag_at"] = now
                     elif line.startswith("VOL:"):
                         try:
                             global _volume
                             val = int(line[4:])
+                            vol_max = getattr(config, 'VOLUME_MAX', 100)
                             with _volume_lock:
-                                _volume = max(0, min(100, val))
+                                _volume = max(0, min(vol_max, val))
                             logger.info(f"[ESP32] Volume → {_volume}")
                         except ValueError:
                             logger.warning(f"Bad VOL message: {line}")
@@ -445,21 +452,44 @@ def serial_reader():
                         if '|' in payload:
                             ssid, pwd = payload.split('|', 1)
                             threading.Thread(target=_apply_wifi, args=(ssid, pwd), daemon=True).start()
-                    elif "APP:" in line:
-                        app_mode = line.split("APP:", 1)[1].split()[0]
-                        with state_lock:
-                            assistant_state["current_app"] = app_mode
-                            assistant_state["mic_active"] = (app_mode == "ASSISTANT" or app_mode == "SPEAKING")
-                            assistant_state["radar_active"] = (app_mode == "RADAR")
-                        logger.info(f"[ESP32] {line} → app={app_mode}, mic_active={assistant_state['mic_active']}")
-                    elif line == "HB:OK":
-                        send_uart_command("HB:ACK")
-                    
-                    # Log ALL traffic to the raw UART log
-                    uart_logger.debug(line)
+                    elif line.startswith("APP:"):
+                        # Prefix match only — substring matching ("APP:" in line) would
+                        # misfire on firmware debug lines that mention APP: mid-string.
+                        parts = line[4:].split()
+                        if parts:
+                            app_mode = parts[0]
+                            with state_lock:
+                                assistant_state["current_app"] = app_mode
+                                assistant_state["mic_active"] = (app_mode == "ASSISTANT" or app_mode == "SPEAKING" or app_mode == "CONTINUITY")
+                                assistant_state["radar_active"] = (app_mode == "RADAR")
+                            logger.info(f"[ESP32] {line} → app={app_mode}, mic_active={assistant_state['mic_active']}")
+                            if app_mode == "GLOBE":
+                                # Push latest POIs whenever the user flips to globe view
+                                threading.Thread(target=lambda: send_uart_command(f"GLOBE:POIS:{globe_manager.get_pois_serial()}")).start()
+                    elif line.startswith("WIFI_STATUS:"):
+                        try:
+                            # Format: WIFI_STATUS:3,RSSI:-55,IP:192.168.4.42
+                            parts = line.split(",")
+                            status_val = int(parts[0].split(":")[1])
+                            ip_val = ""
+                            for part in parts:
+                                if part.startswith("IP:"):
+                                    ip_val = part.split(":")[1]
+                            if status_val == 3 and ip_val and ip_val != "0.0.0.0":
+                                tachyon_ip = get_local_ip()
+                                send_uart_command(f"TACHYON_IP:{tachyon_ip}")
+                        except Exception as ex:
+                            logger.warning(f"Bad WIFI_STATUS parsing: {line} - {ex}")
+                    elif line == "HB:ACK":
+                        # ESP32 acknowledged our heartbeat
+                        pass
 
-                    if line not in ("HB:OK",) and not line.startswith("DIAG:"):
-                        logger.info(f"[ESP32] {line}")
+                    # Log ALL traffic to the raw UART log (WiFi credentials redacted)
+                    log_line = "WIFI:<redacted>" if line.startswith("WIFI:") else line
+                    uart_logger.debug(log_line)
+
+                    if line != "DIAG?" and not line.startswith("DIAG:"):
+                        logger.info(f"[ESP32] {log_line}")
         except Exception as e:
             logger.error(f"Serial read error: {e}")
             reconnect_serial()
@@ -475,6 +505,7 @@ _aplay_stdin  = None          # stdin of the persistent aplay process
 _audio_lock   = threading.Lock()
 _tts_active   = threading.Event()
 _tts_abort    = threading.Event()   # set to kill TTS mid-playback (barge-in)
+_tts_finished_at = 0.0             # monotonic timestamp of last TTS completion
 _active_piper_proc  = None
 _active_piper_lock  = threading.Lock()
 
@@ -491,27 +522,38 @@ except ImportError:
     _SpeexEC = None
     _SPEEX_AVAILABLE = False
 
-def _start_persistent_output():
-    """Start persistent aplay + silence feeder. Call once after I2S stream opens."""
-    global _aplay_stdin
-    aplay = subprocess.Popen(
+_aplay_proc = None            # persistent aplay process — respawned by the feeder if it dies
+
+def _spawn_aplay():
+    """(Re)start the persistent aplay process and capture its stdin."""
+    global _aplay_proc, _aplay_stdin
+    if _aplay_proc and _aplay_proc.poll() is None:
+        try:
+            _aplay_proc.kill()
+        except Exception:
+            pass
+    _aplay_proc = subprocess.Popen(
         ['aplay', '-D', config.APLAY_DEVICE,
          '-t', 'raw', '-f', 'S16_LE',
          '-r', str(config.PIPER_SAMPLE_RATE), '-c', '1', '-q',
-         '--buffer-time=100000'],  # 100ms — tight sync between digital mouth and audio
+         '--buffer-time=200000'],  # 200ms — headroom for GIL/scheduling jitter
         stdin=subprocess.PIPE,
         stderr=subprocess.DEVNULL
     )
-    _aplay_stdin = aplay.stdin
+    _aplay_stdin = _aplay_proc.stdin
 
-    # Cap the stdin pipe at the Linux minimum (4096 bytes = 128ms at 16kHz 16-bit).
-    # Without this, even a slightly-fast feeder re-fills the default 64KB pipe
-    # within seconds, giving ~1s of write-ahead latency before TTS audio is heard.
+    # Cap the stdin pipe to limit write-ahead latency while still providing enough
+    # buffer that scheduling jitter doesn't cause underruns. 16384 bytes = 256ms at
+    # 16kHz 16-bit mono, giving comfortable headroom over the 200ms ring buffer.
     try:
         import fcntl as _fcntl
-        _fcntl.fcntl(_aplay_stdin.fileno(), 1031, 4096)  # F_SETPIPE_SZ
+        _fcntl.fcntl(_aplay_stdin.fileno(), 1031, 16384)  # F_SETPIPE_SZ
     except Exception:
         pass  # non-Linux or permission denied — latency capping unavailable
+
+def _start_persistent_output():
+    """Start persistent aplay + silence feeder. Call once after I2S stream opens."""
+    _spawn_aplay()
 
     # Clock-compensated silence feeder: tracks target write times so OS sleep jitter
     # doesn't accumulate into write-ahead latency. 20ms chunks at exactly 1:1 real-time.
@@ -522,11 +564,26 @@ def _start_persistent_output():
         while True:
             if not _tts_active.is_set():
                 try:
-                    with _audio_lock:
-                        _aplay_stdin.write(silence_chunk)
-                        _aplay_stdin.flush()
-                except Exception:
-                    break
+                    # Writability check outside the lock so we never block the
+                    # audio forwarder threads while waiting for pipe space.
+                    _, writable, _ = select.select([], [_aplay_stdin], [], 0.02)
+                    if writable:
+                        with _audio_lock:
+                            _aplay_stdin.write(silence_chunk)
+                            _aplay_stdin.flush()
+                except Exception as e:
+                    # aplay died or the pipe broke — respawn instead of letting the
+                    # feeder thread die (which would leave all future TTS silent).
+                    logger.error(f"Persistent audio output broke ({e}) — respawning aplay")
+                    try:
+                        with _audio_lock:
+                            _spawn_aplay()
+                        logger.info("aplay respawned")
+                    except Exception as respawn_err:
+                        logger.error(f"aplay respawn failed: {respawn_err}")
+                        time.sleep(1.0)
+                    next_write = time.monotonic()
+                    continue
             next_write += interval
             to_sleep = next_write - time.monotonic()
             if to_sleep > 0:
@@ -679,7 +736,6 @@ def get_weather():
 
 def get_context():
     """One-liner injected into every LLM prompt: date/time + sleep state."""
-    from datetime import datetime
     now = datetime.now()
     with state_lock:
         sleeping = assistant_state.get("is_sleeping", False)
@@ -758,11 +814,10 @@ _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
 _GAP_SILENCE = bytes(int(16000 * 0.010) * 2)   # 10ms of silence at 16kHz — fills aplay during inter-sentence gaps
 
-def _forward_piper_audio(piper):
+def _forward_piper_audio(piper, wait_event=None):
     """Forward piper stdout → aplay. Signals TTS active state.
-    Uses select() so inter-sentence gaps are filled with silence rather than
-    letting the aplay buffer drain (which causes audible clicks)."""
-    import select as _select
+    wait_event: if set, blocks before writing the first audio chunk until the
+    event fires — used by Piper B to avoid overlapping Piper A's playback."""
     from collections import deque as _deque
     try:
         first         = True
@@ -782,7 +837,7 @@ def _forward_piper_audio(piper):
                     send_uart_command(f"S{','.join(map(str, bins))}|A{intensity}")
 
         while True:
-            ready, _, _ = _select.select([piper.stdout], [], [], 0.010)  # 10ms timeout
+            ready, _, _ = select.select([piper.stdout], [], [], 0.010)  # 10ms timeout
 
             _flush_queue()  # drain scheduled dispatches on every tick
 
@@ -792,6 +847,12 @@ def _forward_piper_audio(piper):
                 chunk = piper.stdout.read(4096)
                 if not chunk:
                     break   # piper stdout closed — done
+                # Gate B: wait for A to finish before writing any audio.
+                # Placed after the read (not before) so Piper B's stdout pipe
+                # stays drained during the wait — avoids pipe-buffer stall.
+                if wait_event is not None:
+                    wait_event.wait()
+                    wait_event = None  # only gate the first chunk; clear for subsequent
                 if first:
                     _tts_active.set()
                     first = False
@@ -808,10 +869,16 @@ def _forward_piper_audio(piper):
                 else:
                     chunk_out = chunk
 
-                # Write audio immediately — no sleep, never block the audio path.
-                with _audio_lock:
-                    _aplay_stdin.write(chunk_out)
-                    _aplay_stdin.flush()
+                # Writability check outside the lock — holding the lock during
+                # select() would starve the silence feeder for up to 1s per chunk.
+                if _aplay_stdin:
+                    _, writable, _ = select.select([], [_aplay_stdin], [], 0.3)
+                    if writable:
+                        with _audio_lock:
+                            _aplay_stdin.write(chunk_out)
+                            _aplay_stdin.flush()
+                    else:
+                        logger.error("Audio output blocked (aplay pipe full). Skipping chunk.")
                 # Push reference audio for AEC (use scaled output for correctness)
                 ref_samples = np.frombuffer(chunk_out, dtype=np.int16)
                 with _aec_ref_lock:
@@ -839,11 +906,14 @@ def _forward_piper_audio(piper):
 
             elif not first:
                 # Inter-sentence gap — keep aplay buffer fed to prevent underrun clicks
-                with _audio_lock:
-                    _aplay_stdin.write(_GAP_SILENCE)
-                    _aplay_stdin.flush()
+                if _aplay_stdin:
+                    _, writable, _ = select.select([], [_aplay_stdin], [], 0.1)
+                    if writable:
+                        with _audio_lock:
+                            _aplay_stdin.write(_GAP_SILENCE)
+                            _aplay_stdin.flush()
     except Exception:
-        pass
+        logger.exception("TTS audio forwarder error")
     finally:
         # If APP: SPEAKING was queued but never dispatched (e.g. delay > TTS duration),
         # send it now before clearing so the wake word threshold is always reset cleanly.
@@ -851,6 +921,8 @@ def _forward_piper_audio(piper):
             if item[3]:  # fire_speaking flag
                 send_uart_command("APP: SPEAKING")
                 break
+        global _tts_finished_at
+        _tts_finished_at = time.time()
         _tts_active.clear()
 
 _MD_STRIP = re.compile(r'(\*{1,3}|_{1,3}|`+)')
@@ -888,12 +960,14 @@ def _speak_text_iter(text_iter):
     #   piper_a — plays the first chunk immediately for fast TTS start
     #   piper_b — receives all remaining chunks and runs ONNX inference
     #             concurrently while piper_a's audio is being heard
-    piper_a   = None
-    piper_b   = None
-    fwd_a     = None
-    buf       = ""
-    parts     = []
-    a_fed     = False  # True once piper_a has its text and stdin is closed
+    piper_a      = None
+    piper_b      = None
+    fwd_a        = None
+    fwd_b        = None
+    buf          = ""
+    parts        = []
+    a_fed        = False  # True once piper_a has its text and stdin is closed
+    piper_a_done = threading.Event()  # set after fwd_a finishes; gates fwd_b writes
 
     def _ensure_piper_a():
         nonlocal piper_a, fwd_a
@@ -910,11 +984,13 @@ def _speak_text_iter(text_iter):
         """Write text to piper_b immediately — one line per sentence.
         B starts ONNX inference as each sentence arrives so its audio is
         buffered in the pipe by the time A finishes playing."""
-        nonlocal piper_b
+        nonlocal piper_b, fwd_b
         if not text:
             return
         if piper_b is None:
             piper_b = _get_piper()
+            fwd_b = threading.Thread(target=_forward_piper_audio, args=(piper_b, piper_a_done), daemon=True)
+            fwd_b.start()
         try:
             piper_b.stdin.write(text.encode() + b'\n')
             piper_b.stdin.flush()
@@ -1015,13 +1091,18 @@ def _speak_text_iter(text_iter):
             pass
 
     # ── Drain Piper A ────────────────────────────────────────────────────────
+    if not piper_a:
+        piper_a_done.set()  # A never ran (abort/single-chunk-B path) — ungate fwd_b immediately
     if piper_a:
         try:
             piper_a.stdin.close()  # no-op if already closed above
         except Exception:
             pass
         if fwd_a:
-            fwd_a.join()
+            fwd_a.join(timeout=30)
+            if fwd_a.is_alive():
+                logger.warning("Forwarder A timed out! Audio path may be stuck.")
+        piper_a_done.set()  # ungate fwd_b — A has finished writing to aplay
         try:
             piper_a.wait(timeout=2)
         except Exception:
@@ -1033,14 +1114,16 @@ def _speak_text_iter(text_iter):
             if _active_piper_proc is piper_a:
                 _active_piper_proc = None
 
-    # ── Play Piper B (already computed during A's playback) ──────────────────
+    # ── Play Piper B (already computed or streaming) ──────────────────────────
     if piper_b:
         if not _tts_abort.is_set():
             with _active_piper_lock:
                 _active_piper_proc = piper_b
-            fwd_b = threading.Thread(target=_forward_piper_audio, args=(piper_b,), daemon=True)
-            fwd_b.start()
-            fwd_b.join()
+            # fwd_b was already started in _flush_to_b; now just wait for it to finish.
+            if fwd_b:
+                fwd_b.join(timeout=45)
+                if fwd_b.is_alive():
+                    logger.warning("Forwarder B timed out! Audio path may be stuck.")
             with _active_piper_lock:
                 if _active_piper_proc is piper_b:
                     _active_piper_proc = None
@@ -1118,22 +1201,20 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-def _send_email_async(subject, body):
-    threading.Thread(target=_send_email_task, args=(subject, body), daemon=True).start()
-
 from email.utils import formatdate, make_msgid
 
 def _send_email_task(subject, body):
+    """Send email synchronously. Returns (success: bool, message: str)."""
     sender    = getattr(config, 'EMAIL_SENDER', None)
     user      = getattr(config, 'EMAIL_USERNAME', sender)
     pw        = getattr(config, 'EMAIL_PASSWORD', None)
     recipient = getattr(config, 'EMAIL_RECIPIENT', None)
     server_addr = getattr(config, 'EMAIL_SMTP_SERVER', 'smtp.gmail.com')
     server_port = getattr(config, 'EMAIL_SMTP_PORT', 587)
-    
+
     if not sender or not pw or not recipient:
         logger.error("Email not sent: Configuration missing in config.py")
-        return
+        return False, "Email configuration is missing."
 
     try:
         msg = MIMEMultipart()
@@ -1142,23 +1223,24 @@ def _send_email_task(subject, body):
         msg['Subject'] = subject
         msg['Date'] = formatdate(localtime=True)
         msg['Message-ID'] = make_msgid()
-        
+
         footer = "\n\n--\nSent by your Omnihub Assistant"
         msg.attach(MIMEText(body + footer, 'plain'))
 
-        server = smtplib.SMTP(server_addr, server_port)
+        server = smtplib.SMTP(server_addr, server_port, timeout=10)
         server.starttls()
         server.login(user, pw)
         server.sendmail(sender, recipient, msg.as_string())
         server.quit()
         logger.info(f"Email sent successfully to {recipient} via {server_addr} (user: {user})")
+        return True, "Email sent successfully."
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
-        speak_text("Sorry, I was unable to send that email.")
+        return False, f"Failed: {e}"
 
 
 # ─── Sleep Mode ───────────────────────────────────────────────────────────────
-_prev_volume = 75
+_prev_volume = min(75, getattr(config, 'VOLUME_MAX', 100))
 def _set_sleep_mode(enabled):
     global _volume, _prev_volume
     with state_lock:
@@ -1189,7 +1271,7 @@ def _set_sleep_mode(enabled):
 
 
 
-def process_llm(audio_array):
+def process_llm(audio_array, is_continuity=False):
     global _current_transcript, _last_assistant_response
     """
     LLM pipeline with streaming and Gemini function calling for timers:
@@ -1218,12 +1300,11 @@ def process_llm(audio_array):
 
         # Valid audio detected — now start the "thinking" UX
         with state_lock:
-            prev_status = assistant_state.get("status")
             assistant_state["processing"] = True
             assistant_state["status"]     = "THINKING"
-        
+
         send_uart_command("APP:THINKING")
-        speak_filler(is_continuity=(prev_status == "CONTINUITY"))
+        speak_filler(is_continuity=is_continuity)
 
         logger.info(f"LLM query: {len(audio_array)} samples, peak={peak_amplitude:.5f}")
 
@@ -1253,7 +1334,7 @@ def process_llm(audio_array):
         interaction_transcript = ""
         
         user_msg = f"[Current Context: {get_context()}]"
-        if prev_status == "CONTINUITY" and _last_assistant_response:
+        if is_continuity and _last_assistant_response:
             user_msg += f"\n[Your previous response was: \"{_last_assistant_response}\". The user is now following up.]"
 
 
@@ -1328,10 +1409,23 @@ def process_llm(audio_array):
                             subject = fc.args["subject"]
                             body = fc.args["body"]
                             logger.info(f"Executing Tool: send_detailed_email - {subject}")
-                            _send_email_async(subject, body)
+                            result_holder = [False, "Timed out"]
+                            def _run_email():
+                                result_holder[0], result_holder[1] = _send_email_task(subject, body)
+                            t = threading.Thread(target=_run_email, daemon=True)
+                            t.start()
+                            speak_text(random.choice([
+                                "Routing that to your inbox.",
+                                "Dispatching to your email now.",
+                                "Transmitting to your inbox.",
+                                "Sending that to your email.",
+                            ]))
+                            t.join(timeout=15)
+                            email_ok  = result_holder[0]
+                            email_msg = result_holder[1]
                             fn_responses.append(types.Part(function_response=types.FunctionResponse(
                                 name="send_detailed_email",
-                                response={"status": "success", "message": "Email sent."},
+                                response={"status": "success" if email_ok else "error", "message": email_msg},
                                 id=fc.id
                             )))
                         elif fc.name == "get_weather":
@@ -1438,21 +1532,30 @@ def process_llm(audio_array):
 
             logger.info(f"LLM answer: {display_text}")
             send_uart_command(f"TXT|{display_text.replace(chr(10), ' ')}")
-            
-            # ── 3. Storage: Commit to Memory (Background) ──────────────────────────
-            if _memory:
-                with _transcript_lock:
-                    final_trans = _current_transcript
-                
-                if final_trans:
-                    def _store_mem_bg(txt):
-                        try:
-                            _memory.add(txt, user_id="primary_user")
-                            logger.info("Turn committed to long-term memory (background).")
-                        except Exception as e:
-                            logger.warning(f"Memory storage failed: {e}")
-                    
-                    threading.Thread(target=_store_mem_bg, args=(final_trans,), daemon=True).start()
+
+            with _transcript_lock:
+                final_trans = _current_transcript
+
+            # ── 3a. Session history + cache TTL heartbeat (Tier 2/3, background) ──
+            # Without this, run_summary_task never has history to summarize and the
+            # Gemini context cache silently expires mid-session.
+            if memory_manager:
+                threading.Thread(
+                    target=memory_manager.add_interaction,
+                    args=(final_trans or "(no transcript)", display_text),
+                    daemon=True,
+                ).start()
+
+            # ── 3b. Storage: Commit to long-term memory (Background) ──────────────
+            if _memory and final_trans:
+                def _store_mem_bg(txt):
+                    try:
+                        _memory.add(txt, user_id="primary_user")
+                        logger.info("Turn committed to long-term memory (background).")
+                    except Exception as e:
+                        logger.warning(f"Memory storage failed: {e}")
+
+                threading.Thread(target=_store_mem_bg, args=(final_trans,), daemon=True).start()
 
         # ── 5. Continuity: Start follow-up window ────────────────────────
         # Transition to CONTINUITY or IDLE regardless of whether text was spoken
@@ -1556,6 +1659,62 @@ def _unmute_and_prime_speaker():
     except Exception as e:
         logger.warning(f"Speaker prime failed (non-critical): {e}")
 
+# ─── Audio Front-End Helpers ────────────────────────────────────────────────
+
+def _apply_audio_routing():
+    """Apply the selected source's ALSA mixer routes via tinymix.
+
+    The Tachyon codec captures nothing until MultiMedia1/PRI_MI2S_TX is routed
+    and the ADC/PGA muxes are set. These routes are not persistent across boots,
+    so we (re)apply them every time the capture thread starts. No-op for the
+    INMP441 profile (empty routing list)."""
+    for control, value in config.AUDIO_ROUTING:
+        try:
+            subprocess.run(["sudo", "tinymix", "set", control, value],
+                           check=True, capture_output=True, text=True)
+        except FileNotFoundError:
+            logger.error("tinymix not found — cannot apply audio routing")
+            return
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"tinymix '{control}'='{value}' failed: {e.stderr.strip()}")
+    if config.AUDIO_ROUTING:
+        logger.info(f"Applied {len(config.AUDIO_ROUTING)} ALSA route(s) for "
+                    f"source '{config.AUDIO_SOURCE}'")
+
+
+class _InputFilters:
+    """Stateful per-chunk input filtering (high-pass + optional notch).
+
+    Operates on normalized float audio in [-1, 1]. Filter state (zi) is carried
+    across chunks so there are no discontinuities at chunk boundaries. Disabled
+    cheaply when the profile requests no filtering or scipy is unavailable."""
+
+    def __init__(self, rate, highpass_hz=0, notch_hz=0):
+        self.stages = []  # list of [b, a, zi]
+        if not (highpass_hz or notch_hz):
+            return
+        if not SCIPY_AVAILABLE:
+            logger.warning("scipy unavailable — input noise filtering disabled")
+            return
+        nyq = rate / 2.0
+        if highpass_hz:
+            b, a = _scipy_signal.butter(2, highpass_hz / nyq, btype="highpass")
+            self.stages.append([b, a, _scipy_signal.lfilter_zi(b, a)])
+        if notch_hz:
+            b, a = _scipy_signal.iirnotch(notch_hz / nyq, 30.0)
+            self.stages.append([b, a, _scipy_signal.lfilter_zi(b, a)])
+        logger.info(f"Input filters: highpass={highpass_hz}Hz notch={notch_hz}Hz")
+
+    @property
+    def enabled(self):
+        return bool(self.stages)
+
+    def process(self, x):
+        for st in self.stages:
+            x, st[2] = _scipy_signal.lfilter(st[0], st[1], x, zi=st[2])
+        return x
+
+
 # ─── Audio Processor ──────────────────────────────────────────────────────────
 
 def audio_processor():
@@ -1565,9 +1724,26 @@ def audio_processor():
         return
 
     CHUNK    = config.AUDIO_CHUNK
-    FORMAT   = pyaudio.paInt32
     CHANNELS = config.AUDIO_CHANNELS
     RATE     = config.AUDIO_RATE
+
+    # Sample format depends on the capture front-end: the INMP441 delivers raw
+    # 32-bit I2S slots, the Tachyon codec native 16-bit PCM.
+    if config.AUDIO_SAMPLE_FORMAT == "int16":
+        FORMAT       = pyaudio.paInt16
+        SAMPLE_DTYPE = np.int16
+        FULL_SCALE   = 32768.0
+    else:
+        FORMAT       = pyaudio.paInt32
+        SAMPLE_DTYPE = np.int32
+        FULL_SCALE   = 2147483648.0
+
+    logger.info(f"Audio source '{config.AUDIO_SOURCE}': dev={config.AUDIO_DEVICE_INDEX} "
+                f"fmt={config.AUDIO_SAMPLE_FORMAT} rate={RATE} gain={config.AUDIO_GAIN}")
+
+    # Apply ALSA mixer routing (Tachyon codec) before opening the stream.
+    _apply_audio_routing()
+    input_filters = _InputFilters(RATE, config.AUDIO_HIGHPASS_HZ, config.AUDIO_NOTCH_HZ)
 
     p = pyaudio.PyAudio()
 
@@ -1609,14 +1785,29 @@ def audio_processor():
         except Exception as e:
             logger.error(f"VAD init failed: {e}")
 
-    # ── Open I2S stream now that all CPU-intensive loading is done ──
-    try:
-        stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
-                        input=True, input_device_index=config.AUDIO_DEVICE_INDEX,
-                        frames_per_buffer=CHUNK)
-        logger.info("Audio stream opened (32-bit I2S)")
-    except Exception as e:
-        logger.error(f"Failed to open audio stream: {e}")
+    # ── Open the capture stream now that all CPU-intensive loading is done ──
+    # The codec/DAPM path can need a moment to settle after routing, so the first
+    # open sometimes fails transiently (PortAudio -9998/-9999). Retry before
+    # giving up rather than killing the audio thread on a one-off hiccup.
+    stream = None
+    for attempt in range(1, 6):
+        try:
+            stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+                            input=True, input_device_index=config.AUDIO_DEVICE_INDEX,
+                            frames_per_buffer=CHUNK)
+            logger.info(f"Audio stream opened ({config.AUDIO_SAMPLE_FORMAT}, "
+                        f"{CHANNELS}ch @ {RATE}Hz, attempt {attempt})")
+            break
+        except Exception as e:
+            logger.warning(f"Audio stream open attempt {attempt}/5 failed: {e}")
+            # The backend may only expose a single capture channel in this context;
+            # fall back to mono rather than failing outright.
+            if "Invalid number of channels" in str(e) and CHANNELS > 1:
+                CHANNELS = 1
+                logger.info("Falling back to mono capture (1 channel)")
+            time.sleep(1.0)
+    if stream is None:
+        logger.error("Failed to open audio stream after 5 attempts — audio disabled")
         return
 
     _amp_enable()
@@ -1627,7 +1818,7 @@ def audio_processor():
 
     # ── AEC init ──────────────────────────────────────────────────────────────
     global _aec_ref_buf
-    
+
     # VAD frame: 30ms at 16kHz = 480 samples
     VAD_FRAME_SAMPLES = 480
 
@@ -1637,6 +1828,7 @@ def audio_processor():
     # ── Recording state ──
     recording            = False
     recording_end_time   = 0
+    from_continuity      = False   # True when recording triggered by continuity VAD bypass
     query_buffer         = []
     vad_speech_frames    = 0
     vad_silence_frames   = 0
@@ -1658,30 +1850,13 @@ def audio_processor():
         if not _SPEEX_AVAILABLE:
             logger.info("AEC disabled — speexdsp not installed (pip install speexdsp)")
 
-    # VAD frame: 30ms at 16kHz = 480 samples
-    VAD_FRAME_SAMPLES = 480
-
-    # ── Recording state ──
-    recording            = False
-    recording_end_time   = 0
-    query_buffer         = []
-    vad_speech_frames    = 0
-    vad_silence_frames   = 0
-    vad_frame_buf        = np.array([], dtype=np.int16)
-
-    # ── Pre-compute FFT constants (invariant for this sample rate / chunk size) ──
-    _fft_freq_bounds = np.geomspace(80, 12000, 17)
-    _fft_idx_bounds  = np.clip((_fft_freq_bounds * CHUNK / RATE).astype(int), 0, CHUNK // 2)
-    _fft_weights     = np.ones(16)
-    # Per-bin noise floor calibrated from measured silence (silence p95 * 1.3)
-    _fft_floor       = np.array([0.673, 0.3535, 0.2799, 0.1647, 0.1024, 0.059, 0.0352, 0.0254,
-                                  0.0179, 0.0129, 0.0094, 0.0072, 0.0055, 0.0043, 0.0035, 0.0028])
-
     # ── Other state ──
+    consecutive_errors = 0
     last_send_time     = 0
     oww_buffer         = np.array([], dtype=np.int16)
     last_log_time      = time.time()
     pre_record_buffer  = deque()  # deque of numpy chunks, total ≤ 71680 samples
+    bg_rms             = 0.5      # adaptive background noise floor tracker (starts at 0.5%)
     pre_roll_len       = 0
     continuity_speech_frames = 0
     continuity_silence_frames = 0
@@ -1690,20 +1865,40 @@ def audio_processor():
         try:
             with state_lock:
                 mic_active = assistant_state.get("mic_active", False)
+                status     = assistant_state.get("status", "IDLE")
 
             data = stream.read(CHUNK, exception_on_overflow=False)
-            raw_samples = np.frombuffer(data, dtype=np.int32)
-            ch_left  = raw_samples[0::2]
-            ch_right = raw_samples[1::2]
+            consecutive_errors = 0
+            raw_samples = np.frombuffer(data, dtype=SAMPLE_DTYPE)
+            if CHANNELS == 1:
+                active_ch = raw_samples
+            else:
+                ch_left  = raw_samples[0::2]
+                ch_right = raw_samples[1::2]
+                _ch_sel = config.AUDIO_CHANNEL_SELECT
+                if _ch_sel == 'left':
+                    active_ch = ch_left
+                elif _ch_sel == 'right':
+                    active_ch = ch_right
+                else:
+                    # Auto-detect which channel carries audio (INMP441 L/R pin selects
+                    # the live channel; a mic on either side still triggers the wake word).
+                    rms_left  = np.mean(np.abs(ch_left))
+                    rms_right = np.mean(np.abs(ch_right))
+                    active_ch = ch_left if rms_left > rms_right else ch_right
 
-            # Auto-detect which channel the INMP441 is on (L/R pin to GND = Left, to 3.3V = Right)
-            rms_left = np.mean(np.abs(ch_left))
-            rms_right = np.mean(np.abs(ch_right))
-            active_ch = ch_left if rms_left > rms_right else ch_right
+            # Normalize to float [-1, 1] (scale depends on sample width), then
+            # apply the source's high-pass/notch input filters with carried state.
+            norm_full = active_ch.astype(np.float64) / FULL_SCALE
+            if input_filters.enabled:
+                norm_full = input_filters.process(norm_full)
 
-            # Restore 2x digital boost for optimal pickup
-            norm_samples = (active_ch.astype(np.float64) / 2147483648.0) * 2.0
-            norm_samples = np.clip(norm_samples, -1.0, 1.0)
+            # Apply the source's digital boost for the spectrum/recording path.
+            norm_samples = np.clip(norm_full * config.AUDIO_GAIN, -1.0, 1.0)
+
+            # Downsampled (48k→16k) int16 view shared by VAD and wake word, derived
+            # from the filtered, pre-boost signal so OWW/VAD see a consistent level.
+            mic_16k = (np.clip(norm_full[::3] * config.AUDIO_OWW_GAIN, -1.0, 1.0) * 32767).astype(np.int16)
 
             # Maintain ~0.5s pre-roll buffer — captures tail of wake word and any
             # speech that overlaps OWW detection latency. 1.5s was wasteful since
@@ -1719,9 +1914,8 @@ def audio_processor():
                 query_buffer.extend(norm_samples)
 
                 if vad:
-                    # Accumulate downsampled int16 for VAD (48k→16k, 32bit→16bit)
-                    chunk_16k = np.right_shift(active_ch[::3], 16).astype(np.int16)
-                    vad_frame_buf = np.concatenate([vad_frame_buf, chunk_16k])
+                    # Accumulate downsampled int16 for VAD (already 48k→16k, filtered)
+                    vad_frame_buf = np.concatenate([vad_frame_buf, mic_16k])
 
                     while len(vad_frame_buf) >= VAD_FRAME_SAMPLES:
                         frame = vad_frame_buf[:VAD_FRAME_SAMPLES]
@@ -1755,22 +1949,16 @@ def audio_processor():
                     vad_silence_frames = 0
                     vad_frame_buf      = np.array([], dtype=np.int16)
                     
-                    # Record interaction in MemoryManager (Tier 3)
-                    if memory_manager:
-                        # We don't have the text yet, process_llm will call add_interaction later
-                        pass
-
-                    threading.Thread(target=process_llm, args=(audio_array,), daemon=True).start()
-                    last_wakeword_time = time.time()
+                    threading.Thread(target=process_llm, args=(audio_array, from_continuity), daemon=True).start()
+                    from_continuity = False
 
             # ── Wake Word Detection / Continuity Bypass ──
             else:
+                # status was read at the top of this iteration alongside mic_active
                 with state_lock:
-                    status            = assistant_state.get("status", "IDLE")
-                    is_processing      = assistant_state.get("processing", False)
-                    cooldown_until     = assistant_state.get("wakeword_cooldown_until", 0)
-                    tts_started_at     = assistant_state.get("tts_started_at", 0)
-                    continuity_until   = assistant_state.get("continuity_until", 0)
+                    is_processing    = assistant_state.get("processing", False)
+                    cooldown_until   = assistant_state.get("wakeword_cooldown_until", 0)
+                    continuity_until = assistant_state.get("continuity_until", 0)
 
                 # Check Continuity Timeout
                 if status == "CONTINUITY" and time.time() > continuity_until:
@@ -1795,9 +1983,10 @@ def audio_processor():
                     time.sleep(0.01)
                     continue
 
-                # Prepare audio for VAD/OWW
-                ch_right_16k = ch_right[::3]
-                audio_16k    = np.right_shift(ch_right_16k, 16).astype(np.int16)
+                # Prepare audio for VAD/OWW from the auto-detected live channel —
+                # same selection/filtering as spectrum/recording, so a mic on the
+                # left channel still triggers the wake word.
+                audio_16k = mic_16k
 
                 # ── CONTINUITY MODE: Bypass Wake Word ──
                 if status == "CONTINUITY" and vad:
@@ -1829,18 +2018,25 @@ def audio_processor():
                             continue
 
                         if continuity_speech_frames >= 5: # ~150ms of solid speech
-                            logger.info(f"CONTINUITY: Speech detected via VAD ({continuity_speech_frames} frames). Bypassing wake word.")
-                            with state_lock:
-                                assistant_state["status"] = "LISTENING"
-                            recording          = True
-                            recording_end_time = time.time() + config.LLM_RECORD_SECONDS
-                            query_buffer       = list(np.concatenate(list(pre_record_buffer)) if pre_record_buffer else [])
-                            vad_speech_frames  = continuity_speech_frames
-                            vad_silence_frames = 0
-                            continuity_silence_frames = 0
-                            vad_frame_buf      = np.array([], dtype=np.int16)
-                            continuity_speech_frames = 0
-                            continue
+                            tts_mute_s = config.WAKEWORD_TTS_MUTE_MS / 1000.0
+                            if (time.time() - _tts_finished_at) < tts_mute_s:
+                                # Speaker echo — still within post-TTS mute window. Discard.
+                                logger.debug(f"CONTINUITY: VAD fired within TTS mute window ({tts_mute_s:.1f}s). Ignoring echo.")
+                                continuity_speech_frames = 0
+                            else:
+                                logger.info(f"CONTINUITY: Speech detected via VAD ({continuity_speech_frames} frames). Bypassing wake word.")
+                                with state_lock:
+                                    assistant_state["status"] = "LISTENING"
+                                recording          = True
+                                from_continuity    = True
+                                recording_end_time = time.time() + config.LLM_RECORD_SECONDS
+                                query_buffer       = list(np.concatenate(list(pre_record_buffer)) if pre_record_buffer else [])
+                                vad_speech_frames  = continuity_speech_frames
+                                vad_silence_frames = 0
+                                continuity_silence_frames = 0
+                                vad_frame_buf      = np.array([], dtype=np.int16)
+                                continuity_speech_frames = 0
+                                continue
 
                 # ── IDLE MODE: Standard Wake Word Detection ──
                 if oww_model and status == "IDLE":
@@ -1872,6 +2068,8 @@ def audio_processor():
                         prediction = oww_model.predict(chunk_oww)
                         ww_threshold = config.WAKEWORD_THRESHOLD_BARGE_IN if is_speaking else config.WAKEWORD_THRESHOLD
                         for mdl, score in prediction.items():
+                            if score > 0.01:
+                                logger.debug(f"OWW: {mdl} score={score:.3f} (threshold={ww_threshold:.2f})")
                             if score >= ww_threshold:
                                 logger.info(f"WAKE WORD: {mdl} ({score:.3f})")
                                 if is_speaking: interrupt_tts()
@@ -1883,6 +2081,7 @@ def audio_processor():
                                 with state_lock:
                                     assistant_state["last_wakeword_at"] = time.time()
                                 recording          = True
+                                from_continuity    = False
                                 recording_end_time = time.time() + config.LLM_RECORD_SECONDS
                                 query_buffer       = list(np.concatenate(list(pre_record_buffer)) if pre_record_buffer else [])
                                 vad_speech_frames  = 0
@@ -1894,11 +2093,15 @@ def audio_processor():
                                 break
 
             # ── Spectrum + Intensity for Orb ──
-            rms_left = np.sqrt(np.mean(norm_samples ** 2)) * 100.0
+            rms_now = np.sqrt(np.mean(norm_samples ** 2)) * 100.0
 
             with state_lock:
                 avg_rms = assistant_state.get("avg_rms", 1.0)
-            adj_rms = max(0.0, rms_left - 2.5)
+            # Adaptive noise floor: only update from quiet samples (< 2x current bg)
+            # so speech/startup bursts don't inflate the threshold
+            if rms_now <= bg_rms * 2.0:
+                bg_rms = bg_rms * 0.997 + rms_now * 0.003
+            adj_rms = max(0.0, rms_now - max(0.15, bg_rms * 1.5))
 
             if adj_rms > 0.02:
                 avg_rms = (avg_rms * 0.90) + (adj_rms * 0.10)
@@ -1914,7 +2117,10 @@ def audio_processor():
 
             now = time.time()
             is_speaking = _tts_active.is_set()
-            if mic_active and not is_speaking and now - last_send_time > (1.0 / config.AUDIO_UPDATE_HZ):
+            # Send spectrum if mic is active (ESP32 on Assistant screen) OR if Pi is in a mode that needs the face active
+            should_send = mic_active or status in ("LISTENING", "THINKING", "SPEAKING", "CONTINUITY")
+            
+            if should_send and not is_speaking and now - last_send_time > (1.0 / config.AUDIO_UPDATE_HZ):
                 # FFT only at send rate (10Hz) if not speaking (speech synthesis sends its own data)
                 gain = max(0.5, min(8.0, 1.0 / avg_rms))
                 bins = calculate_spectrum_bins(norm_samples, mic_idx_bounds, gain=gain)
@@ -1923,11 +2129,29 @@ def audio_processor():
 
             now = time.time()
             if now - last_log_time > 10.0:
-                logger.debug(f"Mic RMS: {rms_left:.4f} (avg: {avg_rms:.4f})")
+                bg_thresh = max(0.15, bg_rms * 1.5)
+                logger.debug(f"Mic RMS: {rms_now:.4f} (bg: {bg_rms:.4f}, thresh: {bg_thresh:.4f}, adj: {adj_rms:.4f}, intensity: {intensity})")
                 last_log_time = now
 
         except Exception as e:
             logger.error(f"Audio processing error: {e}")
+            consecutive_errors += 1
+            if consecutive_errors >= 5:
+                # Input stream is likely dead (device reset/unplug) — try to reopen
+                # instead of spinning on errors forever.
+                logger.error("Audio input failing repeatedly — reopening stream")
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                try:
+                    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+                                    input=True, input_device_index=config.AUDIO_DEVICE_INDEX,
+                                    frames_per_buffer=CHUNK)
+                    consecutive_errors = 0
+                    logger.info("Audio input stream reopened")
+                except Exception as reopen_err:
+                    logger.error(f"Stream reopen failed: {reopen_err}")
             time.sleep(0.5)
 
 # ─── Encoder ──────────────────────────────────────────────────────────────────
@@ -1946,7 +2170,8 @@ def on_encoder_event(event, direction, value):
     logger.info(f"Encoder: {event} {direction if direction else ''} (Mode: {mode})")
     
     if event == "rotate":
-        if mode in ("RADAR", "GLOBE"):
+        m = mode.strip().upper()
+        if m == "RADAR":
             # Zoom Logic
             if direction == "CW":
                 with state_lock:
@@ -1956,24 +2181,39 @@ def on_encoder_event(event, direction, value):
                 with state_lock:
                     assistant_state["zoom"] = min(250, assistant_state["zoom"] + 1)
                 send_uart_command("Z-")
-        elif mode in ("ASSISTANT", "SPEAKING", "CONTINUITY"):
+        elif m == "GLOBE":
+            # Tell the ESP32 to adjust the globe's tilt
+            if direction == "CW": send_uart_command("T+")
+            else: send_uart_command("T-")
+        elif m in ("ASSISTANT", "SPEAKING", "CONTINUITY"):
             # Style Toggle Logic
             send_uart_command("STYLE:TOGGLE")
+        elif m == "SETTINGS":
+            # Volume Adjustment in Settings
+            if direction == "CW": send_uart_command("V+")
+            else: send_uart_command("V-")
         else:
             # Default to Zoom for other screens
             if direction == "CW": send_uart_command("Z+")
             else: send_uart_command("Z-")
             
     elif event == "press":
-        if mode == "RADAR":
+        m = mode.strip().upper()
+        if m == "RADAR":
             # Reset Zoom
             with state_lock:
                 assistant_state["zoom"] = 15
             send_uart_command("Z:15")
             logger.info("Encoder Button: Zoom reset to 15nm")
-        elif mode == "CLOCK":
+        elif m == "CLOCK":
             # Jump to Assistant
             send_uart_command("APP:ASSISTANT")
+        elif m == "SETTINGS":
+            # Exit Settings
+            send_uart_command("EXIT_SETTINGS")
+        elif m == "GLOBE":
+            # Toggle Globe Rotation
+            send_uart_command("GLOBE:TOGGLE")
         else:
             # Default press action: Back to Radar
             send_uart_command("APP:RADAR")
@@ -2040,6 +2280,82 @@ def radar_stop():
     logger.info("radar_active set False via HTTP")
     return jsonify({"status": "radar_idle"})
 
+# ─── Globe Manager Routes ───────────────────────────────────────────────────
+
+@app.route('/globe')
+def globe_ui():
+    """Serve the Globe Manager web interface."""
+    return render_template('globe_ui.html')
+
+@app.route('/api/globe/pois', methods=['GET'])
+def get_globe_pois():
+    """Return the list of POIs as JSON."""
+    return jsonify(globe_manager.load_pois())
+
+@app.route('/api/globe/search')
+def globe_search():
+    """Geocode a place name via OpenStreetMap Nominatim (proxied so we can set a
+    proper User-Agent per their usage policy and avoid browser CORS issues)."""
+    q = request.args.get('q', '').strip()
+    if not q:
+        return jsonify([])
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": q, "format": "jsonv2", "limit": 8},
+            headers={"User-Agent": "OmniOrb-GlobeManager/1.0 (personal device)"},
+            timeout=6,
+        )
+        r.raise_for_status()
+        results = []
+        for item in r.json():
+            try:
+                results.append({
+                    "name":         item.get("name") or item.get("display_name", "").split(",")[0],
+                    "display_name": item.get("display_name", ""),
+                    "lat":          float(item["lat"]),
+                    "lon":          float(item["lon"]),
+                })
+            except (KeyError, ValueError, TypeError):
+                continue
+        return jsonify(results)
+    except Exception as e:
+        logger.warning(f"Geocode search failed for '{q}': {e}")
+        return jsonify({"error": "search failed"}), 502
+
+@app.route('/api/globe/pois', methods=['POST'])
+def update_globe_pois():
+    """Update the POI list and sync to ESP32 if currently in Globe mode."""
+    raw = request.get_json(silent=True)
+    if not isinstance(raw, list):
+        return jsonify({"status": "error", "message": "expected a JSON list of POIs"}), 400
+
+    pois = []
+    for p in raw:
+        try:
+            lat = float(p["lat"])
+            lon = float(p["lon"])
+        except (TypeError, KeyError, ValueError):
+            return jsonify({"status": "error", "message": f"POI missing or invalid lat/lon: {p}"}), 400
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            return jsonify({"status": "error", "message": f"POI lat/lon out of range: {p}"}), 400
+        pois.append({
+            "name":  str(p.get("name", "")),
+            "lat":   lat,
+            "lon":   lon,
+            "color": str(p.get("color", "#FFFFFF")),
+        })
+
+    globe_manager.save_pois(pois)
+    
+    # If the ESP32 is currently showing the globe, push the update immediately
+    with state_lock:
+        current_app = assistant_state.get("current_app")
+    if current_app == "GLOBE":
+        send_uart_command(f"GLOBE:POIS:{globe_manager.get_pois_serial()}")
+        
+    return jsonify({"status": "ok", "count": len(pois)})
+
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -2057,6 +2373,7 @@ if __name__ == "__main__":
 
     time.sleep(0.5)
     send_uart_command("SYNC?")
+    send_uart_command("WIFI?")   # one-time credential sync (ESP32 no longer broadcasts these)
     _set_sleep_mode(False) # Force Wake on startup
     send_uart_command("APP:ASSISTANT")
     logger.info("Sent boot synchronization command: APP:ASSISTANT")
@@ -2064,5 +2381,20 @@ if __name__ == "__main__":
     audio_thread = threading.Thread(target=audio_processor, daemon=True)
     audio_thread.start()
     logger.info("Audio processor thread started")
+
+    def heartbeat_worker():
+        """Proactive heartbeat to keep the ESP32 connection alive."""
+        while True:
+            try:
+                # Any message from the Pi resets the ESP32's 15s timeout.
+                # HB:ACK is safe and low-bandwidth.
+                send_uart_command("HB:ACK")
+            except Exception:
+                pass
+            time.sleep(5.0)
+
+    heartbeat_thread = threading.Thread(target=heartbeat_worker, daemon=True)
+    heartbeat_thread.start()
+    logger.info("Proactive heartbeat thread started (5s interval)")
 
     app.run(host=config.FLASK_HOST, port=config.FLASK_PORT)

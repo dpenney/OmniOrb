@@ -1,0 +1,9 @@
+"Id";"Designator";"Footprint";"Quantity";"Designation";"Supplier and ref";
+1;"C2";"C_0603_1608Metric";1;".1uF";;;
+2;"C3";"C_0805_2012Metric";1;"10uF";;;
+3;"ESP_32";"JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical";1;"UART_PWR";;;
+4;"I2S_Microphone1";"JST_XH_B6B-XH-A_1x06_P2.50mm_Vertical";1;"I2S Microphone";;;
+5;"J1";"PinSocket_2x20_P2.54mm_Vertical";1;"GPIO";;;
+6;"J2";"TerminalBlock_Phoenix_MPT-0,5-2-2.54_1x02_P2.54mm_Horizontal";1;"Terminal";;;
+7;"Rotary_Encoder1";"JST_XH_B5B-XH-A_1x05_P2.50mm_Vertical";1;"Conn_01x05_Pin";;;
+8;"U2";"TQFN-16-1EP_3x3mm_P0.5mm_EP1.23x1.23mm";1;"MAX98357A";;;

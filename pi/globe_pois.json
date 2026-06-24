@@ -1,0 +1,14 @@
+[
+    {
+        "name": "Barksdale AFB",
+        "lat": 32.496,
+        "lon": -93.6728,
+        "color": "#0000FF"
+    },
+    {
+        "name": "Bruno's Lair",
+        "lat": 37.8499,
+        "lon": -122.1157,
+        "color": "#FF0000"
+    }
+]
