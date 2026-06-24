@@ -1,6 +1,6 @@
 param(
-    [string]$HostIp = "YOUR_PI_IP",
-    [string]$User = "pi",
+    [string]$HostIp = "192.168.4.36",
+    [string]$User = "penneyd",
     [string]$Dest = "~/assistant/pi"
 )
 

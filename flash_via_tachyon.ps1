@@ -1,8 +1,8 @@
 param(
-    [string]$HostIp = "YOUR_TACHYON_IP",
-    [string]$User = "pi",
+    [string]$HostIp = "192.168.4.205",
+    [string]$User = "penneyd",
     [string]$Dest = "/tmp/esp32_flash",
-    [string]$SshKey = "YOUR_SSH_KEY_PATH",
+    [string]$SshKey = "C:\apps\esp32_round\tachyon_key_fixed",
     [string]$Port = "/dev/ttyHS2"
 )
 

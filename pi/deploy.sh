@@ -2,7 +2,7 @@
 set -e
 
 # Target Raspberry Pi address
-PI_HOST="${PI_HOST:-YOUR_PI_IP}"   # override with: PI_HOST=x.x.x.x ./deploy.sh
+PI_HOST="${PI_HOST:-192.168.4.36}"
 PI_USER="pi"
 PI_DIR="/home/pi/assistant"
 
