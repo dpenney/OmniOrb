@@ -7,6 +7,7 @@
 struct ProjectSettings {
     char wifi_ssid[64];
     char wifi_password[64];
+    char adsb_host[64];
     float home_lat;
     float home_lon;
     float range_nm;

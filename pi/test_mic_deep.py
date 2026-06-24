@@ -2,24 +2,32 @@ import pyaudio
 import numpy as np
 
 p = pyaudio.PyAudio()
+idx = 44 # default device
 
-for fmt in [pyaudio.paInt32, pyaudio.paInt16]:
-    print(f"\n--- Testing Format: {fmt} ---")
-    try:
-        stream = p.open(format=fmt, channels=2, rate=48000, input=True, input_device_index=1, frames_per_buffer=1024)
-        data = stream.read(48000, exception_on_overflow=False)
-        dtype = np.int32 if fmt == pyaudio.paInt32 else np.int16
-        samples = np.frombuffer(data, dtype=dtype)
-        left = samples[0::2]
-        right = samples[1::2]
+try:
+    info = p.get_device_info_by_index(idx)
+    print(f"Recording from Device {idx}: {info.get('name')}")
+    stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, input_device_index=idx, frames_per_buffer=1024)
+    
+    # record 2 seconds
+    frames = []
+    print("Recording 2 seconds of audio...")
+    for _ in range(int(16000 / 1024 * 2)):
+        data = stream.read(1024, exception_on_overflow=False)
+        frames.append(data)
         
-        print("Left RMS:  ", np.sqrt(np.mean(left.astype(np.float64)**2)))
-        print("Right RMS: ", np.sqrt(np.mean(right.astype(np.float64)**2)))
-        print("Left sample slice: ", left[:10])
-        print("Right sample slice:", right[:10])
-        
-        stream.close()
-    except Exception as e:
-        print("Failed:", e)
+    stream.close()
+    
+    audio_data = b"".join(frames)
+    samples = np.frombuffer(audio_data, dtype=np.int16)
+    
+    print(f"Recorded {len(samples)} samples.")
+    print(f"Min value: {np.min(samples)}")
+    print(f"Max value: {np.max(samples)}")
+    print(f"Mean value: {np.mean(samples)}")
+    print(f"Standard deviation: {np.std(samples)}")
+    print("First 30 samples:", samples[:30].tolist())
+except Exception as e:
+    print(f"Error: {e}")
 
 p.terminate()

@@ -15,6 +15,8 @@ extern ProjectSettings settings;
 // extern int aircraft_count;
 // extern SemaphoreHandle_t ac_mutex;
 
+std::vector<GlobePOI> GlobeView::pois;
+
 #define MAX_GLOBE_NODES 2800
 #define CX              240
 #define CY              240
@@ -28,23 +30,22 @@ extern ProjectSettings settings;
 #define C_POI           0x041F // Bright Blue for special locations
 
 struct Point3D { float x, y, z; };
-// Allocated from PSRAM in init() to avoid starving the display DMA bounce
-// buffer, which requires ~115KB of contiguous internal SRAM.
+// Static BSS arrays (~56KB internal SRAM total). If internal RAM gets tight,
+// move these to heap_caps_malloc(MALLOC_CAP_SPIRAM) in init().
 static Point3D base_nodes[MAX_GLOBE_NODES];
 static int old_x[MAX_GLOBE_NODES], old_y[MAX_GLOBE_NODES];
 static int num_nodes = 0;
 
 #include "globe_map.h"
 
-// Store old home marker position to erase it cleanly
-static int old_home_x = -1, old_home_y = -1;
-static int old_bark_x = -1, old_bark_y = -1;
-static int old_bruno_x = -1, old_bruno_y = -1;
+// POI Management
+void GlobeView::clear_pois() {
+    pois.clear();
+}
 
-const float BARK_LAT = 32.4960f;
-const float BARK_LON = -93.6728f;
-const float BRUNO_LAT = 37.8499f;
-const float BRUNO_LON = -122.1157f;
+void GlobeView::add_poi(float lat, float lon, uint16_t color) {
+    pois.push_back({lat, lon, color, -1, -1});
+}
 
 static float rot_y = 0.0f;
 static float tilt_x = -0.41f; // Current globe tilt
@@ -103,9 +104,10 @@ void GlobeView::show() {
     for(int i = 0; i < num_nodes; i++) {
         old_x[i] = -1; old_y[i] = -1;
     }
-    old_home_x = -1; old_home_y = -1;
-    old_bark_x = -1; old_bark_y = -1;
-    old_bruno_x = -1; old_bruno_y = -1;
+    for (auto &poi : pois) {
+        poi.old_x = -1;
+        poi.old_y = -1;
+    }
     last_frame_time = millis();
 }
 
@@ -158,43 +160,35 @@ void GlobeView::update() {
     }
 
     // 2. Erase old markers
-    if (old_home_x >= 0) {
-        gfx->fillCircle(old_home_x, old_home_y, 3, C_BG);
-        gfx->drawFastHLine(old_home_x - 5, old_home_y, 11, C_BG);
-        gfx->drawFastVLine(old_home_x, old_home_y - 5, 11, C_BG);
+    for (auto &poi : pois) {
+        if (poi.old_x >= 0) {
+            gfx->fillCircle(poi.old_x, poi.old_y, 3, C_BG);
+            poi.old_x = -1;
+        }
     }
-    if (old_bark_x >= 0) {
-        gfx->fillCircle(old_bark_x, old_bark_y, 3, C_BG);
-    }
-    if (old_bruno_x >= 0) {
-        gfx->fillCircle(old_bruno_x, old_bruno_y, 3, C_BG);
-    }
-    old_home_x = -1;
-    old_bark_x = -1;
-    old_bruno_x = -1;
 
-    // 3. (Dynamic Home marker removed to favor fixed POIs)
+    // 3. Process and draw Dynamic POIs
+    for (auto &poi : pois) {
+        float p_lat = poi.lat * M_PI / 180.0f;
+        float p_lon = poi.lon * M_PI / 180.0f;
+        float pax = cosf(p_lat) * sinf(p_lon);
+        float pay = sinf(p_lat);
+        float paz = cosf(p_lat) * cosf(p_lon);
 
-    // 4. Process and draw Barksdale AFB (Blue Dot)
-    float b_lat = BARK_LAT * M_PI / 180.0f;
-    float b_lon = BARK_LON * M_PI / 180.0f;
-    float bax = cosf(b_lat) * sinf(b_lon);
-    float bay = sinf(b_lat);
-    float baz = cosf(b_lat) * cosf(b_lon);
+        float prx = pax * cos_y - paz * sin_y;
+        float prz = pax * sin_y + paz * cos_y;
+        float pry = pay;
 
-    float brx = bax * cos_y - baz * sin_y;
-    float brz = bax * sin_y + baz * cos_y;
-    float bry = bay;
+        float pfz = prz * cos_x - pry * sin_x;
+        float pfy = prz * sin_x + pry * cos_x;
 
-    float bfz = brz * cos_x - bry * sin_x;
-    float bfy = brz * sin_x + bry * cos_x;
-
-    if (bfz >= 0) {
-        int sx = CX + (int)(brx * RADIUS);
-        int sy = CY - (int)(bfy * RADIUS);
-        gfx->fillCircle(sx, sy, 3, C_POI);
-        old_bark_x = sx;
-        old_bark_y = sy;
+        if (pfz >= 0) {
+            int sx = CX + (int)(prx * RADIUS);
+            int sy = CY - (int)(pfy * RADIUS);
+            gfx->fillCircle(sx, sy, 3, poi.color);
+            poi.old_x = sx;
+            poi.old_y = sy;
+        }
     }
     
     // 5. Process and draw Bruno's Lair (Blue Dot)

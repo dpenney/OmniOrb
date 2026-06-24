@@ -1,0 +1,13 @@
+﻿Designator,Mid X,Mid Y,Rotation,Layer
+C2,49.12,41.73,90.0,top
+C3,46.62,41.51,90.0,top
+C4,58.0,42.5,0.0,top
+C5,51.5,42.5,0.0,top
+ESP_32,16.75,45.0,0.0,top
+FB1,53.5,44.21,270.0,top
+FB2,56.0,44.21,270.0,top
+I2S_MICROPHONE1,34.25,45.0,0.0,top
+J1,32.5,52.5,270.0,bottom
+J2,54.77,38.995,180.0,top
+ROTARY_ENCODER1,18.0,37.0,0.0,top
+U2,48.31,45.81,0.0,top

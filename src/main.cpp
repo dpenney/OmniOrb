@@ -215,9 +215,9 @@ void exit_settings() {
         prev_app = APP_RADAR;
     }
 
-    Serial0.printf("Exiting Settings: Returning to prev_app ID %d\n", (int)prev_app);
+    Serial.printf("Exiting Settings: Returning to prev_app ID %d\n", (int)prev_app);
     current_app = prev_app;
-    Serial0.printf("Exiting Settings: current_app is now ID %d\n", (int)current_app);
+    Serial.printf("Exiting Settings: current_app is now ID %d\n", (int)current_app);
 
     if (current_app == APP_CLOCK) {
         lvgl_active = true;
@@ -468,7 +468,7 @@ void fetch_task(void *pv) {
 
             if (WiFi.status() == WL_CONNECTED) {
                 HTTPClient http;
-                String url = String("http://") + ADSB_HOST + ":" + ADSB_PORT + ADSB_PATH + 
+                String url = String("http://") + settings.adsb_host + ":" + ADSB_PORT + ADSB_PATH + 
                              "?lat=" + String(settings.home_lat, 4) + 
                              "&lon=" + String(settings.home_lon, 4) +
                              "&range=" + String(range_nm, 1);
@@ -497,6 +497,22 @@ void fetch_task(void *pv) {
                             idx = aircraft_count++;
                             memset(&aircraft[idx], 0, sizeof(Aircraft));
                             strlcpy(aircraft[idx].hex, hex, sizeof(aircraft[idx].hex));
+                        }
+                        if (idx == -1) {
+                            // Array full: reclaim a slot whose aircraft has expired and
+                            // whose blip the sweep has already erased (paint_valid false),
+                            // so reuse can't leave orphaned pixels on screen. Without this
+                            // the array fills with dead entries and new traffic is dropped.
+                            for (int i = 0; i < aircraft_count; i++) {
+                                if (!aircraft[i].paint_valid &&
+                                    millis() - aircraft[i].seen_ms > (uint32_t)(AIRCRAFT_MAX_AGE_S * 1000)) {
+                                    idx = i;
+                                    if (selected_idx == i) selected_idx = -1;
+                                    memset(&aircraft[idx], 0, sizeof(Aircraft));
+                                    strlcpy(aircraft[idx].hex, hex, sizeof(aircraft[idx].hex));
+                                    break;
+                                }
+                            }
                         }
 
                         if (idx != -1) {
@@ -744,7 +760,6 @@ void draw_detail_box() {
     gfx->setCursor(DETAIL_BX+6, DETAIL_BY+50); gfx->printf("Hdg: %d deg", ac.heading);
     detail_visible = true;
     detail_clobbered = false;
-    xSemaphoreGive(ac_mutex);
 }
 
 void erase_detail_box() {
@@ -838,7 +853,33 @@ void full_redraw() {
     prev_sweep = sweep_angle;
 }
 
+void apply_timezone(const char* tz_name, float manual_offset) {
+    String tz_posix = "";
+    
+    // Mapping Olson names to POSIX TZ strings for automatic DST
+    if (strcmp(tz_name, "America/Chicago") == 0)      tz_posix = "CST6CDT,M3.2.0,M11.1.0";
+    else if (strcmp(tz_name, "America/New_York") == 0) tz_posix = "EST5EDT,M3.2.0,M11.1.0";
+    else if (strcmp(tz_name, "America/Denver") == 0)   tz_posix = "MST7MDT,M3.2.0,M11.1.0";
+    else if (strcmp(tz_name, "America/Los_Angeles") == 0) tz_posix = "PST8PDT,M3.2.0,M11.1.0";
+    else if (strcmp(tz_name, "Europe/London") == 0)    tz_posix = "GMT0BST,M3.5.0/1,M10.5.0";
+    else if (strcmp(tz_name, "Europe/Paris") == 0)     tz_posix = "CET-1CEST,M3.5.0,M10.5.0/3";
+    else if (strcmp(tz_name, "America/Anchorage") == 0) tz_posix = "AKST9AKDT,M3.2.0,M11.1.0";
+    else if (strcmp(tz_name, "Pacific/Honolulu") == 0)  tz_posix = "HST10";
+    
+    if (tz_posix != "") {
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        setenv("TZ", tz_posix.c_str(), 1);
+        tzset();
+        Serial.printf("Timezone: %s -> POSIX: %s\n", tz_name, tz_posix.c_str());
+    } else {
+        // Fallback to manual offset if no mapping exists
+        configTime(manual_offset * 3600, 0, "pool.ntp.org", "time.nist.gov");
+        Serial.printf("Timezone Fallback: Static GMT Offset %.1f\n", manual_offset);
+    }
+}
+
 // ─── Arduino entry points ─────────────────────────────────────────────────────
+
 
 void setup() {
     Serial.begin(115200);
@@ -893,9 +934,9 @@ void setup() {
     // Splash screen while WiFi connects
     gfx->fillScreen(C_BG);
     gfx->setTextColor(C_SWEEP, C_BG);
+    gfx->setTextSize(3);
+    gfx->setCursor(45, 155); gfx->print("OmniHub booting...");
     gfx->setTextSize(2);
-    gfx->setCursor(45, 155); gfx->print("ADS-B Radar");
-    gfx->setTextSize(1);
     
     // Handshake: Check for touch to force provisioning mode
     gfx->setTextColor(0x0350, C_BG); // Dim green
@@ -935,18 +976,29 @@ void setup() {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+        // Remote-safety: never strand a configured device in AP mode — a transient
+        // router outage at boot would otherwise require physical access to recover.
+        // Keep retrying, rebooting every 2 minutes for a clean radio state. The
+        // touch-at-boot window remains the (physical) path to re-provisioning.
         gfx->fillRect(60, 180, 400, 20, C_BG);
-        gfx->setCursor(60, 180); gfx->print("WiFi failed! AP Mode...");
-        ProvisioningManager::startPortal(settings);
+        gfx->setCursor(60, 180); gfx->print("WiFi down - retrying...");
+        unsigned long retry_start = millis();
+        while (WiFi.status() != WL_CONNECTED) {
+            if (millis() - retry_start > 120000) {
+                Serial.println("WiFi retry window expired - rebooting");
+                ESP.restart();
+            }
+            delay(500);
+        }
     }
 
-    Serial0.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("WiFi: %s\n", WiFi.localIP().toString().c_str());
     ArduinoOTA.setHostname("esp32-radar");
     ArduinoOTA.begin();
 
     // Initialize NTP
-    Serial.printf("Syncing NTP (GMT Offset: %.1f)...\n", settings.gmt_offset);
-    configTime(settings.gmt_offset * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    apply_timezone(settings.timezone, settings.gmt_offset);
+
 
     ac_mutex = xSemaphoreCreateMutex();
 
@@ -1003,7 +1055,9 @@ void setup() {
     disp_drv.ver_res = SCREEN_HEIGHT;
     disp_drv.flush_cb = my_disp_flush;
     disp_drv.draw_buf = &draw_buf;
-    disp_drv.full_refresh = 1;      // Re-enabled: Fix tearing issue with ESP32 DMA
+    // Full refresh fixes tearing with ESP32 DMA, but LVGL requires full-screen
+    // buffers for it — in the 40-row SRAM fallback (buf2 == NULL) it must be off.
+    disp_drv.full_refresh = (buf2 != NULL) ? 1 : 0;
     disp_drv.antialiasing = 1;
     lv_disp_drv_register(&disp_drv);
 
@@ -1222,12 +1276,7 @@ void loop() {
     auto handle_cmd = [&](String rx) {
         rx.trim();
         if (rx.length() == 0) return;
-        if (!pi_connected) {
-            pi_connected = true;
-            if (strlen(settings.wifi_ssid) > 0) {
-                Serial0.printf("WIFI:%s|%s\n", settings.wifi_ssid, settings.wifi_password);
-            }
-        }
+        pi_connected = true;
         last_pi_msg_ms = millis();
         if (rx == "HB:ACK") {
             return;
@@ -1236,10 +1285,14 @@ void loop() {
             // Bypassing AssistantView::set_state to prevent task deadlock during animation
             set_display_power(mode == 0); // 1 = Sleep (Off), 0 = Wake (On)
         } else if (rx == "SYNC?") {
-
-
             notify_pi_settings();
             notify_pi_app_mode(current_app);
+        } else if (rx == "WIFI?") {
+            // Credentials are only sent when the Pi explicitly asks (boot-time sync),
+            // not broadcast on every reconnect.
+            if (strlen(settings.wifi_ssid) > 0) {
+                Serial0.printf("WIFI:%s|%s\n", settings.wifi_ssid, settings.wifi_password);
+            }
         } else if (rx == "DIAG") {
             current_app = APP_DIAGNOSTICS;
             DiagnosticsView::init();
@@ -1377,6 +1430,26 @@ void loop() {
                 AssistantView::set_audio_intensity(intensity);
                 DiagnosticsView::set_mic_intensity(intensity);
             }
+        } else if (rx.startsWith("GLOBE:POIS:")) {
+            String payload = rx.substring(11);
+            GlobeView::clear_pois();
+            int start = 0;
+            while (start < payload.length()) {
+                int pipe = payload.indexOf('|', start);
+                String item = (pipe == -1) ? payload.substring(start) : payload.substring(start, pipe);
+                
+                int c1 = item.indexOf(',');
+                int c2 = item.indexOf(',', c1 + 1);
+                if (c1 != -1 && c2 != -1) {
+                    float lat = item.substring(0, c1).toFloat();
+                    float lon = item.substring(c1 + 1, c2).toFloat();
+                    uint16_t color = (uint16_t)item.substring(c2 + 1).toInt();
+                    GlobeView::add_poi(lat, lon, color);
+                }
+                
+                if (pipe == -1) break;
+                start = pipe + 1;
+            }
         } else if (rx.startsWith("DIAG:")) {
             String data = rx.substring(5);
             int start = 0;
@@ -1399,6 +1472,15 @@ void loop() {
                 if (comma == -1) break;
                 start = comma + 1;
             }
+        } else if (rx.startsWith("TACHYON_IP:")) {
+            String new_ip = rx.substring(11);
+            new_ip.trim();
+            if (new_ip.length() > 0 && new_ip != settings.adsb_host) {
+                strncpy(settings.adsb_host, new_ip.c_str(), sizeof(settings.adsb_host) - 1);
+                settings.adsb_host[sizeof(settings.adsb_host) - 1] = '\0';
+                SettingsManager::save(settings);
+                Serial.printf("[Settings] Dynamic ADSB Host updated from Tachyon Serial: %s\n", settings.adsb_host);
+            }
         }
     };
 
@@ -1406,13 +1488,15 @@ void loop() {
         char c = Serial.read();
         if (c == '\n') { handle_cmd(rx_buf_usb); rx_buf_usb = ""; }
         else if (c != '\r') rx_buf_usb += c;
+        if (rx_buf_usb.length() > 512) rx_buf_usb = "";   // discard runaway line
     }
-    if (Serial0.available()) {
-        String rx = Serial0.readStringUntil('\n');
-        rx.trim();
-        if (rx.length() > 0) {
-            handle_cmd(rx);
-        }
+    // Non-blocking accumulator — readStringUntil() would stall the render loop
+    // for up to 1s whenever a line arrives torn (no newline yet in the buffer).
+    while (Serial0.available()) {
+        char c = Serial0.read();
+        if (c == '\n') { handle_cmd(rx_buf_uart); rx_buf_uart = ""; }
+        else if (c != '\r') rx_buf_uart += c;
+        if (rx_buf_uart.length() > 512) rx_buf_uart = "";  // discard runaway line
     }
 
     

@@ -86,12 +86,13 @@ The Pi runs a Flask server (`assistant_brains.py`) that:
 ### Provisioning System
 On first boot or touch-during-startup, the ESP32 enters AP mode and serves a captive portal where users can configure:
 - WiFi credentials
-- ADS-B server IP/port
 - Home location (lat/lon) for radar centering
-- GMT offset for clock
-- Default radar range
+- Timezone / GMT offset for clock
 
-Settings are stored in NVS flash via the `Settings` class.
+(The ADS-B server host/port and default radar range are compile-time constants
+in `include/config.h`, not portal fields.)
+
+Settings are stored in LittleFS (`/config.json`) via the `Settings` class.
 
 ## Critical Implementation Details
 
@@ -117,7 +118,7 @@ Touch gestures are detected in `process_swipe()`:
 - **Tap**: Select aircraft or dismiss detail box
 - **Vertical swipe**: Zoom in/out
 - **Horizontal swipe**: Switch between apps
-- Minimum threshold: 50 pixels to distinguish from tap
+- Thresholds: movement under `TAP_THRESHOLD` (20 px) is a tap; swipes register past `GESTURE_THRESHOLD` (10 px)
 
 ### Aircraft Aging System
 Aircraft blips use a two-stage aging system:

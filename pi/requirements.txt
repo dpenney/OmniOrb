@@ -1,0 +1,16 @@
+paho-mqtt
+requests
+flask
+pyserial
+esptool
+python-dotenv
+numpy
+google-genai
+pathvalidate
+webrtcvad
+onnxruntime
+tqdm
+scipy
+scikit-learn
+speexdsp
+openwakeword==0.4.0

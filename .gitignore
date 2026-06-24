@@ -7,7 +7,6 @@ include/config.h
 *.map
 waveshare_demo/
 waveshare_demo.zip
-build_log.txt
 
 # Pi Backend
 pi/venv/
@@ -28,9 +27,25 @@ ssh-copy-id*
 *.zip
 demo_c*/
 *.log
-*.txt
+build_log.txt
+*.log.txt
+diff_utf8.txt
+scratch/*.txt
 *.tar.gz
 .claude/settings.local.json
 pi/device_settings.json
 pi/private_memories.json
 pi/memory_store/
+
+# SSH Keys
+clean_key
+tachyon_key_fixed
+
+# Private / per-device
+pi/deploy_pi.py
+pi5_setup_plan.md
+scratch/*.py
+
+# KiCad backup history
+KiCad/**/.history/
+

@@ -87,7 +87,10 @@ AssistantView::AssistantStyle AssistantView::get_style() { return current_style;
 
 void AssistantView::toggle_style() {
     current_style = (current_style == STYLE_IRIS) ? STYLE_FACE : STYLE_IRIS;
-    // Reset incremental state for both styles so the new style starts clean
+    // Reset incremental state for both styles so the new style starts clean.
+    // visual_bins must be zeroed too: the face stores raw magnitudes (0..~60)
+    // while the iris expects normalized 0..1 — stale values draw wild lines.
+    for (int i = 0; i < 16; i++) visual_bins[i] = 0.0f;
     av_prev_glow_r = -1;
     memset(face_prev_bar_h, 0, sizeof(face_prev_bar_h));
     face_prev_mouth_y   = 0.0f;

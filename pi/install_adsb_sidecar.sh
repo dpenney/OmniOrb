@@ -20,8 +20,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
 Description=Private ADS-B Sidecar Proxy
-After=network.target assistant.service
-Requires=assistant.service
+After=network.target
 
 [Service]
 Type=simple

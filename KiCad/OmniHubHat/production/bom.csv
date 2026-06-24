@@ -1,0 +1,11 @@
+﻿Designator,Footprint,Quantity,Value,LCSC Part #
+C2,0603,1,.1uF,
+C3,0805,1,10uF,
+"C4, C5",C_0402,2,1nF,C1523
+ESP_32,JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical,1,UART_PWR,
+"FB1, FB2",FB_0603,2,~,C14709
+I2S_MICROPHONE1,JST_XH_B6B-XH-A_1x06_P2.50mm_Vertical,1,I2S Microphone,
+J1,PinSocket_2x20_P2.54mm_Vertical,1,GPIO,
+J2,"TerminalBlock_Phoenix_MPT-0,5-2-2.54_1x02_P2.54mm_Horizontal",1,Screw_Terminal_01x02,
+ROTARY_ENCODER1,JST_XH_B5B-XH-A_1x05_P2.50mm_Vertical,1,Conn_01x05_Pin,
+U2,TQFN-16-1EP_3x3mm_P0.5mm_EP1.23x1.23mm,1,MAX98357A,
