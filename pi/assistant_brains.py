@@ -1143,7 +1143,7 @@ def _speak_text_iter(text_iter):
 
     return piper_a or piper_b, ''.join(parts).strip()
 
-_TIMER_TOOL = types.Tool(function_declarations=[
+_funcs = [
     types.FunctionDeclaration(
         name="set_timer",
         description="Set a countdown timer that alerts the user when complete.",
@@ -1187,17 +1187,23 @@ _TIMER_TOOL = types.Tool(function_declarations=[
             properties={},
             required=[],
         )
-    ),
-    types.FunctionDeclaration(
-        name="describe_camera_view",
-        description="Capture a real-time image from the camera to see what is currently in front of the device. Use this whenever the user asks a question about what is in front of the device, what it is looking at, or asks for description of objects, people, or surroundings in the room.",
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={},
-            required=[],
+    )
+]
+
+if getattr(config, 'CAMERA_ENABLED', False):
+    _funcs.append(
+        types.FunctionDeclaration(
+            name="describe_camera_view",
+            description="Capture a real-time image from the camera to see what is currently in front of the device. Use this whenever the user asks a question about what is in front of the device, what it is looking at, or asks for description of objects, people, or surroundings in the room.",
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={},
+                required=[],
+            )
         )
     )
-]) if LLM_AVAILABLE else None
+
+_TIMER_TOOL = types.Tool(function_declarations=_funcs) if LLM_AVAILABLE else None
 
 # Transparent grounding: model retrieves via Google Search internally and returns
 # grounded text directly in the stream — no function_call parts exposed to the client.
