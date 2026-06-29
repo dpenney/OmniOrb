@@ -9,8 +9,8 @@ SERIAL_BAUD = 115200
 
 # GPIO Pins (BCM numbering)
 PIN_ROTARY_CLK = 27
-PIN_ROTARY_DT  = 17
-PIN_ROTARY_SW  = 22
+PIN_ROTARY_DT  = 22
+PIN_ROTARY_SW  = 17
 PIN_SFT_GND    = None  # Using real GND now
 
 # I2S Audio Pins (Standard Raspberry Pi I2S)
@@ -23,7 +23,7 @@ PIN_I2S_DOUT  = 21    # Speaker Data
 # Amp mute pin — set to a BCM GPIO number if your amp has a hardware mute/shutdown
 # pin (active HIGH = muted). The amp will be muted at startup and unmuted once the
 # wake word model finishes loading. Set to None to skip hardware mute.
-PIN_AMP_MUTE  = 13   # SD pin on amp — HIGH = enabled, LOW = shutdown/muted
+PIN_AMP_MUTE  = 26   # SD pin on amp — HIGH = enabled, LOW = shutdown/muted
 
 # UART Pins (Standard Raspberry Pi UART)
 PIN_UART_TX = 14
@@ -161,7 +161,7 @@ AEC_DELAY_SAMPLES = 1600   # 100ms pre-delay to compensate for aplay buffering l
 
 # VAD (Voice Activity Detection) — webrtcvad, 30ms frames at 16kHz
 VAD_AGGRESSIVENESS   = 1   # 0=permissive … 3=most aggressive noise filtering
-VAD_SILENCE_FRAMES    = 30  # 30 × 30ms = 0.9s of silence ends recording
+VAD_SILENCE_FRAMES    = 22  # 22 × 30ms = 0.66s of silence ends recording
 VAD_MIN_SPEECH_FRAMES = 12  # 12 × 30ms = 360ms of speech before silence cutoff arms
 
 # Wake word cooldown applied after LLM processing finishes (covers speaker echo)
@@ -181,6 +181,11 @@ ENCODER_POLL_SLEEP  = 0.001
 # Flask Configuration
 FLASK_HOST = '0.0.0.0'
 FLASK_PORT = 5005
+
+# Camera Configuration
+CAMERA_ENABLED = True
+CAMERA_CAPTURE_CMD = "rpicam-still -t 100 --immediate -n -o /tmp/last_capture.jpg"
+CAMERA_VISUAL_KEYWORDS = ["what is this", "what do you see", "describe", "look at", "what's this", "who is this", "can you see"]
 
 # Home Location — fallback defaults used until ESP32 sends GEO: over UART.
 # Set via the provisioning portal on first boot; persisted to device_settings.json.
@@ -223,8 +228,8 @@ The section below titled 'Personal Facts & Background' contains things you have 
 """
 
 LLM_RECORD_SECONDS = 10.0  # Hard cap — VAD will usually cut this much shorter
-CONTINUITY_TIMEOUT = 12.0 # Seconds the follow-up window stays active (Hard Max)
-CONTINUITY_SILENCE_TIMEOUT = 6.0 # Early exit if room is silent for this long
+CONTINUITY_TIMEOUT = 8.0 # Seconds the follow-up window stays active (Hard Max)
+CONTINUITY_SILENCE_TIMEOUT = 3.5 # Early exit if room is silent for this long
 
 # TTS Pronunciation Map
 # A dictionary of {word/pattern: replacement} used to fix Piper's mispronunciations.

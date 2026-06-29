@@ -24,9 +24,9 @@ Connect your components to the Raspberry Pi 4 using the following pins.
 ### 🎡 Rotary Encoder (Zoom Control)
 | Encoder Pin | Pi Pin Name | Physical Pin |
 | :--- | :--- | :--- |
-| **CLK** | GPIO 17 | **Pin 11** |
+| **CLK** | GPIO 27 | **Pin 13** |
 | **DT** | GPIO 22 | **Pin 15** |
-| **GND** | GPIO 27 | **Pin 13** (Software Ground) |
+| **SW (Button)** | GPIO 17 | **Pin 11** |
 
 ---
 

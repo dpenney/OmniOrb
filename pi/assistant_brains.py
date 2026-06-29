@@ -613,7 +613,7 @@ def interrupt_tts():
 
 _warm_pipers = deque()
 _warm_piper_lock = threading.Lock()
-_MAX_WARM_PIPERS = 3
+_MAX_WARM_PIPERS = 1
 
 def _spawn_piper():
     """Spawn a Piper process with the model already loaded, ready to receive text."""
@@ -935,6 +935,9 @@ _LEAK_STRIP = [
     re.compile(r'^.*?ALRIGHT, LET\'S GET THIS OVER WITH\.?\s*', re.IGNORECASE | re.DOTALL),
     re.compile(r'^.*?REMINDER:.*?(?:audio clip\.|answer\.)\s*', re.IGNORECASE | re.DOTALL),
     re.compile(r'^.*?OUTPUT FORMATTING RULES.*?\n', re.IGNORECASE | re.DOTALL),
+    re.compile(r'^(?:thought|elaboration|hook|constraints|draft|response|instructions)\b.*?\n', re.IGNORECASE),
+    re.compile(r'^\s*-\s+.*?\n', re.IGNORECASE),
+    re.compile(r'^\s*now i need to construct.*?\n', re.IGNORECASE),
 ]
 
 
@@ -1179,6 +1182,15 @@ _TIMER_TOOL = types.Tool(function_declarations=[
     types.FunctionDeclaration(
         name="get_weather",
         description="Fetch current weather conditions and a 3-day forecast for the user's location. Use ONLY for weather-specific questions. Do NOT call this for events, local happenings, or general 'what's going on' questions — use google_search grounding for those.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={},
+            required=[],
+        )
+    ),
+    types.FunctionDeclaration(
+        name="describe_camera_view",
+        description="Capture a real-time image from the camera to see what is currently in front of the device. Use this whenever the user asks a question about what is in front of the device, what it is looking at, or asks for description of objects, people, or surroundings in the room.",
         parameters=types.Schema(
             type="OBJECT",
             properties={},
@@ -1437,6 +1449,43 @@ def process_llm(audio_array, is_continuity=False):
                                 response={"status": "success", "data": w_data},
                                 id=fc.id
                             )))
+                        elif fc.name == "describe_camera_view":
+                            logger.info("Executing Tool: describe_camera_view")
+                            import camera_manager
+                            speak_text(random.choice([
+                                "Let me take a look.",
+                                "Capturing image.",
+                                "Checking my camera.",
+                                "Analyzing what is in front of me."
+                            ]))
+                            img_ok = camera_manager.capture_image("/tmp/last_capture.jpg")
+                            if img_ok:
+                                try:
+                                    with open("/tmp/last_capture.jpg", "rb") as f:
+                                        img_bytes = f.read()
+                                    fn_responses.append(types.Part(function_response=types.FunctionResponse(
+                                        name="describe_camera_view",
+                                        response={
+                                            "status": "success", 
+                                            "message": "Image captured successfully. Analyze this image to answer the user's request sardonically. You MUST start your response directly with the [TRANSCRIPT] tag, and output ONLY your final answer. Do NOT output any thought process, constraints, planning, draft, or instructions."
+                                        },
+                                        id=fc.id
+                                    )))
+                                    fn_responses.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
+                                    logger.info("Camera image attached to tool response.")
+                                except Exception as e:
+                                    logger.error(f"Error reading captured image: {e}")
+                                    fn_responses.append(types.Part(function_response=types.FunctionResponse(
+                                        name="describe_camera_view",
+                                        response={"status": "error", "message": f"Error reading captured image: {e}"},
+                                        id=fc.id
+                                    )))
+                            else:
+                                fn_responses.append(types.Part(function_response=types.FunctionResponse(
+                                    name="describe_camera_view",
+                                    response={"status": "error", "message": "Failed to capture image from camera hardware. Ensure it is connected and functional."},
+                                    id=fc.id
+                                )))
                         else:
                             # Built-in server-side tool (google_search).
                             # The API executes it internally; we get the grounded answer
@@ -1444,7 +1493,14 @@ def process_llm(audio_array, is_continuity=False):
                             logger.info(f"Server-side tool: {fc.name}")
                             has_server_call[0] = True
 
-                    if getattr(part, 'text', None):
+                    if getattr(part, 'thought', False):
+                        continue
+                    txt = getattr(part, 'text', None)
+                    if txt:
+                        # Skip if it's the model's internal thinking blocks
+                        txt_lower = txt.lower().strip()
+                        if txt_lower.startswith("thought") or txt_lower.startswith("- hook:") or txt_lower.startswith("- start with") or txt_lower.startswith("constraints:") or txt_lower.startswith("draft:"):
+                            continue
                         yield part.text
 
         with state_lock:
@@ -1484,7 +1540,13 @@ def process_llm(audio_array, is_continuity=False):
                     if not candidate.content or not candidate.content.parts:
                         continue
                     for part in candidate.content.parts:
-                        if getattr(part, 'text', None):
+                        if getattr(part, 'thought', False):
+                            continue
+                        txt = getattr(part, 'text', None)
+                        if txt:
+                            txt_lower = txt.lower().strip()
+                            if txt_lower.startswith("thought") or txt_lower.startswith("- hook:") or txt_lower.startswith("- start with") or txt_lower.startswith("constraints:") or txt_lower.startswith("draft:"):
+                                continue
                             yield part.text
 
             _, full_text = _speak_text_iter(_follow_iter())
@@ -1509,7 +1571,13 @@ def process_llm(audio_array, is_continuity=False):
                     if not candidate.content or not candidate.content.parts:
                         continue
                     for part in candidate.content.parts:
-                        if getattr(part, 'text', None):
+                        if getattr(part, 'thought', False):
+                            continue
+                        txt = getattr(part, 'text', None)
+                        if txt:
+                            txt_lower = txt.lower().strip()
+                            if txt_lower.startswith("thought") or txt_lower.startswith("- hook:") or txt_lower.startswith("- start with") or txt_lower.startswith("constraints:") or txt_lower.startswith("draft:"):
+                                continue
                             yield part.text
 
             _, full_text = _speak_text_iter(_search_follow_iter())
