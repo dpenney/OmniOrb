@@ -183,7 +183,7 @@ FLASK_HOST = '0.0.0.0'
 FLASK_PORT = 5005
 
 # Camera Configuration
-CAMERA_ENABLED = True
+CAMERA_ENABLED = False
 CAMERA_CAPTURE_CMD = "rpicam-still -t 100 --immediate -n -o /tmp/last_capture.jpg"
 CAMERA_VISUAL_KEYWORDS = ["what is this", "what do you see", "describe", "look at", "what's this", "who is this", "can you see"]
 
