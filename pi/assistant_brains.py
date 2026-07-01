@@ -1025,9 +1025,15 @@ def _speak_text_iter(text_iter):
                     _current_transcript = transcript
                 buf = buf[match.end():].lstrip()
                 logged_transcript = True
-            elif "]" in buf or ":" in buf or len(buf) > 300:
-                if not re.search(r'^\s*\[TRANSCRIPT\]', buf, re.IGNORECASE):
-                    logged_transcript = True
+            else:
+                # If "[TRANSCRIPT]" is not in the buffer (even partially or case-insensitively),
+                # and we have accumulated enough text, assume it's missing and proceed.
+                if "transcript" not in buf.lower():
+                    if len(buf) > 150:
+                        logged_transcript = True
+                else:
+                    if len(buf) > 500:
+                        logged_transcript = True
 
         while logged_transcript:
             m = _SENTENCE_END.search(buf)
@@ -2260,8 +2266,9 @@ def on_encoder_event(event, direction, value):
             if direction == "CW": send_uart_command("T+")
             else: send_uart_command("T-")
         elif m in ("ASSISTANT", "SPEAKING", "CONTINUITY"):
-            # Style Toggle Logic
-            send_uart_command("STYLE:TOGGLE")
+            # Volume Adjustment
+            if direction == "CW": send_uart_command("V+")
+            else: send_uart_command("V-")
         elif m == "SETTINGS":
             # Volume Adjustment in Settings
             if direction == "CW": send_uart_command("V+")
