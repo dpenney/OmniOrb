@@ -2,6 +2,9 @@ import logging
 import threading
 import time
 import os
+import io
+import wave
+import random
 import re
 import numpy as np
 import subprocess
@@ -23,6 +26,8 @@ except ImportError:
 import config
 
 logger = logging.getLogger(__name__)
+
+_TRANS_PATTERN = re.compile(r"\[TRANSCRIPT\]", re.IGNORECASE)
 
 class LLMEngine:
     def __init__(self, callbacks):
@@ -72,20 +77,20 @@ class LLMEngine:
                 self.callbacks.get("set_current_transcript", lambda x: None)('')
             interaction_transcript = ''
             user_msg = f'[Current Context: {self.callbacks.get("get_context", lambda *a, **k: "No context data")()}]'
-            if is_continuity and _last_assistant_response:
-                user_msg += f'\n[Your previous response was: "{_last_assistant_response}". The user is now following up.]'
+            if is_continuity and self.callbacks.get("get_last_assistant_response", lambda: "")():
+                user_msg += f'\n[Your previous response was: "{self.callbacks.get("get_last_assistant_response", lambda: "")()}". The user is now following up.]'
             logger.info('LLM SYSTEM PROMPT: %s', config.LLM_SYSTEM_PROMPT)
             logger.info('LLM USER MESSAGE: %s', user_msg)
             audio_part = types.Part.from_bytes(data=wav_bytes, mime_type='audio/wav')
-            cache_id = memory_manager.cache_id if memory_manager else None
-            full_instr = memory_manager.full_system_instruction if memory_manager else config.LLM_SYSTEM_PROMPT
+            cache_id = self.callbacks.get("get_memory_manager", lambda: None)().cache_id if self.callbacks.get("get_memory_manager", lambda: None)() else None
+            full_instr = self.callbacks.get("get_memory_manager", lambda: None)().full_system_instruction if self.callbacks.get("get_memory_manager", lambda: None)() else config.LLM_SYSTEM_PROMPT
             _tool_cfg = types.ToolConfig(include_server_side_tool_invocations=True)
             if cache_id:
                 logger.info('Using Context Cache: %s', cache_id)
-                gen_cfg = types.GenerateContentConfig(cached_content=cache_id, tools=_ALL_TOOLS, tool_config=_tool_cfg)
+                gen_cfg = types.GenerateContentConfig(cached_content=cache_id, tools=self.callbacks.get("get_all_tools", lambda: [])(), tool_config=_tool_cfg)
             else:
                 logger.info('Using Full System Instruction (No Cache)')
-                gen_cfg = types.GenerateContentConfig(system_instruction=full_instr, tools=_ALL_TOOLS, tool_config=_tool_cfg)
+                gen_cfg = types.GenerateContentConfig(system_instruction=full_instr, tools=self.callbacks.get("get_all_tools", lambda: [])(), tool_config=_tool_cfg)
             pending_timers = []
             fn_responses = []
             model_parts = []
@@ -120,10 +125,10 @@ class LLMEngine:
                                 result_holder = [False, 'Timed out']
 
                                 def _run_email():
-                                    result_holder[0], result_holder[1] = _send_email_task(subject, body)
+                                    result_holder[0], result_holder[1] = self.callbacks.get("send_email_task", lambda s, b: (False, "unimplemented"))(subject, body)
                                 t = threading.Thread(target=_run_email, daemon=True)
                                 t.start()
-                                speak_text(random.choice(['Routing that to your inbox.', 'Dispatching to your email now.', 'Transmitting to your inbox.', 'Sending that to your email.']))
+                                self.callbacks.get("speak_text", lambda x: None)(random.choice(['Routing that to your inbox.', 'Dispatching to your email now.', 'Transmitting to your inbox.', 'Sending that to your email.']))
                                 t.join(timeout=15)
                                 email_ok = result_holder[0]
                                 email_msg = result_holder[1]
@@ -136,7 +141,7 @@ class LLMEngine:
                             elif fc.name == 'describe_camera_view':
                                 logger.info('Executing Tool: describe_camera_view')
                                 import camera_manager
-                                speak_text(random.choice(['Let me take a look.', 'Capturing image.', 'Checking my camera.', 'Analyzing what is in front of me.']))
+                                self.callbacks.get("speak_text", lambda x: None)(random.choice(['Let me take a look.', 'Capturing image.', 'Checking my camera.', 'Analyzing what is in front of me.']))
                                 img_ok = camera_manager.capture_image('/tmp/last_capture.jpg')
                                 if img_ok:
                                     try:
@@ -164,7 +169,7 @@ class LLMEngine:
             with self.callbacks.get("get_state_lock", threading.Lock)():
                 self.callbacks.get("get_state_dict", lambda: {})()['status'] = 'SPEAKING'
             self.callbacks.get("send_uart_command", lambda x: None)('APP:SPEAKING')
-            _, first_text = _speak_text_iter(_first_iter())
+            _, first_text = self.callbacks.get("speak_text_iter", lambda x: ([], ""))(_first_iter())
             with self.callbacks.get("get_transcript_lock", threading.Lock)():
                 interaction_transcript = self.callbacks.get("get_current_transcript", lambda: "")()
             if self.callbacks.get("get_tts_abort_event", threading.Event)().is_set():
@@ -189,7 +194,7 @@ class LLMEngine:
                                 if txt_lower.startswith('thought') or txt_lower.startswith('- hook:') or txt_lower.startswith('- start with') or txt_lower.startswith('constraints:') or txt_lower.startswith('draft:'):
                                     continue
                                 yield part.text
-                _, full_text = _speak_text_iter(_follow_iter())
+                _, full_text = self.callbacks.get("speak_text_iter", lambda x: ([], ""))(_follow_iter())
             elif has_server_call[0]:
                 logger.info('google_search fired — follow-up stream for grounded response.')
                 stream2 = self.client.models.generate_content_stream(model=config.LLM_MODEL, contents=[audio_part, user_msg, types.Content(role='model', parts=model_parts)], config=gen_cfg)
@@ -210,7 +215,7 @@ class LLMEngine:
                                 if txt_lower.startswith('thought') or txt_lower.startswith('- hook:') or txt_lower.startswith('- start with') or txt_lower.startswith('constraints:') or txt_lower.startswith('draft:'):
                                     continue
                                 yield part.text
-                _, full_text = _speak_text_iter(_search_follow_iter())
+                _, full_text = self.callbacks.get("speak_text_iter", lambda x: ([], ""))(_search_follow_iter())
                 if not full_text:
                     logger.warning('google_search follow-up returned no text.')
                     full_text = first_text
@@ -221,32 +226,32 @@ class LLMEngine:
             display_text = ''
             if full_text:
                 display_text = _TRANS_PATTERN.sub('', full_text).strip()
-                _last_assistant_response = display_text
+                self.callbacks.get("set_last_assistant_response", lambda x: None)(display_text)
                 logger.info('LLM answer: %s', display_text)
                 self.callbacks.get("send_uart_command", lambda x: None)(f"TXT|{display_text.replace(chr(10), ' ')}")
                 with self.callbacks.get("get_transcript_lock", threading.Lock)():
                     final_trans = self.callbacks.get("get_current_transcript", lambda: "")()
-                if memory_manager:
-                    threading.Thread(target=memory_manager.add_interaction, args=(final_trans or '(no transcript)', display_text), daemon=True).start()
-                if _memory and final_trans:
+                if self.callbacks.get("get_memory_manager", lambda: None)():
+                    threading.Thread(target=self.callbacks.get("get_memory_manager", lambda: None)().add_interaction, args=(final_trans or '(no transcript)', display_text), daemon=True).start()
+                if self.callbacks.get("get_memory", lambda: None)() and final_trans:
 
                     def _store_mem_bg(txt):
                         try:
-                            _memory.add(txt, user_id='primary_user')
+                            self.callbacks.get("get_memory", lambda: None)().add(txt, user_id='primary_user')
                             logger.info('Turn committed to long-term memory (background).')
                         except Exception as e:
                             logger.warning('Memory storage failed: %s', e)
                     threading.Thread(target=_store_mem_bg, args=(final_trans,), daemon=True).start()
             with self.callbacks.get("get_state_lock", threading.Lock)():
-                is_slp = assistant_state.get('is_sleeping', False)
+                is_slp = self.callbacks.get("get_state", lambda k, d: d)('is_sleeping', False)
             if is_slp:
                 with self.callbacks.get("get_state_lock", threading.Lock)():
                     self.callbacks.get("get_state_dict", lambda: {})()['status'] = 'IDLE'
-                global _volume
-                with _volume_lock:
-                    _volume = 0
+                
+                if True:
+                    self.callbacks.get("mute_volume", lambda: None)()
                 logger.info('Sleep Mode active: Muting volume and bypassing continuity.')
-            elif not is_exit_command(interaction_transcript) and (not is_exit_command(display_text)):
+            elif not self.callbacks.get("is_exit_command", lambda x: False)(interaction_transcript) and (not self.callbacks.get("is_exit_command", lambda x: False)(display_text)):
                 with self.callbacks.get("get_state_lock", threading.Lock)():
                     self.callbacks.get("get_state_dict", lambda: {})()['status'] = 'CONTINUITY'
                     self.callbacks.get("get_state_dict", lambda: {})()['continuity_until'] = time.time() + config.CONTINUITY_TIMEOUT
@@ -260,12 +265,12 @@ class LLMEngine:
         except Exception as e:
             logger.error('LLM pipeline error: %s', e)
             self.callbacks.get("send_uart_command", lambda x: None)('TXT|Sorry, I had an error.')
-            speak_text('Sorry, I had an error.')
+            self.callbacks.get("speak_text", lambda x: None)('Sorry, I had an error.')
             with self.callbacks.get("get_state_lock", threading.Lock)():
                 self.callbacks.get("get_state_dict", lambda: {})()['status'] = 'IDLE'
             self.callbacks.get("send_uart_command", lambda x: None)('APP: ASSISTANT')
         finally:
-            _tts_active.clear()
+            self.callbacks.get("clear_tts_active", lambda: None)()
             with self.callbacks.get("get_state_lock", threading.Lock)():
                 self.callbacks.get("get_state_dict", lambda: {})()['processing'] = False
                 self.callbacks.get("get_state_dict", lambda: {})()['wakeword_cooldown_until'] = time.time() + config.WAKEWORD_POST_LLM_COOLDOWN

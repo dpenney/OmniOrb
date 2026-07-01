@@ -1600,6 +1600,16 @@ if __name__ == "__main__":
     # so we no longer need to launch it as a subprocess here.
 
 
+
+def _mute_volume():
+    global _volume
+    with _volume_lock:
+        _volume = 0
+
+def _set_last_resp(txt):
+    global _last_assistant_response
+    _last_assistant_response = txt
+
     llm_callbacks = {
         "get_state_dict": lambda: assistant_state,
         "get_state_lock": lambda: state_lock,
@@ -1615,7 +1625,20 @@ if __name__ == "__main__":
         "get_context": get_context,
         "globe_search": globe_search,
         "set_sleep_mode": _set_sleep_mode,
-        "set_timer": set_timer
+        "set_timer": set_timer,
+        "get_last_assistant_response": lambda: _last_assistant_response,
+        "set_last_assistant_response": _set_last_resp,
+        "get_memory_manager": lambda: memory_manager,
+        "get_all_tools": lambda: _ALL_TOOLS,
+        "send_email_task": _send_email_task,
+        "speak_text": speak_text,
+        "speak_text_iter": _speak_text_iter,
+        "get_memory": lambda: _memory,
+        "is_exit_command": is_exit_command,
+        "clear_tts_active": _tts_active.clear,
+        "get_state": lambda k, d: assistant_state.get(k, d),
+        "mute_volume": _mute_volume,
+
     }
     llm_engine = LLMEngine(llm_callbacks)
 
