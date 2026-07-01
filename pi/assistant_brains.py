@@ -377,6 +377,112 @@ def _apply_wifi(ssid, pwd):
     except Exception as e:
         logger.error("Failed to apply Wi-Fi: %s", e)
 
+def handle_uart_message(line):
+    if line.startswith("GEO:"):
+        # Format: GEO:lat,lon,tz  (tz is an IANA string, may contain /)
+        parts = line[4:].split(",", 2)
+        if len(parts) == 3:
+            try:
+                lat, lon, tz = float(parts[0]), float(parts[1]), parts[2].strip()
+                _save_device_settings(lat, lon, tz)
+                # Bust weather cache so next query uses new location
+                with _weather_cache_lock:
+                    _weather_cache["fetched_at"] = 0
+            except ValueError:
+                logger.warning("Bad GEO message: %s", line)
+    elif line == "INTERRUPT":
+        logger.info("[ESP32] Tap interrupt received")
+        interrupt_tts()
+        send_uart_command("APP: ASSISTANT")
+    elif line == "DIAG?":
+        # Send diagnostic payload
+        with state_lock:
+            mic_val   = assistant_state.get("audio_intensity", 0)
+            is_proc   = assistant_state.get("processing", False)
+            last_w_at = assistant_state.get("last_wakeword_at", 0)
+            is_ready  = assistant_state.get("oww_ready", False)
+            last_diag = assistant_state.get("last_diag_at", 0)
+
+        last_w = datetime.fromtimestamp(last_w_at).strftime('%I:%M:%S %p') if last_w_at > 0 else "NEVER"
+        ww_stat = "READY" if is_ready else "NOT LOADED"
+        if is_proc: ww_stat = "PROC"
+                        
+        # WiFi RSSI (approximate or placeholder if not easily reachable in this thread)
+        try:
+            with open("/proc/net/wireless", "r") as f:
+                lines = f.readlines()
+                if len(lines) > 2:
+                    rssi = int(float(lines[2].split()[3]))
+                else:
+                    rssi = -50
+        except Exception:
+            rssi = -50
+                        
+        # Throttle diag updates to 1Hz
+        now = time.time()
+        if now - last_diag >= 1.0:
+            diag_msg = f"DIAG:mic={mic_val},ww={ww_stat},pi=OK,rssi={rssi},wake={last_w}"
+            send_uart_command(diag_msg)
+            with state_lock:
+                assistant_state["last_diag_at"] = now
+    elif line.startswith("VOL:"):
+        try:
+            global _volume
+            val = int(line[4:])
+            vol_max = getattr(config, 'VOLUME_MAX', 100)
+            with _volume_lock:
+                _volume = max(0, min(vol_max, val))
+            logger.info("[ESP32] Volume → %s", _volume)
+        except ValueError:
+            logger.warning("Bad VOL message: %s", line)
+    elif line.startswith("TIMER:DONE:"):
+        label = line[len("TIMER:DONE:"):]
+        logger.info("[ESP32] Timer done: '%s'", label)
+        threading.Thread(target=_handle_timer_done, args=(label,), daemon=True).start()
+    elif line.startswith("WIFI:"):
+        payload = line[5:]
+        if '|' in payload:
+            ssid, pwd = payload.split('|', 1)
+            threading.Thread(target=_apply_wifi, args=(ssid, pwd), daemon=True).start()
+    elif line.startswith("APP:"):
+        # Prefix match only — substring matching ("APP:" in line) would
+        # misfire on firmware debug lines that mention APP: mid-string.
+        parts = line[4:].split()
+        if parts:
+            app_mode = parts[0]
+            with state_lock:
+                assistant_state["current_app"] = app_mode
+                assistant_state["mic_active"] = (app_mode == "ASSISTANT" or app_mode == "SPEAKING" or app_mode == "CONTINUITY")
+                assistant_state["radar_active"] = (app_mode == "RADAR")
+            logger.info(f"[ESP32] {line} → app={app_mode}, mic_active={assistant_state['mic_active']}")
+            if app_mode == "GLOBE":
+                # Push latest POIs whenever the user flips to globe view
+                threading.Thread(target=lambda: send_uart_command(f"GLOBE:POIS:{globe_manager.get_pois_serial()}")).start()
+    elif line.startswith("WIFI_STATUS:"):
+        try:
+            # Format: WIFI_STATUS:3,RSSI:-55,IP:192.168.4.42
+            parts = line.split(",")
+            status_val = int(parts[0].split(":")[1])
+            ip_val = ""
+            for part in parts:
+                if part.startswith("IP:"):
+                    ip_val = part.split(":")[1]
+            if status_val == 3 and ip_val and ip_val != "0.0.0.0":
+                tachyon_ip = get_local_ip()
+                send_uart_command(f"TACHYON_IP:{tachyon_ip}")
+        except Exception as ex:
+            logger.warning(f"Bad WIFI_STATUS parsing: {line} - {ex}")
+    elif line == "HB:ACK":
+        # ESP32 acknowledged our heartbeat
+        pass
+
+    # Log ALL traffic to the raw UART log (WiFi credentials redacted)
+    log_line = "WIFI:<redacted>" if line.startswith("WIFI:") else line
+    uart_logger.debug(log_line)
+
+    if line != "DIAG?" and not line.startswith("DIAG:"):
+        logger.info("[ESP32] %s", log_line)
+
 def serial_reader():
     while True:
         try:
@@ -386,110 +492,7 @@ def serial_reader():
                         line = ser.readline().decode('utf-8', errors='ignore').strip()
                     if not line:
                         break
-                    if line.startswith("GEO:"):
-                        # Format: GEO:lat,lon,tz  (tz is an IANA string, may contain /)
-                        parts = line[4:].split(",", 2)
-                        if len(parts) == 3:
-                            try:
-                                lat, lon, tz = float(parts[0]), float(parts[1]), parts[2].strip()
-                                _save_device_settings(lat, lon, tz)
-                                # Bust weather cache so next query uses new location
-                                with _weather_cache_lock:
-                                    _weather_cache["fetched_at"] = 0
-                            except ValueError:
-                                logger.warning("Bad GEO message: %s", line)
-                    elif line == "INTERRUPT":
-                        logger.info("[ESP32] Tap interrupt received")
-                        interrupt_tts()
-                        send_uart_command("APP: ASSISTANT")
-                    elif line == "DIAG?":
-                        # Send diagnostic payload
-                        with state_lock:
-                            mic_val   = assistant_state.get("audio_intensity", 0)
-                            is_proc   = assistant_state.get("processing", False)
-                            last_w_at = assistant_state.get("last_wakeword_at", 0)
-                            is_ready  = assistant_state.get("oww_ready", False)
-                            last_diag = assistant_state.get("last_diag_at", 0)
-
-                        last_w = datetime.fromtimestamp(last_w_at).strftime('%I:%M:%S %p') if last_w_at > 0 else "NEVER"
-                        ww_stat = "READY" if is_ready else "NOT LOADED"
-                        if is_proc: ww_stat = "PROC"
-                        
-                        # WiFi RSSI (approximate or placeholder if not easily reachable in this thread)
-                        try:
-                            with open("/proc/net/wireless", "r") as f:
-                                lines = f.readlines()
-                                if len(lines) > 2:
-                                    rssi = int(float(lines[2].split()[3]))
-                                else:
-                                    rssi = -50
-                        except Exception:
-                            rssi = -50
-                        
-                        # Throttle diag updates to 1Hz
-                        now = time.time()
-                        if now - last_diag >= 1.0:
-                            diag_msg = f"DIAG:mic={mic_val},ww={ww_stat},pi=OK,rssi={rssi},wake={last_w}"
-                            send_uart_command(diag_msg)
-                            with state_lock:
-                                assistant_state["last_diag_at"] = now
-                    elif line.startswith("VOL:"):
-                        try:
-                            global _volume
-                            val = int(line[4:])
-                            vol_max = getattr(config, 'VOLUME_MAX', 100)
-                            with _volume_lock:
-                                _volume = max(0, min(vol_max, val))
-                            logger.info("[ESP32] Volume → %s", _volume)
-                        except ValueError:
-                            logger.warning("Bad VOL message: %s", line)
-                    elif line.startswith("TIMER:DONE:"):
-                        label = line[len("TIMER:DONE:"):]
-                        logger.info("[ESP32] Timer done: '%s'", label)
-                        threading.Thread(target=_handle_timer_done, args=(label,), daemon=True).start()
-                    elif line.startswith("WIFI:"):
-                        payload = line[5:]
-                        if '|' in payload:
-                            ssid, pwd = payload.split('|', 1)
-                            threading.Thread(target=_apply_wifi, args=(ssid, pwd), daemon=True).start()
-                    elif line.startswith("APP:"):
-                        # Prefix match only — substring matching ("APP:" in line) would
-                        # misfire on firmware debug lines that mention APP: mid-string.
-                        parts = line[4:].split()
-                        if parts:
-                            app_mode = parts[0]
-                            with state_lock:
-                                assistant_state["current_app"] = app_mode
-                                assistant_state["mic_active"] = (app_mode == "ASSISTANT" or app_mode == "SPEAKING" or app_mode == "CONTINUITY")
-                                assistant_state["radar_active"] = (app_mode == "RADAR")
-                            logger.info(f"[ESP32] {line} → app={app_mode}, mic_active={assistant_state['mic_active']}")
-                            if app_mode == "GLOBE":
-                                # Push latest POIs whenever the user flips to globe view
-                                threading.Thread(target=lambda: send_uart_command(f"GLOBE:POIS:{globe_manager.get_pois_serial()}")).start()
-                    elif line.startswith("WIFI_STATUS:"):
-                        try:
-                            # Format: WIFI_STATUS:3,RSSI:-55,IP:192.168.4.42
-                            parts = line.split(",")
-                            status_val = int(parts[0].split(":")[1])
-                            ip_val = ""
-                            for part in parts:
-                                if part.startswith("IP:"):
-                                    ip_val = part.split(":")[1]
-                            if status_val == 3 and ip_val and ip_val != "0.0.0.0":
-                                tachyon_ip = get_local_ip()
-                                send_uart_command(f"TACHYON_IP:{tachyon_ip}")
-                        except Exception as ex:
-                            logger.warning(f"Bad WIFI_STATUS parsing: {line} - {ex}")
-                    elif line == "HB:ACK":
-                        # ESP32 acknowledged our heartbeat
-                        pass
-
-                    # Log ALL traffic to the raw UART log (WiFi credentials redacted)
-                    log_line = "WIFI:<redacted>" if line.startswith("WIFI:") else line
-                    uart_logger.debug(log_line)
-
-                    if line != "DIAG?" and not line.startswith("DIAG:"):
-                        logger.info("[ESP32] %s", log_line)
+                    handle_uart_message(line)
         except Exception as e:
             logger.error("Serial read error: %s", e)
             reconnect_serial()
