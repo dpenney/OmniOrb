@@ -1599,6 +1599,40 @@ if __name__ == "__main__":
     # The ADS-B proxy is now managed as a standalone systemd service (adsb_sidecar)
     # so we no longer need to launch it as a subprocess here.
 
+
+    llm_callbacks = {
+        "get_state_dict": lambda: assistant_state,
+        "get_state_lock": lambda: state_lock,
+        "send_uart_command": send_uart_command,
+        "speak_filler": speak_filler,
+        "tts_clean": _tts_clean,
+        "spawn_piper": _spawn_piper,
+        "get_tts_abort_event": lambda: _tts_abort,
+        "get_transcript_lock": lambda: _transcript_lock,
+        "get_current_transcript": lambda: _current_transcript,
+        "get_weather": get_weather,
+        "get_local_time": lambda: time.strftime("%I:%M %p"),
+        "get_context": get_context,
+        "globe_search": globe_search,
+        "set_sleep_mode": _set_sleep_mode,
+        "set_timer": set_timer
+    }
+    llm_engine = LLMEngine(llm_callbacks)
+
+    audio_callbacks = {
+        "apply_audio_routing": _apply_audio_routing,
+        "amp_enable": _amp_enable,
+        "start_persistent_output": _start_persistent_output,
+        "warmup_piper": _warmup_piper,
+        "process_llm": llm_engine.process_audio,
+        "get_state": lambda k, d: assistant_state.get(k, d),
+        "get_state_dict": lambda: assistant_state,
+        "get_state_lock": lambda: state_lock,
+        "send_uart_command": send_uart_command
+    }
+    audio_engine = AudioEngine(audio_callbacks)
+    audio_engine.start()
+
     reader_thread = threading.Thread(target=serial_reader, daemon=True)
     reader_thread.start()
     logger.info("Serial reader thread started")
