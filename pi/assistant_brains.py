@@ -152,9 +152,9 @@ def _load_device_settings():
                 stored = _json.load(f)
             with _device_settings_lock:
                 _device_settings.update(stored)
-            logger.info(f"Loaded device settings: {_device_settings}")
+            logger.info("Loaded device settings: %s", _device_settings)
     except Exception as e:
-        logger.warning(f"Could not load device_settings.json: {e}")
+        logger.warning("Could not load device_settings.json: %s", e)
 
 def _save_device_settings(lat, lon, tz):
     """Persist location/tz to disk and update in-memory state."""
@@ -166,9 +166,9 @@ def _save_device_settings(lat, lon, tz):
     try:
         with open(_SETTINGS_FILE, "w") as f:
             _json.dump(data, f)
-        logger.info(f"Device settings saved: {data}")
+        logger.info("Device settings saved: %s", data)
     except Exception as e:
-        logger.error(f"Could not save device_settings.json: {e}")
+        logger.error("Could not save device_settings.json: %s", e)
 
 # State
 assistant_state = {
@@ -261,7 +261,7 @@ def _init_mem0():
         _memory = Memory.from_config(_mem_config)
         logger.info("Mem0 long-term memory initialized with Local Chroma store.")
     except Exception as e:
-        logger.error(f"Failed to initialize Mem0: {e}")
+        logger.error("Failed to initialize Mem0: %s", e)
         _memory = None
 
 threading.Thread(target=_init_mem0, daemon=True).start()
@@ -275,7 +275,7 @@ def init_memory_manager():
             memory_manager = MemoryManager(client)
             logger.info("MemoryManager initialized in background.")
     except Exception as e:
-        logger.error(f"Failed to initialize MemoryManager: {e}")
+        logger.error("Failed to initialize MemoryManager: %s", e)
 
 # Start memory initialization in the background to avoid blocking boot
 threading.Thread(target=init_memory_manager, daemon=True).start()
@@ -297,7 +297,7 @@ for port in serial_ports:
     try:
         if os.path.exists(port):
             ser = serial.Serial(port, config.SERIAL_BAUD, timeout=1, write_timeout=1)
-            logger.info(f"Connected to Serial Port: {port}")
+            logger.info("Connected to Serial Port: %s", port)
             break
     except Exception as e:
         logger.error(f"Failed to connect to {port}: {e}")
@@ -337,7 +337,7 @@ def reconnect_serial():
             try:
                 if os.path.exists(port):
                     ser = serial.Serial(port, config.SERIAL_BAUD, timeout=1, write_timeout=1)
-                    logger.info(f"Serial reconnected on {port}")
+                    logger.info("Serial reconnected on %s", port)
                     return
             except Exception as e:
                 logger.error(f"Reconnect failed on {port}: {e}")
@@ -361,9 +361,9 @@ def send_uart_command(cmd):
                 global _last_uart_send_at
                 _last_uart_send_at = time.time()
                 if not (cmd.startswith("S") and "," in cmd) and not (cmd.startswith("A") and cmd[1:2].isdigit()) and not cmd.startswith("DIAG:"):
-                    logger.info(f"Sent UART: {cmd}")
+                    logger.info("Sent UART: %s", cmd)
     except Exception as e:
-        logger.error(f"UART send error: {e}")
+        logger.error("UART send error: %s", e)
         reconnect_serial()
 def _apply_wifi(ssid, pwd):
     try:
@@ -372,10 +372,10 @@ def _apply_wifi(ssid, pwd):
             shell=True, text=True
         ).strip()
         if current_ssid != ssid:
-            logger.info(f"Applying new Wi-Fi credentials for SSID: {ssid}")
+            logger.info("Applying new Wi-Fi credentials for SSID: %s", ssid)
             subprocess.run(['sudo', 'nmcli', 'dev', 'wifi', 'connect', ssid, 'password', pwd])
     except Exception as e:
-        logger.error(f"Failed to apply Wi-Fi: {e}")
+        logger.error("Failed to apply Wi-Fi: %s", e)
 
 def serial_reader():
     while True:
@@ -397,7 +397,7 @@ def serial_reader():
                                 with _weather_cache_lock:
                                     _weather_cache["fetched_at"] = 0
                             except ValueError:
-                                logger.warning(f"Bad GEO message: {line}")
+                                logger.warning("Bad GEO message: %s", line)
                     elif line == "INTERRUPT":
                         logger.info("[ESP32] Tap interrupt received")
                         interrupt_tts()
@@ -440,12 +440,12 @@ def serial_reader():
                             vol_max = getattr(config, 'VOLUME_MAX', 100)
                             with _volume_lock:
                                 _volume = max(0, min(vol_max, val))
-                            logger.info(f"[ESP32] Volume → {_volume}")
+                            logger.info("[ESP32] Volume → %s", _volume)
                         except ValueError:
-                            logger.warning(f"Bad VOL message: {line}")
+                            logger.warning("Bad VOL message: %s", line)
                     elif line.startswith("TIMER:DONE:"):
                         label = line[len("TIMER:DONE:"):]
-                        logger.info(f"[ESP32] Timer done: '{label}'")
+                        logger.info("[ESP32] Timer done: '%s'", label)
                         threading.Thread(target=_handle_timer_done, args=(label,), daemon=True).start()
                     elif line.startswith("WIFI:"):
                         payload = line[5:]
@@ -489,9 +489,9 @@ def serial_reader():
                     uart_logger.debug(log_line)
 
                     if line != "DIAG?" and not line.startswith("DIAG:"):
-                        logger.info(f"[ESP32] {log_line}")
+                        logger.info("[ESP32] %s", log_line)
         except Exception as e:
-            logger.error(f"Serial read error: {e}")
+            logger.error("Serial read error: %s", e)
             reconnect_serial()
             time.sleep(1)
         time.sleep(config.SERIAL_READER_SLEEP)
@@ -574,13 +574,13 @@ def _start_persistent_output():
                 except Exception as e:
                     # aplay died or the pipe broke — respawn instead of letting the
                     # feeder thread die (which would leave all future TTS silent).
-                    logger.error(f"Persistent audio output broke ({e}) — respawning aplay")
+                    logger.error("Persistent audio output broke (%s) — respawning aplay", e)
                     try:
                         with _audio_lock:
                             _spawn_aplay()
                         logger.info("aplay respawned")
                     except Exception as respawn_err:
-                        logger.error(f"aplay respawn failed: {respawn_err}")
+                        logger.error("aplay respawn failed: %s", respawn_err)
                         time.sleep(1.0)
                     next_write = time.monotonic()
                     continue
@@ -635,11 +635,11 @@ def _warmup_piper():
         with _warm_piper_lock:
             if len(_warm_pipers) < _MAX_WARM_PIPERS:
                 _warm_pipers.append(p)
-                logger.info(f"Piper warm standby ready (pool size: {len(_warm_pipers)})")
+                logger.info("Piper warm standby ready (pool size: %s)", len(_warm_pipers))
             else:
                 p.kill() # Pool is already full
     except Exception as e:
-        logger.error(f"Piper warmup failed: {e}")
+        logger.error("Piper warmup failed: %s", e)
 
 def _get_piper():
     """Return a warm Piper process (or cold-start one if standby isn't ready).
@@ -731,7 +731,7 @@ def get_weather():
         logger.info("Weather updated.")
         return summary
     except Exception as e:
-        logger.warning(f"Weather fetch failed: {e}")
+        logger.warning("Weather fetch failed: %s", e)
         return "Weather data unavailable."
 
 def get_context():
@@ -788,13 +788,13 @@ def speak_text(text):
         fwd.start()
         fwd.join()
     except Exception as e:
-        logger.error(f"speak_text error: {e}")
+        logger.error("speak_text error: %s", e)
 
 def _handle_timer_done(label):
     """Called when ESP32 sends TIMER:DONE — announce completion."""
     with _active_timers_lock:
         _active_timers.pop(label, None)
-    logger.info(f"Timer fired (ESP32): '{label}'")
+    logger.info("Timer fired (ESP32): '%s'", label)
     clean = re.sub(r'\s*timer\s*$', '', label, flags=re.IGNORECASE).strip()
     speak_text(f"{clean} timer is done." if clean else "Timer complete.")
     send_uart_command("APP: ASSISTANT")
@@ -1020,7 +1020,7 @@ def _speak_text_iter(text_iter):
             match = _TRANS_PATTERN.search(buf)
             if match:
                 transcript = match.group(1)
-                logger.info(f"[USER TRANSCRIPT]: {transcript}")
+                logger.info("[USER TRANSCRIPT]: %s", transcript)
                 with _transcript_lock:
                     _current_transcript = transcript
                 buf = buf[match.end():].lstrip()
@@ -1259,7 +1259,7 @@ def _send_email_task(subject, body):
         logger.info(f"Email sent successfully to {recipient} via {server_addr} (user: {user})")
         return True, "Email sent successfully."
     except Exception as e:
-        logger.error(f"Failed to send email: {e}")
+        logger.error("Failed to send email: %s", e)
         return False, f"Failed: {e}"
 
 
@@ -1280,7 +1280,7 @@ def _set_sleep_mode(enabled):
         send_uart_command("SLEEP:1")
         with state_lock:
             assistant_state["is_sleeping"] = True
-        logger.info(f"Device entering SLEEP mode (Volume {_prev_volume} -> 0)")
+        logger.info("Device entering SLEEP mode (Volume %s -> 0)", _prev_volume)
     else:
         if not already_sleeping: return
         # Restore volume
@@ -1291,7 +1291,7 @@ def _set_sleep_mode(enabled):
             assistant_state["is_sleeping"] = False
         
         send_uart_command("SLEEP:0")
-        logger.info(f"Device WAKING UP from sleep mode (Volume -> {_volume})")
+        logger.info("Device WAKING UP from sleep mode (Volume -> %s)", _volume)
 
 
 
@@ -1363,8 +1363,8 @@ def process_llm(audio_array, is_continuity=False):
 
 
         # Log exactly what is being sent to the AI
-        logger.info(f"LLM SYSTEM PROMPT: {config.LLM_SYSTEM_PROMPT}")
-        logger.info(f"LLM USER MESSAGE: {user_msg}")
+        logger.info("LLM SYSTEM PROMPT: %s", config.LLM_SYSTEM_PROMPT)
+        logger.info("LLM USER MESSAGE: %s", user_msg)
 
         audio_part = types.Part.from_bytes(data=wav_bytes, mime_type='audio/wav')
         
@@ -1374,7 +1374,7 @@ def process_llm(audio_array, is_continuity=False):
         
         _tool_cfg = types.ToolConfig(include_server_side_tool_invocations=True)
         if cache_id:
-            logger.info(f"Using Context Cache: {cache_id}")
+            logger.info("Using Context Cache: %s", cache_id)
             gen_cfg = types.GenerateContentConfig(
                 cached_content=cache_id,
                 tools=_ALL_TOOLS,
@@ -1413,7 +1413,7 @@ def process_llm(audio_array, is_continuity=False):
                         fc = part.function_call
                         if fc.name == "set_sleep_mode":
                             enabled = fc.args["enabled"]
-                            logger.info(f"Executing Tool: set_sleep_mode - {enabled}")
+                            logger.info("Executing Tool: set_sleep_mode - %s", enabled)
                             _set_sleep_mode(enabled)
                             fn_responses.append(types.Part(function_response=types.FunctionResponse(
                                 name="set_sleep_mode",
@@ -1432,7 +1432,7 @@ def process_llm(audio_array, is_continuity=False):
                         elif fc.name == "send_detailed_email":
                             subject = fc.args["subject"]
                             body = fc.args["body"]
-                            logger.info(f"Executing Tool: send_detailed_email - {subject}")
+                            logger.info("Executing Tool: send_detailed_email - %s", subject)
                             result_holder = [False, "Timed out"]
                             def _run_email():
                                 result_holder[0], result_holder[1] = _send_email_task(subject, body)
@@ -1455,7 +1455,7 @@ def process_llm(audio_array, is_continuity=False):
                         elif fc.name == "get_weather":
                             logger.info("Executing Tool: get_weather")
                             w_data = get_weather()
-                            logger.info(f"Tool Result: {w_data}")
+                            logger.info("Tool Result: %s", w_data)
                             fn_responses.append(types.Part(function_response=types.FunctionResponse(
                                 name="get_weather",
                                 response={"status": "success", "data": w_data},
@@ -1486,7 +1486,7 @@ def process_llm(audio_array, is_continuity=False):
                                     fn_responses.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
                                     logger.info("Camera image attached to tool response.")
                                 except Exception as e:
-                                    logger.error(f"Error reading captured image: {e}")
+                                    logger.error("Error reading captured image: %s", e)
                                     fn_responses.append(types.Part(function_response=types.FunctionResponse(
                                         name="describe_camera_view",
                                         response={"status": "error", "message": f"Error reading captured image: {e}"},
@@ -1502,7 +1502,7 @@ def process_llm(audio_array, is_continuity=False):
                             # Built-in server-side tool (google_search).
                             # The API executes it internally; we get the grounded answer
                             # by replaying the conversation with model_parts in stream2.
-                            logger.info(f"Server-side tool: {fc.name}")
+                            logger.info("Server-side tool: %s", fc.name)
                             has_server_call[0] = True
 
                     if getattr(part, 'thought', False):
@@ -1529,7 +1529,7 @@ def process_llm(audio_array, is_continuity=False):
 
         # ── If tool calls happened: follow-up streaming call for confirmation/reporting ──
         if fn_responses:
-            logger.info(f"Triggering tool follow-up (Pass 2) with {len(fn_responses)} response(s).")
+            logger.info("Triggering tool follow-up (Pass 2) with %s response(s).", len(fn_responses))
             stream2 = client.models.generate_content_stream(
                 model=config.LLM_MODEL,
                 contents=[
@@ -1610,7 +1610,7 @@ def process_llm(audio_array, is_continuity=False):
             display_text = _TRANS_PATTERN.sub('', full_text).strip()
             _last_assistant_response = display_text
 
-            logger.info(f"LLM answer: {display_text}")
+            logger.info("LLM answer: %s", display_text)
             send_uart_command(f"TXT|{display_text.replace(chr(10), ' ')}")
 
             with _transcript_lock:
@@ -1633,7 +1633,7 @@ def process_llm(audio_array, is_continuity=False):
                         _memory.add(txt, user_id="primary_user")
                         logger.info("Turn committed to long-term memory (background).")
                     except Exception as e:
-                        logger.warning(f"Memory storage failed: {e}")
+                        logger.warning("Memory storage failed: %s", e)
 
                 threading.Thread(target=_store_mem_bg, args=(final_trans,), daemon=True).start()
 
@@ -1657,7 +1657,7 @@ def process_llm(audio_array, is_continuity=False):
                 assistant_state["status"] = "CONTINUITY"
                 assistant_state["continuity_until"] = time.time() + config.CONTINUITY_TIMEOUT
             send_uart_command("APP:CONTINUITY")
-            logger.info(f"Transitioned to CONTINUITY state ({config.CONTINUITY_TIMEOUT}s window).")
+            logger.info("Transitioned to CONTINUITY state (%ss window).", config.CONTINUITY_TIMEOUT)
         else:
             with state_lock:
                 assistant_state["status"] = "IDLE"
@@ -1666,7 +1666,7 @@ def process_llm(audio_array, is_continuity=False):
 
 
     except Exception as e:
-        logger.error(f"LLM pipeline error: {e}")
+        logger.error("LLM pipeline error: %s", e)
         send_uart_command("TXT|Sorry, I had an error.")
         speak_text("Sorry, I had an error.")
         with state_lock:
@@ -1693,10 +1693,10 @@ def _init_hardware_pins():
         # so SD=LOW means shutdown/muted).
         if config.PIN_AMP_MUTE is not None:
             GPIO.setup(config.PIN_AMP_MUTE, GPIO.OUT, initial=GPIO.LOW)
-            logger.info(f"Hardware Mute pin {config.PIN_AMP_MUTE} initialised (LOW/MUTED)")
+            logger.info("Hardware Mute pin %s initialised (LOW/MUTED)", config.PIN_AMP_MUTE)
             
     except Exception as e:
-        logger.error(f"Hardware pin init failed: {e}")
+        logger.error("Hardware pin init failed: %s", e)
 
 _init_hardware_pins()
 
@@ -1706,7 +1706,7 @@ def _amp_enable():
         try:
             GPIO.output(config.PIN_AMP_MUTE, GPIO.HIGH)
         except Exception as e:
-            logger.error(f"Failed to enable amp: {e}")
+            logger.error("Failed to enable amp: %s", e)
 
 def _amp_mute():
     """Shut down the amplifier (SD pin LOW)."""
@@ -1714,7 +1714,7 @@ def _amp_mute():
         try:
             GPIO.output(config.PIN_AMP_MUTE, GPIO.LOW)
         except Exception as e:
-            logger.error(f"Failed to mute amp: {e}")
+            logger.error("Failed to mute amp: %s", e)
 
 def _unmute_and_prime_speaker():
     """No-op when hardware SD pin is configured — amp is enabled only after
@@ -1737,7 +1737,7 @@ def _unmute_and_prime_speaker():
         proc.communicate(input=silence)
         logger.info("Speaker primed (no SD pin)")
     except Exception as e:
-        logger.warning(f"Speaker prime failed (non-critical): {e}")
+        logger.warning("Speaker prime failed (non-critical): %s", e)
 
 # ─── Audio Front-End Helpers ────────────────────────────────────────────────
 
@@ -1844,26 +1844,26 @@ def audio_processor():
             else:
                 wakeword_models = [model_target]
             if not wakeword_models:
-                logger.error(f"OWW model not found: {model_target}")
+                logger.error("OWW model not found: %s", model_target)
             else:
                 oww_model = Model(wakeword_model_paths=wakeword_models)
                 with state_lock:
                     assistant_state["oww_ready"] = True
-                logger.info(f"OWW model loaded: {wakeword_models[0]}")
+                logger.info("OWW model loaded: %s", wakeword_models[0])
                 # Piper warmup deferred until here so OWW had full CPU during load
                 for _ in range(_MAX_WARM_PIPERS):
                     threading.Thread(target=_warmup_piper, daemon=True).start()
         except Exception as e:
-            logger.error(f"OWW load failed: {e}")
+            logger.error("OWW load failed: %s", e)
 
     # ── Load VAD ──
     vad = None
     if VAD_AVAILABLE:
         try:
             vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
-            logger.info(f"VAD ready (aggressiveness={config.VAD_AGGRESSIVENESS})")
+            logger.info("VAD ready (aggressiveness=%s)", config.VAD_AGGRESSIVENESS)
         except Exception as e:
-            logger.error(f"VAD init failed: {e}")
+            logger.error("VAD init failed: %s", e)
 
     # ── Open the capture stream now that all CPU-intensive loading is done ──
     # The codec/DAPM path can need a moment to settle after routing, so the first
@@ -1925,7 +1925,7 @@ def audio_processor():
                 f"filter={config.AEC_FILTER_LENGTH}, delay={config.AEC_DELAY_SAMPLES})"
             )
         except Exception as e:
-            logger.warning(f"AEC init failed: {e}")
+            logger.warning("AEC init failed: %s", e)
     else:
         if not _SPEEX_AVAILABLE:
             logger.info("AEC disabled — speexdsp not installed (pip install speexdsp)")
@@ -2090,7 +2090,7 @@ def audio_processor():
                         # 30ms frames -> 33.3 frames per second.
                         silence_threshold_frames = int(config.CONTINUITY_SILENCE_TIMEOUT * 33.3)
                         if continuity_silence_frames >= silence_threshold_frames:
-                            logger.info(f"CONTINUITY: Silence threshold ({config.CONTINUITY_SILENCE_TIMEOUT}s) reached. Exiting early.")
+                            logger.info("CONTINUITY: Silence threshold (%ss) reached. Exiting early.", config.CONTINUITY_SILENCE_TIMEOUT)
                             with state_lock:
                                 assistant_state["status"] = "IDLE"
                             send_uart_command("APP:ASSISTANT")
@@ -2101,10 +2101,10 @@ def audio_processor():
                             tts_mute_s = config.WAKEWORD_TTS_MUTE_MS / 1000.0
                             if (time.time() - _tts_finished_at) < tts_mute_s:
                                 # Speaker echo — still within post-TTS mute window. Discard.
-                                logger.debug(f"CONTINUITY: VAD fired within TTS mute window ({tts_mute_s:.1f}s). Ignoring echo.")
+                                logger.debug("CONTINUITY: VAD fired within TTS mute window (%.1fs). Ignoring echo.", tts_mute_s)
                                 continuity_speech_frames = 0
                             else:
-                                logger.info(f"CONTINUITY: Speech detected via VAD ({continuity_speech_frames} frames). Bypassing wake word.")
+                                logger.info("CONTINUITY: Speech detected via VAD (%s frames). Bypassing wake word.", continuity_speech_frames)
                                 with state_lock:
                                     assistant_state["status"] = "LISTENING"
                                 recording          = True
@@ -2214,7 +2214,7 @@ def audio_processor():
                 last_log_time = now
 
         except Exception as e:
-            logger.error(f"Audio processing error: {e}")
+            logger.error("Audio processing error: %s", e)
             consecutive_errors += 1
             if consecutive_errors >= 5:
                 # Input stream is likely dead (device reset/unplug) — try to reopen
@@ -2231,7 +2231,7 @@ def audio_processor():
                     consecutive_errors = 0
                     logger.info("Audio input stream reopened")
                 except Exception as reopen_err:
-                    logger.error(f"Stream reopen failed: {reopen_err}")
+                    logger.error("Stream reopen failed: %s", reopen_err)
             time.sleep(0.5)
 
 # ─── Encoder ──────────────────────────────────────────────────────────────────
@@ -2243,7 +2243,7 @@ def on_encoder_event(event, direction, value):
     
     # Wake on interaction
     if is_sleeping and event in ("rotate", "press"):
-        logger.info(f"Wake trigger detected ({event})! Exiting sleep mode.")
+        logger.info("Wake trigger detected (%s)! Exiting sleep mode.", event)
         _set_sleep_mode(False)
         return
 
@@ -2303,7 +2303,7 @@ def on_encoder_event(event, direction, value):
         with state_lock:
             is_sleeping = assistant_state.get("is_sleeping", False)
         
-        logger.info(f"Encoder Button: Long Press! Toggling sleep: {not is_sleeping}")
+        logger.info("Encoder Button: Long Press! Toggling sleep: %s", not is_sleeping)
         _set_sleep_mode(not is_sleeping)
 
 # ─── Hardware Init ────────────────────────────────────────────────────────────
@@ -2313,11 +2313,11 @@ try:
     if config.PIN_SFT_GND:
         GPIO.setup(config.PIN_SFT_GND, GPIO.OUT)
         GPIO.output(config.PIN_SFT_GND, GPIO.LOW)
-        logger.info(f"Software GND on GPIO {config.PIN_SFT_GND}")
+        logger.info("Software GND on GPIO %s", config.PIN_SFT_GND)
     if config.PIN_AMP_MUTE is not None:
         GPIO.setup(config.PIN_AMP_MUTE, GPIO.OUT)
         GPIO.output(config.PIN_AMP_MUTE, GPIO.LOW)   # SD LOW = shutdown, muted at startup
-        logger.info(f"Amp muted on GPIO {config.PIN_AMP_MUTE}")
+        logger.info("Amp muted on GPIO %s", config.PIN_AMP_MUTE)
     encoder = RotaryEncoder(
         clk_pin=config.PIN_ROTARY_CLK,
         dt_pin=config.PIN_ROTARY_DT,
@@ -2326,7 +2326,7 @@ try:
     )
     logger.info(f"Encoder on GPIO {config.PIN_ROTARY_CLK}/{config.PIN_ROTARY_DT}")
 except Exception as e:
-    logger.error(f"Hardware init failed: {e}")
+    logger.error("Hardware init failed: %s", e)
 
 # ─── Flask Routes ─────────────────────────────────────────────────────────────
 
